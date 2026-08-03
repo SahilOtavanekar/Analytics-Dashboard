@@ -49,6 +49,32 @@ streamlit run streamlit_app.py
 
 The app opens at `http://localhost:8501`.
 
+## Deployment
+
+**Streamlit Community Cloud** — deploys from this GitHub repo. Community Cloud
+runs headless (no browser to complete SSO), so it needs **key-pair auth**
+instead of `authenticator = "externalbrowser"`:
+1. Have a Snowflake admin attach an RSA public key to your user (see
+   `sql/attach_key_pair_auth.sql` — one-time, doesn't touch your SSO login).
+2. On [share.streamlit.io](https://share.streamlit.io), create a new app from
+   this repo, main file `streamlit_app.py`.
+3. In the app's **Secrets** settings, paste the key-pair variant shown in
+   `.streamlit/secrets.toml.example` (with your actual private key content —
+   never commit that file to git).
+
+**Streamlit in Snowflake** — files are already uploaded to
+`@CIT_DATA_CORE.TRACKING.ANALYTICS_DASHBOARD_STAGE`. Once `CREATE STREAMLIT` is
+granted on the schema, an admin (or you, once granted) can run:
+```sql
+CREATE STREAMLIT CIT_DATA_CORE.TRACKING.ANALYTICS_DASHBOARD
+  ROOT_LOCATION = '@CIT_DATA_CORE.TRACKING.ANALYTICS_DASHBOARD_STAGE'
+  MAIN_FILE = 'streamlit_app.py'
+  QUERY_WAREHOUSE = 'SNOWFLAKE_LEARNING_WH';
+```
+Note: the version currently on this stage predates the key-pair auth addition
+above — it would need re-uploading to pick up that change (not required for
+native Snowflake hosting, which doesn't use key-pair auth at all).
+
 ## Project structure
 
 ```
