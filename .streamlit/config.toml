@@ -1,0 +1,42 @@
+# Theme matches the validated chart palette in src/theme.py, so the app
+# chrome and the Plotly charts read as one system in both light and dark.
+
+[theme]
+font = "sans-serif"
+baseRadius = "small"
+buttonRadius = "small"
+showSidebarBorder = true
+linkColor = "#2a78d6"
+chartCategoricalColors = [
+    "#2a78d6", # blue
+    "#eb6834", # orange
+    "#1baf7a", # aqua
+    "#eda100", # yellow
+    "#e87ba4", # magenta
+    "#008300", # green
+    "#4a3aa7", # violet
+    "#e34948", # red
+]
+
+[theme.light]
+primaryColor = "#2a78d6"
+backgroundColor = "#fcfcfb"
+secondaryBackgroundColor = "#f9f9f7"
+textColor = "#0b0b0b"
+borderColor = "#e1e0d9"
+dataframeBorderColor = "#e1e0d9"
+
+[theme.light.sidebar]
+backgroundColor = "#f9f9f7"
+
+[theme.dark]
+primaryColor = "#3987e5"
+backgroundColor = "#1a1a19"
+secondaryBackgroundColor = "#0d0d0d"
+textColor = "#ffffff"
+borderColor = "#2c2c2a"
+dataframeBorderColor = "#2c2c2a"
+linkColor = "#3987e5"
+
+[theme.dark.sidebar]
+backgroundColor = "#0d0d0d"
