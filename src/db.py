@@ -2,6 +2,21 @@ import pandas as pd
 import snowflake.connector
 import streamlit as st
 
+TABLE_FQN = "CIT_DATA_CORE.TRACKING.INSYTE_TRAKING_EVENTS"
+
+
+def _get_sis_session_connection():
+    """Return the raw connection behind the active Snowpark session when
+    running inside Streamlit in Snowflake, or None otherwise (local dev,
+    Community Cloud)."""
+    try:
+        from snowflake.snowpark.context import get_active_session
+
+        session = get_active_session()
+    except Exception:
+        return None
+    return session.connection if hasattr(session, "connection") else session._conn._conn
+
 
 def _load_private_key_der(pem_text: str) -> bytes:
     from cryptography.hazmat.backends import default_backend
@@ -19,6 +34,10 @@ def _load_private_key_der(pem_text: str) -> bytes:
 
 @st.cache_resource
 def get_connection():
+    sis_conn = _get_sis_session_connection()
+    if sis_conn is not None:
+        return sis_conn
+
     cfg = st.secrets["snowflake"]
 
     # Headless hosts (e.g. Streamlit Community Cloud) have no browser to complete
@@ -47,8 +66,7 @@ def get_connection():
 
 
 def table_fqn() -> str:
-    cfg = st.secrets["snowflake"]
-    return f'{cfg["database"]}.{cfg["schema"]}.{cfg["table"]}'
+    return TABLE_FQN
 
 
 @st.cache_data(ttl=300, show_spinner="Querying Snowflake...")
