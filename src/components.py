@@ -12,7 +12,9 @@ def kpi_row(items: list[tuple[str, str]]) -> None:
 def date_range_filter(default_days: int = 30, key: str = "date_range_filter") -> tuple[dt.date, dt.date]:
     today = dt.date.today()
     start = today - dt.timedelta(days=default_days)
-    selected = st.sidebar.date_input("Date range", value=(start, today), max_value=today, key=key)
+    selected = st.sidebar.date_input(
+        "Date range", value=(start, today), max_value=today, key=key, persist_state="session"
+    )
     if isinstance(selected, tuple) and len(selected) == 2:
         return selected
     return start, today
