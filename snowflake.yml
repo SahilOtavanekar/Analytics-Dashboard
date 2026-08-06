@@ -1,0 +1,31 @@
+# Verbatim copy of the config that deploys successfully from Snowsight Workspaces.
+#
+# Two things here are known to be inert - left in place because this exact file is
+# what works, and because Deploy demonstrably ignores them:
+#   - `artifacts` is not used. srs.txt doesn't exist, and pages/ and src/ are absent,
+#     yet the deployed app imports from src and serves all five pages - so Workspaces
+#     ships the whole folder regardless of this list.
+#   - `run_mode: WarehouseOnly` sits alongside `compute_pool`. Which one Deploy honours
+#     is unconfirmed; run `DESCRIBE STREAMLIT CIT_DATA_CORE.TRACKING.ANALYTICS_DASHBOARD`
+#     to see the runtime the live app actually uses.
+definition_version: 2
+entities:
+  streamlit_app:
+    type: streamlit
+    identifier:
+      database: CIT_DATA_CORE
+      schema: TRACKING
+      name: ANALYTICS_DASHBOARD
+    title: Analytics_Dashboard
+    query_warehouse: COMPUTE_WH
+    compute_pool: DEV
+    run_mode: WarehouseOnly
+    execute_as: OWNER
+    main_file: streamlit_app.py
+    artifacts:
+      - environment.yml
+      - pyproject.toml
+      - streamlit_app.py
+      - .streamlit/config.toml
+      - srs.txt
+    idle_auto_shutdown_time_seconds: 86400

@@ -1,53 +1,29 @@
+import altair as alt
 import pandas as pd
-import plotly.graph_objects as go
 
-from src.theme import (
-    AXIS,
-    CATEGORICAL,
-    FONT_FAMILY,
-    GRIDLINE,
-    INK_MUTED,
-    INK_PRIMARY,
-    SEQUENTIAL_BLUE,
-    SURFACE,
-)
+from src.theme import CATEGORICAL, SEQUENTIAL_BLUE
 
 
-def _base_layout(**overrides) -> dict:
-    layout = dict(
-        plot_bgcolor=SURFACE,
-        paper_bgcolor=SURFACE,
-        font=dict(family=FONT_FAMILY, color=INK_PRIMARY),
-        margin=dict(l=8, r=8, t=8, b=8),
-    )
-    layout.update(overrides)
-    return layout
-
-
-def top_events_bar(df: pd.DataFrame, name_col: str, value_col: str) -> go.Figure:
-    """Ranked magnitude: single hue, sorted, no per-bar labels (axis + tooltip carry values)."""
-    ordered = df.sort_values(value_col, ascending=True)
-    fig = go.Figure(
-        go.Bar(
-            x=ordered[value_col],
-            y=ordered[name_col],
-            orientation="h",
-            marker_color=SEQUENTIAL_BLUE,
-            hovertemplate="%{y}: %{x:,}<extra></extra>",
+def top_events_bar(df: pd.DataFrame, name_col: str, value_col: str) -> alt.Chart:
+    """Ranked magnitude: single hue, sorted, axis + tooltip carry values."""
+    return (
+        alt.Chart(df)
+        .mark_bar(color=SEQUENTIAL_BLUE)
+        .encode(
+            x=alt.X(f"{value_col}:Q", title="Events"),
+            y=alt.Y(f"{name_col}:N", title=None, sort="-x"),
+            tooltip=[
+                alt.Tooltip(f"{name_col}:N", title=name_col.replace("_", " ").title()),
+                alt.Tooltip(f"{value_col}:Q", title="Events", format=","),
+            ],
         )
     )
-    fig.update_layout(
-        **_base_layout(
-            xaxis=dict(title="Events", gridcolor=GRIDLINE, linecolor=AXIS, tickfont=dict(color=INK_MUTED)),
-            yaxis=dict(title=None, linecolor=AXIS, tickfont=dict(color=INK_MUTED)),
-            showlegend=False,
-        )
-    )
-    return fig
 
 
-def share_stacked_bar(df: pd.DataFrame, name_col: str, value_col: str, max_segments: int = 6) -> go.Figure:
-    """Part-to-whole: single horizontal 100% stacked bar, categorical colors, Other fold past max_segments."""
+def share_stacked_bar(
+    df: pd.DataFrame, name_col: str, value_col: str, max_segments: int = 6
+) -> alt.LayerChart:
+    """Part-to-whole: single horizontal 100% bar, categorical colors, Other fold past max_segments."""
     ranked = df.sort_values(value_col, ascending=False).reset_index(drop=True)
     if len(ranked) > max_segments:
         head = ranked.iloc[: max_segments - 1]
@@ -56,60 +32,53 @@ def share_stacked_bar(df: pd.DataFrame, name_col: str, value_col: str, max_segme
             [head, pd.DataFrame({name_col: ["Other"], value_col: [other_total]})],
             ignore_index=True,
         )
-    total = ranked[value_col].sum()
-    ranked["share"] = ranked[value_col] / total
 
-    fig = go.Figure()
-    for i, row in ranked.iterrows():
-        pct = row["share"] * 100
-        fig.add_trace(
-            go.Bar(
-                x=[row["share"]],
-                y=["Share"],
-                orientation="h",
-                name=str(row[name_col]),
-                marker=dict(color=CATEGORICAL[i % len(CATEGORICAL)], line=dict(color=SURFACE, width=2)),
-                text=f"{pct:.0f}%" if pct >= 8 else None,
-                textposition="inside",
-                insidetextanchor="middle",
-                textfont=dict(color="#ffffff"),
-                hovertemplate=f"{row[name_col]}: {pct:.1f}%<extra></extra>",
-            )
-        )
-    fig.update_layout(
-        **_base_layout(
-            barmode="stack",
-            xaxis=dict(visible=False, range=[0, 1]),
-            yaxis=dict(visible=False),
-            legend=dict(orientation="h", yanchor="bottom", y=-0.35),
-            height=180,
+    ranked["share"] = ranked[value_col] / ranked[value_col].sum()
+    # Explicit start/end beats Vega's normalize stack here - the label layer needs
+    # segment midpoints, and computing them in pandas keeps both layers in step.
+    ranked["seg_end"] = ranked["share"].cumsum()
+    ranked["seg_start"] = ranked["seg_end"] - ranked["share"]
+    ranked["seg_mid"] = (ranked["seg_start"] + ranked["seg_end"]) / 2
+    ranked["pct"] = ranked["share"].map(lambda s: f"{s * 100:.0f}%" if s * 100 >= 8 else "")
+    ranked["tip"] = ranked["share"].map(lambda s: f"{s * 100:.1f}%")
+
+    order = ranked[name_col].astype(str).tolist()
+    bars = (
+        alt.Chart(ranked)
+        .mark_bar(stroke="#ffffff", strokeWidth=2)
+        .encode(
+            x=alt.X("seg_start:Q", title=None, axis=None, scale=alt.Scale(domain=[0, 1])),
+            x2="seg_end:Q",
+            color=alt.Color(
+                f"{name_col}:N",
+                scale=alt.Scale(domain=order, range=CATEGORICAL[: len(order)]),
+                legend=alt.Legend(orient="bottom", title=None, columns=3),
+            ),
+            tooltip=[alt.Tooltip(f"{name_col}:N", title="Type"), alt.Tooltip("tip:N", title="Share")],
         )
     )
-    return fig
+    labels = (
+        alt.Chart(ranked)
+        .mark_text(color="#ffffff", fontWeight="bold")
+        .encode(x=alt.X("seg_mid:Q", scale=alt.Scale(domain=[0, 1])), text="pct:N")
+    )
+    return (bars + labels).properties(height=180)
 
 
-def trend_line(df: pd.DataFrame, x_col: str, y_col: str, y_title: str) -> go.Figure:
-    """Trend over time: single series, thin line, hairline grid, unified hover."""
-    mode = "lines+markers" if len(df) <= 14 else "lines"
-    fig = go.Figure(
-        go.Scatter(
-            x=df[x_col],
-            y=df[y_col],
-            mode=mode,
-            line=dict(color=SEQUENTIAL_BLUE, width=2),
-            marker=dict(color=SEQUENTIAL_BLUE, size=6),
-            hovertemplate="%{x|%b %d}: %{y:,}<extra></extra>",
-        )
+def trend_line(df: pd.DataFrame, x_col: str, y_col: str, y_title: str) -> alt.Chart:
+    """Trend over time: single series, thin line, markers only when points are sparse."""
+    base = alt.Chart(df).encode(
+        x=alt.X(f"{x_col}:T", title=None),
+        y=alt.Y(f"{y_col}:Q", title=y_title),
+        tooltip=[
+            alt.Tooltip(f"{x_col}:T", title="Date", format="%b %d"),
+            alt.Tooltip(f"{y_col}:Q", title=y_title, format=","),
+        ],
     )
-    fig.update_layout(
-        **_base_layout(
-            xaxis=dict(title=None, gridcolor=GRIDLINE, linecolor=AXIS, tickfont=dict(color=INK_MUTED)),
-            yaxis=dict(title=y_title, gridcolor=GRIDLINE, linecolor=AXIS, tickfont=dict(color=INK_MUTED)),
-            hovermode="x unified",
-            showlegend=False,
-        )
-    )
-    return fig
+    line = base.mark_line(color=SEQUENTIAL_BLUE, strokeWidth=2)
+    if len(df) <= 14:
+        return line + base.mark_point(color=SEQUENTIAL_BLUE, size=45, filled=True)
+    return line
 
 
 def distribution_histogram(
@@ -119,37 +88,27 @@ def distribution_histogram(
     y_title: str = "Sessions",
     nbins: int = 30,
     clip_percentile: float = 0.95,
-) -> go.Figure:
-    """Magnitude distribution: single hue, hairline grid.
+) -> alt.Chart:
+    """Magnitude distribution, binned to the clip_percentile.
 
-    View is zoomed to the clip_percentile so a long tail of outliers (e.g. a
-    handful of stale sessions) doesn't crush the chart into one bar; all data
-    still contributes to the bins, and the full range remains in the table view.
+    A long tail of outliers (a handful of stale sessions) would otherwise crush
+    the chart into one bar; the full range stays available in the table view.
     """
     values = df[value_col].astype(float)
     lower = min(values.min(), 0.0)
     upper = max(values.quantile(clip_percentile), lower + 1)
-    bin_size = (upper - lower) / nbins
-    fig = go.Figure(
-        go.Histogram(
-            x=values,
-            xbins=dict(start=lower, end=upper, size=bin_size),
-            marker=dict(color=SEQUENTIAL_BLUE, line=dict(color=SURFACE, width=1)),
-            hovertemplate=f"{x_title}: %{{x}}<br>{y_title}: %{{y:,}}<extra></extra>",
-        )
-    )
-    fig.update_layout(
-        **_base_layout(
-            xaxis=dict(
+
+    return (
+        alt.Chart(pd.DataFrame({value_col: values}))
+        .mark_bar(color=SEQUENTIAL_BLUE, stroke="#ffffff", strokeWidth=1)
+        .encode(
+            x=alt.X(
+                f"{value_col}:Q",
+                bin=alt.Bin(extent=[lower, upper], maxbins=nbins),
                 title=x_title,
-                gridcolor=GRIDLINE,
-                linecolor=AXIS,
-                tickfont=dict(color=INK_MUTED),
-                range=[lower, upper],
+                scale=alt.Scale(domain=[lower, upper]),
             ),
-            yaxis=dict(title=y_title, gridcolor=GRIDLINE, linecolor=AXIS, tickfont=dict(color=INK_MUTED)),
-            showlegend=False,
-            bargap=0.05,
+            y=alt.Y("count():Q", title=y_title),
+            tooltip=[alt.Tooltip("count():Q", title=y_title, format=",")],
         )
     )
-    return fig

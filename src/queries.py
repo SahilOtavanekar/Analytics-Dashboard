@@ -8,7 +8,7 @@ def executive_kpis_sql() -> str:
             COUNT(DISTINCT SESSION_ID) AS total_sessions,
             COUNT(DISTINCT CAMPAIGN_ID) AS total_campaigns
         FROM {table_fqn()}
-        WHERE EVENT_TS::DATE BETWEEN %(start_date)s AND %(end_date)s
+        WHERE EVENT_TS::DATE BETWEEN ? AND ?
     """
 
 
@@ -16,7 +16,7 @@ def top_events_sql(limit: int = 10) -> str:
     return f"""
         SELECT EVENT_NAME, COUNT(*) AS EVENT_COUNT
         FROM {table_fqn()}
-        WHERE EVENT_TS::DATE BETWEEN %(start_date)s AND %(end_date)s
+        WHERE EVENT_TS::DATE BETWEEN ? AND ?
         GROUP BY EVENT_NAME
         ORDER BY EVENT_COUNT DESC
         LIMIT {limit}
@@ -27,7 +27,7 @@ def event_type_share_sql() -> str:
     return f"""
         SELECT EVENT_TYPE, COUNT(*) AS EVENT_COUNT
         FROM {table_fqn()}
-        WHERE EVENT_TS::DATE BETWEEN %(start_date)s AND %(end_date)s
+        WHERE EVENT_TS::DATE BETWEEN ? AND ?
         GROUP BY EVENT_TYPE
         ORDER BY EVENT_COUNT DESC
     """
@@ -40,7 +40,7 @@ def _session_summary_cte() -> str:
             COUNT(*) AS EVENT_COUNT,
             DATEDIFF('second', MIN(EVENT_TS), MAX(EVENT_TS)) AS DURATION_SECONDS
         FROM {table_fqn()}
-        WHERE EVENT_TS::DATE BETWEEN %(start_date)s AND %(end_date)s
+        WHERE EVENT_TS::DATE BETWEEN ? AND ?
         GROUP BY SESSION_ID
     """
 
@@ -61,7 +61,7 @@ def sessions_over_time_sql() -> str:
             EVENT_TS::DATE AS EVENT_DATE,
             COUNT(DISTINCT SESSION_ID) AS SESSION_COUNT
         FROM {table_fqn()}
-        WHERE EVENT_TS::DATE BETWEEN %(start_date)s AND %(end_date)s
+        WHERE EVENT_TS::DATE BETWEEN ? AND ?
         GROUP BY EVENT_DATE
         ORDER BY EVENT_DATE
     """
@@ -83,7 +83,7 @@ def _visitor_summary_cte() -> str:
             COUNT(DISTINCT SESSION_ID) AS SESSION_COUNT,
             COUNT(DISTINCT EVENT_TS::DATE) AS ACTIVE_DAYS
         FROM {table_fqn()}
-        WHERE EVENT_TS::DATE BETWEEN %(start_date)s AND %(end_date)s
+        WHERE EVENT_TS::DATE BETWEEN ? AND ?
         GROUP BY REQUEST_IP
     """
 
@@ -125,7 +125,7 @@ def campaign_kpis_sql() -> str:
                 (COUNT(*) / NULLIF(COUNT(DISTINCT CAMPAIGN_ID), 0))::FLOAT, 0
             ) AS AVG_EVENTS_PER_CAMPAIGN
         FROM {table_fqn()}
-        WHERE EVENT_TS::DATE BETWEEN %(start_date)s AND %(end_date)s
+        WHERE EVENT_TS::DATE BETWEEN ? AND ?
     """
 
 
@@ -138,7 +138,7 @@ def top_campaigns_sql(limit: int = 10) -> str:
             COALESCE(MODE(PROPERTIES:campaign_name::STRING), CAMPAIGN_ID) AS CAMPAIGN_LABEL,
             COUNT(*) AS EVENT_COUNT
         FROM {table_fqn()}
-        WHERE EVENT_TS::DATE BETWEEN %(start_date)s AND %(end_date)s
+        WHERE EVENT_TS::DATE BETWEEN ? AND ?
         GROUP BY CAMPAIGN_ID
         ORDER BY EVENT_COUNT DESC
         LIMIT {limit}
@@ -149,7 +149,7 @@ def channel_share_sql() -> str:
     return f"""
         SELECT CHANNEL, COUNT(*) AS EVENT_COUNT
         FROM {table_fqn()}
-        WHERE EVENT_TS::DATE BETWEEN %(start_date)s AND %(end_date)s
+        WHERE EVENT_TS::DATE BETWEEN ? AND ?
         GROUP BY CHANNEL
         ORDER BY EVENT_COUNT DESC
     """

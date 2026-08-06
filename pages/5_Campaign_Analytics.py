@@ -14,7 +14,7 @@ st.set_page_config(page_title="Campaign Analytics", page_icon="🎯", layout="wi
 st.title("Campaign Analytics")
 
 start_date, end_date = date_range_filter(default_days=30)
-params = {"start_date": start_date, "end_date": end_date}
+params = [start_date, end_date]
 
 kpis = run_query(campaign_kpis_sql(), params).iloc[0]
 kpi_row(
@@ -30,7 +30,7 @@ top_campaigns = run_query(top_campaigns_sql(), params)
 if top_campaigns.empty:
     st.info("No campaign activity in this date range.")
 else:
-    st.plotly_chart(top_events_bar(top_campaigns, "CAMPAIGN_LABEL", "EVENT_COUNT"), use_container_width=True)
+    st.altair_chart(top_events_bar(top_campaigns, "CAMPAIGN_LABEL", "EVENT_COUNT"), use_container_width=True)
     with st.expander("View as table"):
         st.dataframe(top_campaigns, use_container_width=True, hide_index=True)
 
@@ -39,7 +39,7 @@ channel_share = run_query(channel_share_sql(), params)
 if channel_share.empty:
     st.info("No channel activity in this date range.")
 else:
-    st.plotly_chart(share_stacked_bar(channel_share, "CHANNEL", "EVENT_COUNT"), use_container_width=True)
+    st.altair_chart(share_stacked_bar(channel_share, "CHANNEL", "EVENT_COUNT"), use_container_width=True)
     with st.expander("View as table"):
         st.dataframe(channel_share, use_container_width=True, hide_index=True)
 

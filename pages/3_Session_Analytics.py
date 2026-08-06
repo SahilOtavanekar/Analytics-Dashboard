@@ -14,7 +14,7 @@ st.set_page_config(page_title="Session Analytics", page_icon="🕒", layout="wid
 st.title("Session Analytics")
 
 start_date, end_date = date_range_filter(default_days=30)
-params = {"start_date": start_date, "end_date": end_date}
+params = [start_date, end_date]
 
 kpis = run_query(session_kpis_sql(), params).iloc[0]
 kpi_row(
@@ -30,7 +30,8 @@ over_time = run_query(sessions_over_time_sql(), params)
 if over_time.empty:
     st.info("No sessions in this date range.")
 else:
-    st.plotly_chart(trend_line(over_time, "EVENT_DATE", "SESSION_COUNT", "Sessions"), use_container_width=True)
+    trend = trend_line(over_time, "EVENT_DATE", "SESSION_COUNT", "Sessions")
+    st.altair_chart(trend, use_container_width=True)
     with st.expander("View as table"):
         st.dataframe(over_time, use_container_width=True, hide_index=True)
 
@@ -39,10 +40,8 @@ durations = run_query(session_durations_sql(), params)
 if durations.empty:
     st.info("No sessions in this date range.")
 else:
-    st.plotly_chart(
-        distribution_histogram(durations, "DURATION_MINUTES", "Duration (minutes)"),
-        use_container_width=True,
-    )
+    duration_chart = distribution_histogram(durations, "DURATION_MINUTES", "Duration (minutes)")
+    st.altair_chart(duration_chart, use_container_width=True)
     with st.expander("View as table"):
         st.dataframe(durations.describe(), use_container_width=True)
 

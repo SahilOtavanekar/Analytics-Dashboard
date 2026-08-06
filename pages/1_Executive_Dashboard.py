@@ -16,7 +16,7 @@ start_date, end_date = date_range_filter(default_days=30)
 
 kpis = run_query(
     executive_kpis_sql(),
-    {"start_date": start_date, "end_date": end_date},
+    [start_date, end_date],
 ).iloc[0]
 
 kpi_row(
