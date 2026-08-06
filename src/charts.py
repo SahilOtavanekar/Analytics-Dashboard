@@ -4,17 +4,47 @@ import pandas as pd
 from src.theme import CATEGORICAL, SEQUENTIAL_BLUE
 
 
-def top_events_bar(df: pd.DataFrame, name_col: str, value_col: str) -> alt.Chart:
+def funnel_bar(df: pd.DataFrame, stage_col: str, value_col: str) -> alt.LayerChart:
+    """Nested stages held in the given order, never value-sorted.
+
+    Sorting by value would let a wider lower stage jump above a narrower upper one
+    and imply a journey that doesn't exist, so the row order carries the sequence.
+    Each bar is labelled with its count and its share of the first stage.
+    """
+    data = df.copy()
+    base = float(data[value_col].iloc[0]) if len(data) else 0.0
+    data["PCT"] = data[value_col] / base * 100 if base else 0.0
+    data["LABEL"] = [f"{int(v):,}  ({p:.1f}%)" for v, p in zip(data[value_col], data["PCT"])]
+    order = data[stage_col].astype(str).tolist()
+
+    bars = alt.Chart(data).mark_bar(color=SEQUENTIAL_BLUE).encode(
+        x=alt.X(f"{value_col}:Q", title="Sessions"),
+        y=alt.Y(f"{stage_col}:N", title=None, sort=order),
+        tooltip=[
+            alt.Tooltip(f"{stage_col}:N", title="Stage"),
+            alt.Tooltip(f"{value_col}:Q", title="Sessions", format=","),
+            alt.Tooltip("PCT:Q", title="% of first stage", format=".1f"),
+        ],
+    )
+    labels = alt.Chart(data).mark_text(align="left", dx=6).encode(
+        x=alt.X(f"{value_col}:Q"),
+        y=alt.Y(f"{stage_col}:N", sort=order),
+        text="LABEL:N",
+    )
+    return (bars + labels).properties(height=alt.Step(44))
+
+
+def top_events_bar(df: pd.DataFrame, name_col: str, value_col: str, x_title: str = "Events") -> alt.Chart:
     """Ranked magnitude: single hue, sorted, axis + tooltip carry values."""
     return (
         alt.Chart(df)
         .mark_bar(color=SEQUENTIAL_BLUE)
         .encode(
-            x=alt.X(f"{value_col}:Q", title="Events"),
+            x=alt.X(f"{value_col}:Q", title=x_title),
             y=alt.Y(f"{name_col}:N", title=None, sort="-x"),
             tooltip=[
                 alt.Tooltip(f"{name_col}:N", title=name_col.replace("_", " ").title()),
-                alt.Tooltip(f"{value_col}:Q", title="Events", format=","),
+                alt.Tooltip(f"{value_col}:Q", title=x_title, format=","),
             ],
         )
     )

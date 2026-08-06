@@ -6,7 +6,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 import streamlit as st
 
 from src.charts import distribution_histogram
-from src.components import date_range_filter, kpi_row
+from src.components import date_range_filter, kpi, kpi_row, previous_window
 from src.db import run_query
 from src.queries import (
     sessions_per_visitor_sql,
@@ -31,14 +31,17 @@ st.caption(
 )
 
 start_date, end_date = date_range_filter(default_days=30)
+prev_start, prev_end = previous_window(start_date, end_date)
 params = [start_date, end_date]
 
-kpis = run_query(user_activity_kpis_sql(), params).iloc[0]
+now = run_query(user_activity_kpis_sql(), params).iloc[0]
+was = run_query(user_activity_kpis_sql(), [prev_start, prev_end]).iloc[0]
+
 kpi_row(
     [
-        ("Unique Visitors (proxy)", f"{int(kpis['TOTAL_VISITORS']):,}"),
-        ("Returning (active >1 day)", f"{kpis['PCT_RETURNING']:.1f}%"),
-        ("Avg Sessions / Visitor", f"{kpis['AVG_SESSIONS_PER_VISITOR']:.1f}"),
+        kpi("Unique Visitors (proxy)", now["TOTAL_VISITORS"], was["TOTAL_VISITORS"]),
+        kpi("Returning (active >1 day)", now["PCT_RETURNING"], was["PCT_RETURNING"], decimals=1, suffix="%", delta_as_points=True),
+        kpi("Avg Sessions / Visitor", now["AVG_SESSIONS_PER_VISITOR"], was["AVG_SESSIONS_PER_VISITOR"], decimals=1),
     ]
 )
 
@@ -56,4 +59,4 @@ else:
     with st.expander("View as table"):
         st.dataframe(per_visitor.describe(), use_container_width=True)
 
-st.caption(f"Showing data from {start_date} to {end_date}.")
+st.caption(f"Showing {start_date} to {end_date}. Change is against {prev_start} to {prev_end}.")

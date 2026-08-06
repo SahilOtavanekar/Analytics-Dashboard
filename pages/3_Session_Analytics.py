@@ -6,7 +6,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 import streamlit as st
 
 from src.charts import distribution_histogram, trend_line
-from src.components import date_range_filter, kpi_row
+from src.components import date_range_filter, kpi, kpi_row, previous_window
 from src.db import run_query
 from src.queries import session_durations_sql, session_kpis_sql, sessions_over_time_sql
 
@@ -14,14 +14,17 @@ st.set_page_config(page_title="Session Analytics", page_icon="🕒", layout="wid
 st.title("Session Analytics")
 
 start_date, end_date = date_range_filter(default_days=30)
+prev_start, prev_end = previous_window(start_date, end_date)
 params = [start_date, end_date]
 
-kpis = run_query(session_kpis_sql(), params).iloc[0]
+now = run_query(session_kpis_sql(), params + params).iloc[0]
+was = run_query(session_kpis_sql(), [prev_start, prev_end, prev_start, prev_end]).iloc[0]
+
 kpi_row(
     [
-        ("Total Sessions", f"{int(kpis['TOTAL_SESSIONS']):,}"),
-        ("Avg Events / Session", f"{kpis['AVG_EVENTS_PER_SESSION']:.1f}"),
-        ("Avg Session Duration", f"{kpis['AVG_DURATION_MINUTES']:.1f} min"),
+        kpi("Total Sessions", now["TOTAL_SESSIONS"], was["TOTAL_SESSIONS"]),
+        kpi("Avg Events / Session", now["AVG_EVENTS_PER_SESSION"], was["AVG_EVENTS_PER_SESSION"], decimals=1),
+        kpi("Avg Session Duration", now["AVG_DURATION_MINUTES"], was["AVG_DURATION_MINUTES"], decimals=1, suffix=" min"),
     ]
 )
 
@@ -45,4 +48,4 @@ else:
     with st.expander("View as table"):
         st.dataframe(durations.describe(), use_container_width=True)
 
-st.caption(f"Showing data from {start_date} to {end_date}.")
+st.caption(f"Showing {start_date} to {end_date}. Change is against {prev_start} to {prev_end}.")

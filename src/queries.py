@@ -1,10 +1,134 @@
+"""All SQL for the dashboard, one function per query.
+
+Two conventions worth knowing before editing:
+
+**Event counts use COUNT(DISTINCT MESSAGE_ID), never COUNT(*).** The source table
+contains ~1.29M exactly-duplicated rows (5.9% of the table, 2.4% of the last 30
+days) - same MESSAGE_ID, same timestamp to the millisecond, same session, same
+path. Verified by comparing distinct MESSAGE_IDs against distinct full-row hashes
+and by inspecting duplicate groups: 1,037,068 groups, of which 0 vary in
+SESSION_ID or PATH. MESSAGE_ID has no nulls anywhere, so deduplicating on it is
+exact. COUNT(*) overstates every event metric.
+
+**NULL guards on SESSION_ID and REQUEST_IP.** SQL collapses all NULLs into one
+GROUP BY bucket, so without a guard the ~3.47M session-less rows become a single
+pseudo-session spanning the range. Those rows are historical: SESSION_ID was not
+captured at all before Nov 2025 (Aug-Oct 2025 is ~100% null) and is fully
+populated from May 2026 onward. The default 30-day window is unaffected; a range
+reaching into 2025 is not.
+"""
+
 from src.db import table_fqn
+
+# A page view is EVENT_TYPE = 'page' OR a name of "page visit". Both halves matter:
+# the ~3.4M unnamed events are all type 'page', so type catches them; and 107 events
+# arrive as linkedin_track/google_track while being named "page visit", so the name
+# check catches those. COALESCE because NOT(FALSE OR NULL) is NULL, not TRUE - a
+# track event with no name would otherwise fall out of both sides of the split.
+# "pdf-page-visit" is deliberately NOT a page view; it's a tracked action.
+_PAGE_VIEW = "(COALESCE(EVENT_TYPE, '') = 'page' OR COALESCE(LOWER(EVENT_NAME), '') = 'page visit')"
+
+# Development artefacts sitting in production data.
+_NOT_TEST = "(EVENT_NAME IS NULL OR LOWER(EVENT_NAME) NOT IN ('test event', 'test download event'))"
+
+# Event names arrive inconsistently cased and punctuated ("clicked"/"Clicked",
+# "form_submit"/"Form Submit"), so every name comparison goes through this.
+_NORM = "LOWER(REPLACE(EVENT_NAME, '_', ' '))"
+
+# Page identity comes from SEARCH_URL, not PATH. The tracking implementation was
+# swapped around Mar-Apr 2026: PATH and TAB_URL fell from 100% populated to 0%,
+# while REFERER_URL and QUERY_PARAMETERS rose from 0% to 100%. SEARCH_URL is the
+# one URL column populated across the whole history, and despite its name it holds
+# the current page URL. Query strings are stripped so "?asset=..." variants of the
+# same page don't rank as separate rows.
+_PAGE_URL = (
+    "COALESCE(PARSE_URL(SEARCH_URL, 1):host::STRING, '') || '/' || "
+    "COALESCE(PARSE_URL(SEARCH_URL, 1):path::STRING, '')"
+)
+
+_REF_HOST = "PARSE_URL(REFERER_URL, 1):host::STRING"
+
+# 81% of referrers are an empty string (direct), and most of the remainder is our
+# own infrastructure or internal tooling - Atlassian, an S3 microsites bucket,
+# localhost, Amplify preview URLs. Ranking raw referrer hosts would present
+# internal traffic as acquisition, so sources are bucketed first. Edit these lists
+# if the estate changes; everything unmatched counts as genuinely External.
+_SOURCE_GROUP = f"""
+        CASE
+            WHEN COALESCE(REFERER_URL, '') = '' THEN 'Direct / none'
+            WHEN {_REF_HOST} IN ('localhost', '127.0.0.1')
+              OR {_REF_HOST} ILIKE '%amplifye.ai'
+              OR {_REF_HOST} ILIKE '%demandai.net'
+              OR {_REF_HOST} ILIKE '%atlassian.net'
+              OR {_REF_HOST} ILIKE '%amplifyapp.com'
+              OR {_REF_HOST} ILIKE '%amazonaws.com'
+              OR {_REF_HOST} ILIKE '%cloudfront.net' THEN 'Internal / dev'
+            WHEN {_REF_HOST} ILIKE '%officeapps.live.com'
+              OR {_REF_HOST} ILIKE '%sharepoint.com'
+              OR {_REF_HOST} ILIKE '%office.net'
+              OR {_REF_HOST} ILIKE '%microsoft.com' THEN 'Email / Office'
+            ELSE 'External'
+        END"""
+
+
+def top_pages_sql(limit: int = 15) -> str:
+    """Most-viewed pages, labelled by PROPERTIES:title where one exists.
+
+    Grouped on the canonical URL rather than the title, because titles drift while
+    the URL is stable - the same pattern top_campaigns_sql uses for campaign names.
+    """
+    return f"""
+        SELECT
+            COALESCE(MODE(PROPERTIES:title::STRING), {_PAGE_URL}) AS PAGE,
+            COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT
+        FROM {table_fqn()}
+        WHERE EVENT_TS::DATE BETWEEN ? AND ?
+          AND {_PAGE_VIEW}
+          AND SEARCH_URL IS NOT NULL
+        GROUP BY {_PAGE_URL}
+        ORDER BY EVENT_COUNT DESC
+        LIMIT {limit}
+    """
+
+
+def page_coverage_sql() -> str:
+    return f"""
+        SELECT
+            COUNT(DISTINCT {_PAGE_URL}) AS DISTINCT_PAGES,
+            COUNT(DISTINCT MESSAGE_ID) AS PAGE_VIEWS
+        FROM {table_fqn()}
+        WHERE EVENT_TS::DATE BETWEEN ? AND ?
+          AND {_PAGE_VIEW}
+          AND SEARCH_URL IS NOT NULL
+    """
+
+
+def traffic_sources_sql() -> str:
+    return f"""
+        SELECT {_SOURCE_GROUP} AS SOURCE_GROUP, COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT
+        FROM {table_fqn()}
+        WHERE EVENT_TS::DATE BETWEEN ? AND ?
+        GROUP BY 1
+        ORDER BY EVENT_COUNT DESC
+    """
+
+
+def top_external_referrers_sql(limit: int = 12) -> str:
+    return f"""
+        SELECT {_REF_HOST} AS REFERRER, COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT
+        FROM {table_fqn()}
+        WHERE EVENT_TS::DATE BETWEEN ? AND ?
+          AND {_SOURCE_GROUP} = 'External'
+        GROUP BY 1
+        ORDER BY EVENT_COUNT DESC
+        LIMIT {limit}
+    """
 
 
 def executive_kpis_sql() -> str:
     return f"""
         SELECT
-            COUNT(*) AS total_events,
+            COUNT(DISTINCT MESSAGE_ID) AS total_events,
             COUNT(DISTINCT SESSION_ID) AS total_sessions,
             COUNT(DISTINCT CAMPAIGN_ID) AS total_campaigns
         FROM {table_fqn()}
@@ -13,19 +137,30 @@ def executive_kpis_sql() -> str:
 
 
 def top_events_sql(limit: int = 10) -> str:
+    # EVENT_NAME arrives inconsistently cased and punctuated: "clicked"/"Clicked"
+    # and "form_submit"/"Form Submit" are the same action but ranked as separate
+    # bars, understating both. Normalise for grouping, title-case for display.
+    # Nulls are a real category (page views carrying no name), so they get a label
+    # rather than being silently dropped or shown as blank.
     return f"""
-        SELECT EVENT_NAME, COUNT(*) AS EVENT_COUNT
+        SELECT
+            IFF(EVENT_NAME IS NULL, '(unnamed page view)',
+                INITCAP(LOWER(REPLACE(EVENT_NAME, '_', ' ')))) AS EVENT_NAME,
+            COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT
         FROM {table_fqn()}
         WHERE EVENT_TS::DATE BETWEEN ? AND ?
-        GROUP BY EVENT_NAME
+          AND {_NOT_TEST}
+        GROUP BY 1
         ORDER BY EVENT_COUNT DESC
         LIMIT {limit}
     """
 
 
 def event_type_share_sql() -> str:
+    # Superseded on the Event Analytics page by event_mix_sql(), which labels the
+    # split in business terms. Kept because the raw type breakdown is still useful.
     return f"""
-        SELECT EVENT_TYPE, COUNT(*) AS EVENT_COUNT
+        SELECT EVENT_TYPE, COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT
         FROM {table_fqn()}
         WHERE EVENT_TS::DATE BETWEEN ? AND ?
         GROUP BY EVENT_TYPE
@@ -33,19 +168,125 @@ def event_type_share_sql() -> str:
     """
 
 
+def event_split_kpis_sql() -> str:
+    """Page views vs tracked actions - the volume/intent split."""
+    return f"""
+        SELECT
+            COUNT(DISTINCT IFF({_PAGE_VIEW}, MESSAGE_ID, NULL)) AS PAGE_VIEWS,
+            COUNT(DISTINCT IFF(NOT {_PAGE_VIEW}, MESSAGE_ID, NULL)) AS TRACKED_ACTIONS
+        FROM {table_fqn()}
+        WHERE EVENT_TS::DATE BETWEEN ? AND ?
+          AND {_NOT_TEST}
+    """
+
+
+def tracked_actions_sql(limit: int = 15) -> str:
+    """Intent signals only. Page views outnumber these ~20:1 and bury them when ranked together."""
+    return f"""
+        SELECT
+            INITCAP(LOWER(REPLACE(EVENT_NAME, '_', ' '))) AS EVENT_NAME,
+            COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT
+        FROM {table_fqn()}
+        WHERE EVENT_TS::DATE BETWEEN ? AND ?
+          AND NOT {_PAGE_VIEW}
+          AND {_NOT_TEST}
+          AND EVENT_NAME IS NOT NULL
+        GROUP BY 1
+        ORDER BY EVENT_COUNT DESC
+        LIMIT {limit}
+    """
+
+
+def event_mix_sql() -> str:
+    return f"""
+        SELECT
+            IFF({_PAGE_VIEW}, 'Page views', 'Tracked actions') AS EVENT_GROUP,
+            COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT
+        FROM {table_fqn()}
+        WHERE EVENT_TS::DATE BETWEEN ? AND ?
+          AND {_NOT_TEST}
+        GROUP BY 1
+        ORDER BY EVENT_COUNT DESC
+    """
+
+
+def funnel_sql() -> str:
+    """Three stages that genuinely nest, measured per session.
+
+    The intuitive ordering - page visit -> pdf -> click -> form submit - is NOT a
+    funnel, and the data says so plainly: in a 30-day window 9,001 sessions clicked
+    against only 2,269 that opened a PDF, 7,184 clicking sessions never touched a
+    PDF at all, and 413 form submissions involved no click. Presenting those as
+    sequential stages would invent a journey nobody takes.
+
+    Visited -> took any action -> submitted a form does nest, by construction: a
+    form submit is an action, and an action requires a session.
+    """
+    return f"""
+        WITH sess AS (
+            SELECT
+                SESSION_ID,
+                MAX(IFF(NOT {_PAGE_VIEW}, 1, 0)) AS DID_ACT,
+                MAX(IFF({_NORM} = 'form submit', 1, 0)) AS DID_CONVERT
+            FROM {table_fqn()}
+            WHERE EVENT_TS::DATE BETWEEN ? AND ?
+              AND SESSION_ID IS NOT NULL
+              AND {_NOT_TEST}
+            GROUP BY SESSION_ID
+        )
+        SELECT 1 AS STAGE_ORDER, 'Visited' AS STAGE, COUNT(*) AS SESSIONS FROM sess
+        UNION ALL
+        SELECT 2 AS STAGE_ORDER, 'Took an action' AS STAGE, COALESCE(SUM(DID_ACT), 0) FROM sess
+        UNION ALL
+        SELECT 3 AS STAGE_ORDER, 'Submitted a form' AS STAGE, COALESCE(SUM(DID_CONVERT), 0) FROM sess
+        ORDER BY STAGE_ORDER
+    """
+
+
+def action_reach_sql() -> str:
+    """Share of sessions performing each action. Overlapping, deliberately not a funnel."""
+    return f"""
+        WITH all_sessions AS (
+            SELECT SESSION_ID
+            FROM {table_fqn()}
+            WHERE EVENT_TS::DATE BETWEEN ? AND ?
+              AND SESSION_ID IS NOT NULL
+            GROUP BY SESSION_ID
+        ), acted AS (
+            SELECT DISTINCT SESSION_ID, INITCAP({_NORM}) AS ACTION
+            FROM {table_fqn()}
+            WHERE EVENT_TS::DATE BETWEEN ? AND ?
+              AND SESSION_ID IS NOT NULL
+              AND EVENT_NAME IS NOT NULL
+              AND NOT {_PAGE_VIEW}
+              AND {_NOT_TEST}
+        )
+        SELECT
+            ACTION,
+            COUNT(DISTINCT SESSION_ID) AS SESSIONS,
+            COUNT(DISTINCT SESSION_ID) * 100.0
+                / NULLIF((SELECT COUNT(*) FROM all_sessions), 0) AS PCT_OF_SESSIONS
+        FROM acted
+        GROUP BY ACTION
+        ORDER BY SESSIONS DESC
+    """
+
+
 def _session_summary_cte() -> str:
     return f"""
         SELECT
             SESSION_ID,
-            COUNT(*) AS EVENT_COUNT,
+            COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT,
             DATEDIFF('second', MIN(EVENT_TS), MAX(EVENT_TS)) AS DURATION_SECONDS
         FROM {table_fqn()}
         WHERE EVENT_TS::DATE BETWEEN ? AND ?
+          AND SESSION_ID IS NOT NULL
         GROUP BY SESSION_ID
     """
 
 
 def session_kpis_sql() -> str:
+    # COUNT(*) here counts session groups, not events - correct as written.
     return f"""
         SELECT
             COUNT(*) AS TOTAL_SESSIONS,
@@ -75,8 +316,8 @@ def session_durations_sql() -> str:
 
 
 def _visitor_summary_cte() -> str:
-    # No persistent user/visitor ID exists in this data; REQUEST_IP is the
-    # closest proxy for "who", acknowledging it can be shared (NAT, VPN, bots).
+    # No persistent user/visitor ID exists in this data; REQUEST_IP is the closest
+    # proxy for "who", acknowledging it can be shared (NAT, VPN, bots).
     return f"""
         SELECT
             REQUEST_IP,
@@ -84,11 +325,13 @@ def _visitor_summary_cte() -> str:
             COUNT(DISTINCT EVENT_TS::DATE) AS ACTIVE_DAYS
         FROM {table_fqn()}
         WHERE EVENT_TS::DATE BETWEEN ? AND ?
+          AND REQUEST_IP IS NOT NULL
         GROUP BY REQUEST_IP
     """
 
 
 def user_activity_kpis_sql() -> str:
+    # COUNT(*) here counts visitor groups, not events - correct as written.
     return f"""
         SELECT
             COUNT(*) AS TOTAL_VISITORS,
@@ -121,8 +364,12 @@ def campaign_kpis_sql() -> str:
         SELECT
             COUNT(DISTINCT CAMPAIGN_ID) AS TOTAL_CAMPAIGNS,
             COUNT(DISTINCT SESSION_ID) AS TOTAL_SESSIONS,
+            -- Numerator counts only events that actually carry a campaign: 0.53% of
+            -- rows have none, and including them while excluding them from the
+            -- distinct denominator overstates the average.
             COALESCE(
-                (COUNT(*) / NULLIF(COUNT(DISTINCT CAMPAIGN_ID), 0))::FLOAT, 0
+                (COUNT(DISTINCT IFF(CAMPAIGN_ID IS NOT NULL, MESSAGE_ID, NULL))
+                 / NULLIF(COUNT(DISTINCT CAMPAIGN_ID), 0))::FLOAT, 0
             ) AS AVG_EVENTS_PER_CAMPAIGN
         FROM {table_fqn()}
         WHERE EVENT_TS::DATE BETWEEN ? AND ?
@@ -136,7 +383,7 @@ def top_campaigns_sql(limit: int = 10) -> str:
     return f"""
         SELECT
             COALESCE(MODE(PROPERTIES:campaign_name::STRING), CAMPAIGN_ID) AS CAMPAIGN_LABEL,
-            COUNT(*) AS EVENT_COUNT
+            COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT
         FROM {table_fqn()}
         WHERE EVENT_TS::DATE BETWEEN ? AND ?
         GROUP BY CAMPAIGN_ID
@@ -146,8 +393,9 @@ def top_campaigns_sql(limit: int = 10) -> str:
 
 
 def channel_share_sql() -> str:
+    # CHANNEL holds device type (desktop / web / mobile), not an acquisition channel.
     return f"""
-        SELECT CHANNEL, COUNT(*) AS EVENT_COUNT
+        SELECT CHANNEL, COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT
         FROM {table_fqn()}
         WHERE EVENT_TS::DATE BETWEEN ? AND ?
         GROUP BY CHANNEL
