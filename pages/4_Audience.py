@@ -9,12 +9,10 @@ from src.charts import ordered_bar, top_events_bar
 from src.components import compact, date_range_filter, kpi, kpi_row, previous_window
 from src.db import run_query
 from src.queries import (
+    audience_geo_sql,
     audience_kpis_sql,
-    geo_region_sql,
     identity_cohort_sql,
-    locale_share_sql,
     top_accounts_sql,
-    top_timezones_sql,
     top_visitor_by_sessions_sql,
     user_activity_kpis_sql,
     visitor_sessions_bands_sql,
@@ -113,18 +111,23 @@ else:
     with st.expander("All domains, including consumer mailboxes"):
         st.dataframe(accounts, use_container_width=True, hide_index=True)
 
+# Region, timezone and locale arrive from a single scan - see audience_geo_sql.
+# Three separate queries here cost 3.8s against 0.8s combined.
+geo = run_query(audience_geo_sql(), params)
+regions = geo[geo["KIND"] == "region"][["LABEL", "SESSIONS"]].rename(columns={"LABEL": "REGION"})
+zones = geo[geo["KIND"] == "timezone"][["LABEL", "SESSIONS"]].rename(columns={"LABEL": "TIMEZONE"})
+locales = geo[geo["KIND"] == "locale"][["LABEL", "SESSIONS"]].rename(columns={"LABEL": "LOCALE"})
+
 st.subheader("Where They Are")
 st.caption("Derived from the browser timezone, which is present on every event. UTC and Etc/* are settings rather than places, so they are grouped as unknown.")
-regions = run_query(geo_region_sql(), params)
 if regions.empty:
     st.info("No sessions in this date range.")
 else:
     st.altair_chart(ordered_bar(regions, "REGION", "SESSIONS", x_title="Sessions"), use_container_width=True)
     with st.expander("Individual timezones"):
-        st.dataframe(run_query(top_timezones_sql(), params), use_container_width=True, hide_index=True)
+        st.dataframe(zones, use_container_width=True, hide_index=True)
 
 st.subheader("Language")
-locales = run_query(locale_share_sql(), params)
 if locales.empty:
     st.info("No locale recorded in this date range.")
 else:

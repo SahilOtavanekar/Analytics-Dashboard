@@ -2,12 +2,19 @@ import datetime as dt
 
 import streamlit as st
 
+from src.db import CACHE_TTL_SECONDS, clear_cache
+
 # Streamlit discards widget state on page navigation, so the selection is
 # mirrored into a plain (non-widget) key that survives, then fed back in as the
 # widget's value on the next page. Reading the widget's own key instead is what
 # reset the range to the default on every page switch.
 _STORE = "date_range_value"
 _WIDGET = "date_range_widget"
+
+# Results are cached for an hour so navigation doesn't re-query - see src/db.py for
+# the measurements behind that. An hour of staleness on a 30-day window is
+# immaterial, but it must be visible and overridable rather than silent.
+_CACHE_NOTE = "Figures are cached for up to {mins} min. Refresh to re-query Snowflake."
 
 
 def compact(value) -> str:
@@ -100,5 +107,13 @@ def date_range_filter(default_days: int = 30, key: str = _WIDGET) -> tuple[dt.da
     # so the dashboard doesn't snap to the default for a rerun.
     if isinstance(selected, (tuple, list)) and len(selected) == 2:
         st.session_state[_STORE] = (selected[0], selected[1])
+
+    # Rendered on every page, because the cache is what makes navigation fast and
+    # the reader needs a way out of it without knowing where the setting lives.
+    if st.sidebar.button("Refresh data", use_container_width=True):
+        clear_cache()
+        st.session_state.pop("warmed_range", None)
+        st.rerun()
+    st.sidebar.caption(_CACHE_NOTE.format(mins=CACHE_TTL_SECONDS // 60))
 
     return st.session_state[_STORE]

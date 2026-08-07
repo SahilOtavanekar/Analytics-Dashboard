@@ -38,8 +38,11 @@ start_date, end_date = date_range_filter(default_days=30)
 prev_start, prev_end = previous_window(start_date, end_date)
 params = [start_date, end_date]
 
-now = run_query(session_kpis_sql(), params + params).iloc[0]
-was = run_query(session_kpis_sql(), [prev_start, prev_end, prev_start, prev_end]).iloc[0]
+# session_kpis_sql has two placeholders, not four. This passed the range twice for
+# a shape the query no longer has; Snowflake ignored the extras, so the numbers were
+# right, but the next placeholder added to that query would have bound wrongly.
+now = run_query(session_kpis_sql(), params).iloc[0]
+was = run_query(session_kpis_sql(), [prev_start, prev_end]).iloc[0]
 
 kpi_row(
     [
