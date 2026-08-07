@@ -94,7 +94,7 @@ else:
     table["LEAD_CONV_PCT"] = [f"{v:.2f}%" for v in table["LEAD_CONV_PCT"]]
     table["MEDIAN_EVENTS"] = [f"{v:.0f}" for v in table["MEDIAN_EVENTS"]]
     table.columns = ["Cohort", "Sessions", "Engagement", "Lead conversion", "Median events"]
-    st.dataframe(table, use_container_width=True, hide_index=True)
+    st.dataframe(table, width="stretch", hide_index=True)
 
 st.subheader("Top Companies")
 accounts = run_query(top_accounts_sql(), params)
@@ -108,9 +108,9 @@ else:
     if corporate.empty:
         st.info("No corporate domains in this date range.")
     else:
-        st.altair_chart(top_events_bar(corporate, "COMPANY", "SESSIONS", x_title="Sessions"), use_container_width=True)
+        st.altair_chart(top_events_bar(corporate, "COMPANY", "SESSIONS", x_title="Sessions"), width="stretch")
     with st.expander("All domains, including consumer mailboxes"):
-        st.dataframe(accounts, use_container_width=True, hide_index=True)
+        st.dataframe(accounts, width="stretch", hide_index=True)
 
 # Region, timezone and locale arrive from a single scan - see audience_geo_sql.
 # Three separate queries here cost 3.8s against 0.8s combined.
@@ -124,15 +124,15 @@ st.caption("Derived from the browser timezone, which is present on every event. 
 if regions.empty:
     st.info("No sessions in this date range.")
 else:
-    st.altair_chart(ordered_bar(regions, "REGION", "SESSIONS", x_title="Sessions"), use_container_width=True)
+    st.altair_chart(ordered_bar(regions, "REGION", "SESSIONS", x_title="Sessions"), width="stretch")
     with st.expander("Individual timezones"):
-        st.dataframe(zones, use_container_width=True, hide_index=True)
+        st.dataframe(zones, width="stretch", hide_index=True)
 
 st.subheader("Language")
 if locales.empty:
     st.info("No locale recorded in this date range.")
 else:
-    st.altair_chart(ordered_bar(locales, "LOCALE", "SESSIONS", x_title="Sessions"), use_container_width=True)
+    st.altair_chart(ordered_bar(locales, "LOCALE", "SESSIONS", x_title="Sessions"), width="stretch")
 
 st.subheader("Anonymous Activity (IP proxy)")
 st.caption(IP_PROXY_NOTE)
@@ -158,9 +158,9 @@ percentiles = run_query(visitor_sessions_percentiles_sql(), params)
 if bands.empty:
     st.info("No visitor activity in this date range.")
 else:
-    st.altair_chart(ordered_bar(bands, "BAND", "VISITORS", x_title="IP addresses"), use_container_width=True)
+    st.altair_chart(ordered_bar(bands, "BAND", "VISITORS", x_title="IP addresses"), width="stretch")
     with st.expander("Percentiles and edge cases"):
-        st.dataframe(percentiles.T, use_container_width=True)
+        st.dataframe(percentiles.T, width="stretch")
 
 stats = percentiles.iloc[0]
 top = run_query(top_visitor_by_sessions_sql(), params)

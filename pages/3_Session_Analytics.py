@@ -64,9 +64,9 @@ if over_time.empty:
     st.info("No sessions in this date range.")
 else:
     trend = trend_line(over_time, "EVENT_DATE", "SESSION_COUNT", "Sessions")
-    st.altair_chart(trend, use_container_width=True)
+    st.altair_chart(trend, width="stretch")
     with st.expander("View as table"):
-        st.dataframe(over_time, use_container_width=True, hide_index=True)
+        st.dataframe(over_time, width="stretch", hide_index=True)
 
 st.subheader("Session Duration")
 st.caption(DURATION_NOTE)
@@ -74,9 +74,9 @@ bands = run_query(session_duration_bands_sql(), params)
 if bands.empty:
     st.info("No sessions in this date range.")
 else:
-    st.altair_chart(ordered_bar(bands, "BAND", "SESSIONS"), use_container_width=True)
+    st.altair_chart(ordered_bar(bands, "BAND", "SESSIONS"), width="stretch")
     with st.expander("Percentiles and edge cases"):
-        st.dataframe(run_query(session_duration_percentiles_sql(), params).T, use_container_width=True)
+        st.dataframe(run_query(session_duration_percentiles_sql(), params).T, width="stretch")
 
 integrity = run_query(session_integrity_sql(), params).iloc[0]
 if int(integrity["MULTI_IP_SESSIONS"]) > 0:

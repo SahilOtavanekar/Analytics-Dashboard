@@ -79,16 +79,16 @@ else:
     table["LEAD_CONV_PCT"] = [f"{v:.2f}%" for v in table["LEAD_CONV_PCT"]]
     table["MEDIAN_EVENTS"] = [f"{v:.0f}" for v in table["MEDIAN_EVENTS"]]
     table.columns = ["Cohort", "Sessions", "Engagement", "Lead conversion", "Median events"]
-    st.dataframe(table, use_container_width=True, hide_index=True)
+    st.dataframe(table, width="stretch", hide_index=True)
 
 st.subheader("Top Content by Reach")
 top = run_query(top_assets_sql(), params)
 if top.empty:
     st.info(NO_ASSETS)
 else:
-    st.altair_chart(top_events_bar(top, "ASSET", "SESSIONS", x_title="Sessions"), use_container_width=True)
+    st.altair_chart(top_events_bar(top, "ASSET", "SESSIONS", x_title="Sessions"), width="stretch")
     with st.expander("With engagement depth"):
-        st.dataframe(top, use_container_width=True, hide_index=True)
+        st.dataframe(top, width="stretch", hide_index=True)
 
 st.subheader("PDF Read Depth")
 depth = run_query(asset_read_depth_sql(), params)
@@ -96,8 +96,8 @@ if depth.empty:
     st.info("No PDF page-turn events in this date range.")
 else:
     st.caption(DEPTH_NOTE.format(n=int(depth["SESSIONS"].sum())))
-    st.altair_chart(top_events_bar(depth, "ASSET", "AVG_PAGE_REACHED", x_title="Average page reached"), use_container_width=True)
+    st.altair_chart(top_events_bar(depth, "ASSET", "AVG_PAGE_REACHED", x_title="Average page reached"), width="stretch")
     with st.expander("Deepest page reached per asset"):
-        st.dataframe(depth, use_container_width=True, hide_index=True)
+        st.dataframe(depth, width="stretch", hide_index=True)
 
 st.caption(f"Showing {start_date} to {end_date}. Change is against {prev_start} to {prev_end}.")

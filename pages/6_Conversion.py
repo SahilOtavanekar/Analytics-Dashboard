@@ -63,9 +63,9 @@ st.caption(
 )
 
 st.subheader("Session Funnel")
-st.altair_chart(funnel_bar(now, "STAGE", "SESSIONS"), use_container_width=True)
+st.altair_chart(funnel_bar(now, "STAGE", "SESSIONS"), width="stretch")
 with st.expander("View as table"):
-    st.dataframe(now[["STAGE", "SESSIONS"]], use_container_width=True, hide_index=True)
+    st.dataframe(now[["STAGE", "SESSIONS"]], width="stretch", hide_index=True)
 
 st.subheader("Form Performance")
 forms = run_query(form_performance_sql(), params)
@@ -80,9 +80,9 @@ else:
     if leads.empty:
         st.info("No lead-form submissions in this date range.")
     else:
-        st.altair_chart(top_events_bar(leads, "FORM_ID", "SUBMITS", x_title="Submits"), use_container_width=True)
+        st.altair_chart(top_events_bar(leads, "FORM_ID", "SUBMITS", x_title="Submits"), width="stretch")
     with st.expander("All forms, including the consent banner"):
-        st.dataframe(forms, use_container_width=True, hide_index=True)
+        st.dataframe(forms, width="stretch", hide_index=True)
 
 st.subheader("Action Reach")
 st.caption(NOT_A_FUNNEL)
@@ -90,8 +90,8 @@ reach = run_query(action_reach_sql(), params + params)
 if reach.empty:
     st.info("No tracked actions in this date range.")
 else:
-    st.altair_chart(top_events_bar(reach, "ACTION", "SESSIONS", x_title="Sessions"), use_container_width=True)
+    st.altair_chart(top_events_bar(reach, "ACTION", "SESSIONS", x_title="Sessions"), width="stretch")
     with st.expander("View as table"):
-        st.dataframe(reach, use_container_width=True, hide_index=True)
+        st.dataframe(reach, width="stretch", hide_index=True)
 
 st.caption(f"Showing {start_date} to {end_date}. Change is against {prev_start} to {prev_end}.")

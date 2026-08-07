@@ -68,9 +68,9 @@ mix = run_query(model_mix_sql(), params)
 if mix.empty:
     st.info(NO_AI)
 else:
-    st.altair_chart(share_stacked_bar(mix, "MODEL", "REQUESTS"), use_container_width=True)
+    st.altair_chart(share_stacked_bar(mix, "MODEL", "REQUESTS"), width="stretch")
     with st.expander("View as table"):
-        st.dataframe(mix, use_container_width=True, hide_index=True)
+        st.dataframe(mix, width="stretch", hide_index=True)
 
 st.subheader("Model Migration")
 trend = run_query(model_trend_sql(), params)
@@ -78,7 +78,7 @@ if trend.empty or trend["WEEK_START"].nunique() < 2:
     st.info("Not enough weeks in this range to show a trend. Widen the date range.")
 else:
     st.caption("Weekly requests per model. Widen the range to see the full migration curve.")
-    st.altair_chart(multi_trend_line(trend, "WEEK_START", "REQUESTS", "MODEL", "Requests"), use_container_width=True)
+    st.altair_chart(multi_trend_line(trend, "WEEK_START", "REQUESTS", "MODEL", "Requests"), width="stretch")
 
 st.subheader("Does AI Change Behaviour?")
 cohort = run_query(ai_cohort_sql(), params)
@@ -94,6 +94,6 @@ else:
     table["LEAD_CONV_PCT"] = [f"{v:.2f}%" for v in table["LEAD_CONV_PCT"]]
     table["MEDIAN_EVENTS"] = [f"{v:.0f}" for v in table["MEDIAN_EVENTS"]]
     table.columns = ["Cohort", "Sessions", "Engagement", "Lead conversion", "Median events"]
-    st.dataframe(table, use_container_width=True, hide_index=True)
+    st.dataframe(table, width="stretch", hide_index=True)
 
 st.caption(f"Showing {start_date} to {end_date}. Change is against {prev_start} to {prev_end}.")

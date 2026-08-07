@@ -87,7 +87,7 @@ else:
     table["LEAD_CONV_PCT"] = [f"{v:.2f}%" for v in table["LEAD_CONV_PCT"]]
     table["MEDIAN_EVENTS"] = [f"{v:.0f}" for v in table["MEDIAN_EVENTS"]]
     table.columns = ["Tenant", "Top campaign", "Sessions", "Engagement", "Lead conversion", "Median events"]
-    st.dataframe(table, use_container_width=True, hide_index=True)
+    st.dataframe(table, width="stretch", hide_index=True)
 
 st.subheader("Biggest Movers")
 st.caption(MOVEMENT_NOTE)
@@ -95,11 +95,11 @@ movement = run_query(tenant_movement_sql(), params + [prev_start, prev_end])
 if movement.empty:
     st.info("No tenant activity to compare across these two windows.")
 else:
-    st.altair_chart(diverging_bar(movement, "TENANT", "CHANGE", x_title="Change in events"), use_container_width=True)
+    st.altair_chart(diverging_bar(movement, "TENANT", "CHANGE", x_title="Change in events"), width="stretch")
     gone = movement[(movement["PRIOR_EVENTS"] > 0) & (movement["CURRENT_EVENTS"] == 0)]
     if not gone.empty:
         st.warning(f"{len(gone)} tenant(s) recorded activity in the previous window and none in this one: {', '.join(gone['TENANT'].astype(str))}.")
     with st.expander("View as table"):
-        st.dataframe(movement, use_container_width=True, hide_index=True)
+        st.dataframe(movement, width="stretch", hide_index=True)
 
 st.caption(f"Showing {start_date} to {end_date}. Change is against {prev_start} to {prev_end}.")

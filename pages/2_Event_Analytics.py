@@ -42,20 +42,20 @@ actions = run_query(tracked_actions_sql(), params)
 if actions.empty:
     st.info("No tracked actions in this date range.")
 else:
-    st.altair_chart(top_events_bar(actions, "EVENT_NAME", "EVENT_COUNT"), use_container_width=True)
+    st.altair_chart(top_events_bar(actions, "EVENT_NAME", "EVENT_COUNT"), width="stretch")
     with st.expander("View as table"):
-        st.dataframe(actions, use_container_width=True, hide_index=True)
+        st.dataframe(actions, width="stretch", hide_index=True)
 
 st.subheader("Event Mix")
 mix = run_query(event_mix_sql(), params)
 if mix.empty:
     st.info("No events in this date range.")
 else:
-    st.altair_chart(share_stacked_bar(mix, "EVENT_GROUP", "EVENT_COUNT"), use_container_width=True)
+    st.altair_chart(share_stacked_bar(mix, "EVENT_GROUP", "EVENT_COUNT"), width="stretch")
     with st.expander("View as table"):
-        st.dataframe(mix, use_container_width=True, hide_index=True)
+        st.dataframe(mix, width="stretch", hide_index=True)
 
 with st.expander("All events, page views included"):
-    st.dataframe(run_query(top_events_sql(limit=25), params), use_container_width=True, hide_index=True)
+    st.dataframe(run_query(top_events_sql(limit=25), params), width="stretch", hide_index=True)
 
 st.caption(f"Showing {start_date} to {end_date}. Change is against {prev_start} to {prev_end}.")

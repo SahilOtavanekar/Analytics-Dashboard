@@ -59,17 +59,17 @@ pages = run_query(top_pages_sql(), params)
 if pages.empty:
     st.info("No page views with a resolvable URL in this date range.")
 else:
-    st.altair_chart(top_events_bar(pages, "PAGE", "EVENT_COUNT", x_title="Page views"), use_container_width=True)
+    st.altair_chart(top_events_bar(pages, "PAGE", "EVENT_COUNT", x_title="Page views"), width="stretch")
     with st.expander("View as table"):
-        st.dataframe(pages, use_container_width=True, hide_index=True)
+        st.dataframe(pages, width="stretch", hide_index=True)
 
 st.subheader("Traffic Sources")
 if sources.empty:
     st.info("No events in this date range.")
 else:
-    st.altair_chart(share_stacked_bar(sources, "SOURCE_GROUP", "EVENT_COUNT"), use_container_width=True)
+    st.altair_chart(share_stacked_bar(sources, "SOURCE_GROUP", "EVENT_COUNT"), width="stretch")
     with st.expander("View as table"):
-        st.dataframe(sources, use_container_width=True, hide_index=True)
+        st.dataframe(sources, width="stretch", hide_index=True)
 
 st.subheader("Top External Referrers")
 st.caption(SOURCE_NOTE)
@@ -77,8 +77,8 @@ referrers = run_query(top_external_referrers_sql(), params)
 if referrers.empty:
     st.info("No external referrals in this date range.")
 else:
-    st.altair_chart(top_events_bar(referrers, "REFERRER", "EVENT_COUNT", x_title="Events"), use_container_width=True)
+    st.altair_chart(top_events_bar(referrers, "REFERRER", "EVENT_COUNT", x_title="Events"), width="stretch")
     with st.expander("View as table"):
-        st.dataframe(referrers, use_container_width=True, hide_index=True)
+        st.dataframe(referrers, width="stretch", hide_index=True)
 
 st.caption(f"Showing {start_date} to {end_date}. Change is against {prev_start} to {prev_end}.")

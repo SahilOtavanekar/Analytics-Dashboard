@@ -33,17 +33,17 @@ top_campaigns = run_query(top_campaigns_sql(), params)
 if top_campaigns.empty:
     st.info("No campaign activity in this date range.")
 else:
-    st.altair_chart(top_events_bar(top_campaigns, "CAMPAIGN_LABEL", "EVENT_COUNT"), use_container_width=True)
+    st.altair_chart(top_events_bar(top_campaigns, "CAMPAIGN_LABEL", "EVENT_COUNT"), width="stretch")
     with st.expander("View as table"):
-        st.dataframe(top_campaigns, use_container_width=True, hide_index=True)
+        st.dataframe(top_campaigns, width="stretch", hide_index=True)
 
 st.subheader("Traffic by Device")
 channel_share = run_query(channel_share_sql(), params)
 if channel_share.empty:
     st.info("No device activity in this date range.")
 else:
-    st.altair_chart(share_stacked_bar(channel_share, "CHANNEL", "EVENT_COUNT"), use_container_width=True)
+    st.altair_chart(share_stacked_bar(channel_share, "CHANNEL", "EVENT_COUNT"), width="stretch")
     with st.expander("View as table"):
-        st.dataframe(channel_share, use_container_width=True, hide_index=True)
+        st.dataframe(channel_share, width="stretch", hide_index=True)
 
 st.caption(f"Showing {start_date} to {end_date}. Change is against {prev_start} to {prev_end}.")
