@@ -286,13 +286,107 @@ def _session_summary_cte() -> str:
 
 
 def session_kpis_sql() -> str:
-    # COUNT(*) here counts session groups, not events - correct as written.
+    """Medians, not means. COUNT(*) counts session groups, not events - correct as written.
+
+    Session duration is extreme enough that the mean is an artifact rather than a
+    summary: half of all sessions have zero duration, the median is one second, and
+    the mean is 23 minutes because a handful of sessions span weeks. Reporting the
+    mean as "Avg Session Duration" overstated the typical session ~1,400x. Means are
+    still returned, for the hover detail.
+    """
     return f"""
         SELECT
             COUNT(*) AS TOTAL_SESSIONS,
-            COALESCE((AVG(EVENT_COUNT))::FLOAT, 0) AS AVG_EVENTS_PER_SESSION,
-            COALESCE((AVG(DURATION_SECONDS) / 60.0)::FLOAT, 0) AS AVG_DURATION_MINUTES
+            COALESCE((APPROX_PERCENTILE(EVENT_COUNT, 0.5))::FLOAT, 0) AS MEDIAN_EVENTS,
+            COALESCE((AVG(EVENT_COUNT))::FLOAT, 0) AS MEAN_EVENTS,
+            COALESCE((APPROX_PERCENTILE(DURATION_SECONDS, 0.5) / 60.0)::FLOAT, 0) AS MEDIAN_DURATION_MINUTES,
+            COALESCE((AVG(DURATION_SECONDS) / 60.0)::FLOAT, 0) AS MEAN_DURATION_MINUTES,
+            COALESCE(
+                (SUM(IFF(DURATION_SECONDS = 0, 1, 0)) * 100.0 / NULLIF(COUNT(*), 0))::FLOAT, 0
+            ) AS PCT_INSTANT
         FROM ({_session_summary_cte()})
+    """
+
+
+def session_duration_bands_sql() -> str:
+    """Duration in interpretable bands.
+
+    A linear histogram cannot render this distribution: 49.8% of sessions sit at
+    exactly zero and the tail reaches 60 days, so one bar holds almost everything
+    and the p95 clip doesn't rescue it. Fixed bands are readable and each one means
+    something on its own. Returns 7 rows instead of 100k+, so it also stops shipping
+    the whole session table to the client.
+    """
+    return f"""
+        SELECT
+            CASE
+                WHEN DURATION_SECONDS = 0 THEN '0s (instant)'
+                WHEN DURATION_SECONDS <= 10 THEN '1-10 seconds'
+                WHEN DURATION_SECONDS <= 60 THEN '10-60 seconds'
+                WHEN DURATION_SECONDS <= 300 THEN '1-5 minutes'
+                WHEN DURATION_SECONDS <= 1800 THEN '5-30 minutes'
+                WHEN DURATION_SECONDS <= 7200 THEN '30 min - 2 hours'
+                ELSE 'over 2 hours'
+            END AS BAND,
+            CASE
+                WHEN DURATION_SECONDS = 0 THEN 1
+                WHEN DURATION_SECONDS <= 10 THEN 2
+                WHEN DURATION_SECONDS <= 60 THEN 3
+                WHEN DURATION_SECONDS <= 300 THEN 4
+                WHEN DURATION_SECONDS <= 1800 THEN 5
+                WHEN DURATION_SECONDS <= 7200 THEN 6
+                ELSE 7
+            END AS BAND_ORDER,
+            COUNT(*) AS SESSIONS
+        FROM ({_session_summary_cte()})
+        GROUP BY BAND, BAND_ORDER
+        ORDER BY BAND_ORDER
+    """
+
+
+def session_duration_percentiles_sql() -> str:
+    """Percentiles and degenerate-case counts - what .describe() should have shown."""
+    return f"""
+        SELECT
+            COUNT(*) AS SESSIONS,
+            ROUND(APPROX_PERCENTILE(DURATION_SECONDS, 0.50) / 60.0, 3) AS P50_MINUTES,
+            ROUND(APPROX_PERCENTILE(DURATION_SECONDS, 0.75) / 60.0, 3) AS P75_MINUTES,
+            ROUND(APPROX_PERCENTILE(DURATION_SECONDS, 0.90) / 60.0, 2) AS P90_MINUTES,
+            ROUND(APPROX_PERCENTILE(DURATION_SECONDS, 0.95) / 60.0, 2) AS P95_MINUTES,
+            ROUND(APPROX_PERCENTILE(DURATION_SECONDS, 0.99) / 60.0, 2) AS P99_MINUTES,
+            ROUND(AVG(DURATION_SECONDS) / 60.0, 2) AS MEAN_MINUTES,
+            ROUND(MAX(DURATION_SECONDS) / 86400.0, 2) AS MAX_DAYS,
+            SUM(IFF(DURATION_SECONDS = 0, 1, 0)) AS INSTANT_SESSIONS,
+            SUM(IFF(DURATION_SECONDS > 7200, 1, 0)) AS OVER_2_HOURS,
+            SUM(IFF(DURATION_SECONDS > 86400, 1, 0)) AS OVER_24_HOURS
+        FROM ({_session_summary_cte()})
+    """
+
+
+def session_integrity_sql() -> str:
+    """How far SESSION_ID can be trusted to mean "one visit".
+
+    Measured, not assumed: the worst session in a recent 60-day window carried 45
+    distinct IPs across 36 active days. Session IDs are reused across unrelated
+    visitors, so any per-session metric is a blend for those rows.
+    """
+    return f"""
+        WITH s AS (
+            SELECT
+                SESSION_ID,
+                COUNT(DISTINCT REQUEST_IP) AS IPS,
+                DATEDIFF('second', MIN(EVENT_TS), MAX(EVENT_TS)) AS DURATION_SECONDS
+            FROM {table_fqn()}
+            WHERE EVENT_TS::DATE BETWEEN ? AND ?
+              AND SESSION_ID IS NOT NULL
+            GROUP BY SESSION_ID
+        )
+        SELECT
+            COUNT(*) AS SESSIONS,
+            SUM(IFF(IPS > 1, 1, 0)) AS MULTI_IP_SESSIONS,
+            MAX(IPS) AS MAX_IPS_ON_ONE_SESSION,
+            SUM(IFF(DURATION_SECONDS > 86400, 1, 0)) AS OVER_24_HOURS
+        FROM s
     """
 
 
@@ -305,13 +399,6 @@ def sessions_over_time_sql() -> str:
         WHERE EVENT_TS::DATE BETWEEN ? AND ?
         GROUP BY EVENT_DATE
         ORDER BY EVENT_DATE
-    """
-
-
-def session_durations_sql() -> str:
-    return f"""
-        SELECT (DURATION_SECONDS / 60.0)::FLOAT AS DURATION_MINUTES
-        FROM ({_session_summary_cte()})
     """
 
 
@@ -331,21 +418,76 @@ def _visitor_summary_cte() -> str:
 
 
 def user_activity_kpis_sql() -> str:
-    # COUNT(*) here counts visitor groups, not events - correct as written.
+    """Median first. COUNT(*) counts visitor groups, not events - correct as written.
+
+    Sessions per visitor is as skewed as session duration: 59.7% of IPs have exactly
+    one session, the median is 1, and the mean is 9.2 because one IP carries 4,053.
+    The mean overstated the typical visitor ~9x.
+    """
     return f"""
         SELECT
             COUNT(*) AS TOTAL_VISITORS,
             COALESCE(
                 (SUM(CASE WHEN ACTIVE_DAYS > 1 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0))::FLOAT, 0
             ) AS PCT_RETURNING,
-            COALESCE((AVG(SESSION_COUNT))::FLOAT, 0) AS AVG_SESSIONS_PER_VISITOR
+            COALESCE((APPROX_PERCENTILE(SESSION_COUNT, 0.5))::FLOAT, 0) AS MEDIAN_SESSIONS_PER_VISITOR,
+            COALESCE((AVG(SESSION_COUNT))::FLOAT, 0) AS MEAN_SESSIONS_PER_VISITOR,
+            COALESCE(
+                (SUM(CASE WHEN SESSION_COUNT = 1 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0))::FLOAT, 0
+            ) AS PCT_SINGLE_SESSION
         FROM ({_visitor_summary_cte()})
     """
 
 
-def sessions_per_visitor_sql() -> str:
+def visitor_sessions_bands_sql() -> str:
+    """Sessions per visitor in bands, so every visitor is represented.
+
+    The histogram this replaces clipped its bin extent to the 95th percentile, which
+    silently dropped ~5% of visitors from the drawing - including the single busiest
+    one, which is the row a reader most wants to see. Bands put the outliers in an
+    explicit "over 100" bucket instead, and return 7 rows rather than several
+    thousand.
+    """
     return f"""
-        SELECT SESSION_COUNT::FLOAT AS SESSION_COUNT
+        SELECT
+            CASE
+                WHEN SESSION_COUNT = 1 THEN '1 session'
+                WHEN SESSION_COUNT <= 5 THEN '2-5 sessions'
+                WHEN SESSION_COUNT <= 10 THEN '6-10 sessions'
+                WHEN SESSION_COUNT <= 25 THEN '11-25 sessions'
+                WHEN SESSION_COUNT <= 50 THEN '26-50 sessions'
+                WHEN SESSION_COUNT <= 100 THEN '51-100 sessions'
+                ELSE 'over 100 sessions'
+            END AS BAND,
+            CASE
+                WHEN SESSION_COUNT = 1 THEN 1
+                WHEN SESSION_COUNT <= 5 THEN 2
+                WHEN SESSION_COUNT <= 10 THEN 3
+                WHEN SESSION_COUNT <= 25 THEN 4
+                WHEN SESSION_COUNT <= 50 THEN 5
+                WHEN SESSION_COUNT <= 100 THEN 6
+                ELSE 7
+            END AS BAND_ORDER,
+            COUNT(*) AS VISITORS
+        FROM ({_visitor_summary_cte()})
+        GROUP BY BAND, BAND_ORDER
+        ORDER BY BAND_ORDER
+    """
+
+
+def visitor_sessions_percentiles_sql() -> str:
+    return f"""
+        SELECT
+            COUNT(*) AS VISITORS,
+            APPROX_PERCENTILE(SESSION_COUNT, 0.50) AS P50_SESSIONS,
+            APPROX_PERCENTILE(SESSION_COUNT, 0.75) AS P75_SESSIONS,
+            APPROX_PERCENTILE(SESSION_COUNT, 0.90) AS P90_SESSIONS,
+            APPROX_PERCENTILE(SESSION_COUNT, 0.95) AS P95_SESSIONS,
+            APPROX_PERCENTILE(SESSION_COUNT, 0.99) AS P99_SESSIONS,
+            ROUND(AVG(SESSION_COUNT), 2) AS MEAN_SESSIONS,
+            MAX(SESSION_COUNT) AS MAX_SESSIONS,
+            SUM(IFF(SESSION_COUNT = 1, 1, 0)) AS SINGLE_SESSION_VISITORS,
+            SUM(IFF(SESSION_COUNT > 100, 1, 0)) AS OVER_100_SESSIONS
         FROM ({_visitor_summary_cte()})
     """
 

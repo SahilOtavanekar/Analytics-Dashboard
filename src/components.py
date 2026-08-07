@@ -27,6 +27,20 @@ def compact(value) -> str:
     return f"{n:,.0f}"
 
 
+def duration_label(minutes) -> str:
+    """Readable duration, scaled to its own magnitude.
+
+    Sessions here have a median of 0.0167 minutes, which reads as "0.02 min" under
+    fixed formatting and as "1 s" under this one. Same number, one of them legible.
+    """
+    m = float(minutes)
+    if m < 1:
+        return f"{m * 60:.0f} s"
+    if m < 60:
+        return f"{m:.1f} min"
+    return f"{m / 60:.1f} h"
+
+
 def previous_window(start: dt.date, end: dt.date) -> tuple[dt.date, dt.date]:
     """The equal-length window ending the day before `start`, for comparison."""
     span = (end - start).days
@@ -34,22 +48,27 @@ def previous_window(start: dt.date, end: dt.date) -> tuple[dt.date, dt.date]:
     return prev_end - dt.timedelta(days=span), prev_end
 
 
-def kpi(label, current, previous=None, decimals=0, suffix="", delta_as_points=False):
+def kpi(label, current, previous=None, decimals=0, suffix="", delta_as_points=False, formatter=None):
     """Build one metric card: compact value, exact figure on hover, change vs previous.
 
     `delta_as_points` reports a percentage-point difference instead of a percentage
     change - the honest form when the metric is itself a percentage, where "+4%"
-    is ambiguous between relative and absolute movement.
+    is ambiguous between relative and absolute movement. `formatter` overrides the
+    display for values that need their own scale, e.g. duration_label.
     """
     current = float(current)
-    display = f"{current:,.{decimals}f}{suffix}" if decimals else f"{compact(current)}{suffix}"
-    exact = f"{current:,.{decimals}f}{suffix}"
+    if formatter:
+        display = exact = formatter(current)
+    else:
+        display = f"{current:,.{decimals}f}{suffix}" if decimals else f"{compact(current)}{suffix}"
+        exact = f"{current:,.{decimals}f}{suffix}"
 
     delta = None
     detail = f"{exact} this period"
     if previous is not None:
         previous = float(previous)
-        detail = f"{exact} this period vs {previous:,.{decimals}f}{suffix} previous"
+        prev_text = formatter(previous) if formatter else f"{previous:,.{decimals}f}{suffix}"
+        detail = f"{exact} this period vs {prev_text} previous"
         if delta_as_points:
             delta = f"{current - previous:+.1f} pp"
         elif previous != 0:

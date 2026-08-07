@@ -4,34 +4,45 @@ import pandas as pd
 from src.theme import CATEGORICAL, SEQUENTIAL_BLUE
 
 
-def funnel_bar(df: pd.DataFrame, stage_col: str, value_col: str) -> alt.LayerChart:
-    """Nested stages held in the given order, never value-sorted.
+def _ordered_labelled_bar(df, label_col, value_col, x_title, denominator, pct_title, step):
+    """Horizontal bars held in the order supplied, labelled with count and share.
 
-    Sorting by value would let a wider lower stage jump above a narrower upper one
-    and imply a journey that doesn't exist, so the row order carries the sequence.
-    Each bar is labelled with its count and its share of the first stage.
+    Row order carries meaning in both callers - funnel sequence, duration bands - so
+    value-sorting is deliberately not applied anywhere here.
     """
     data = df.copy()
-    base = float(data[value_col].iloc[0]) if len(data) else 0.0
-    data["PCT"] = data[value_col] / base * 100 if base else 0.0
+    denom = float(denominator or 0.0)
+    data["PCT"] = data[value_col] / denom * 100 if denom else 0.0
     data["LABEL"] = [f"{int(v):,}  ({p:.1f}%)" for v, p in zip(data[value_col], data["PCT"])]
-    order = data[stage_col].astype(str).tolist()
+    order = data[label_col].astype(str).tolist()
 
     bars = alt.Chart(data).mark_bar(color=SEQUENTIAL_BLUE).encode(
-        x=alt.X(f"{value_col}:Q", title="Sessions"),
-        y=alt.Y(f"{stage_col}:N", title=None, sort=order),
+        x=alt.X(f"{value_col}:Q", title=x_title, axis=alt.Axis(format="~s")),
+        y=alt.Y(f"{label_col}:N", title=None, sort=order),
         tooltip=[
-            alt.Tooltip(f"{stage_col}:N", title="Stage"),
-            alt.Tooltip(f"{value_col}:Q", title="Sessions", format=","),
-            alt.Tooltip("PCT:Q", title="% of first stage", format=".1f"),
+            alt.Tooltip(f"{label_col}:N", title=label_col.replace("_", " ").title()),
+            alt.Tooltip(f"{value_col}:Q", title=x_title, format=","),
+            alt.Tooltip("PCT:Q", title=pct_title, format=".1f"),
         ],
     )
     labels = alt.Chart(data).mark_text(align="left", dx=6).encode(
         x=alt.X(f"{value_col}:Q"),
-        y=alt.Y(f"{stage_col}:N", sort=order),
+        y=alt.Y(f"{label_col}:N", sort=order),
         text="LABEL:N",
     )
-    return (bars + labels).properties(height=alt.Step(44))
+    return (bars + labels).properties(height=alt.Step(step))
+
+
+def funnel_bar(df: pd.DataFrame, stage_col: str, value_col: str) -> alt.LayerChart:
+    """Nested stages, each labelled with its share of the first stage."""
+    base = float(df[value_col].iloc[0]) if len(df) else 0.0
+    return _ordered_labelled_bar(df, stage_col, value_col, "Sessions", base, "% of first stage", 44)
+
+
+def ordered_bar(df: pd.DataFrame, label_col: str, value_col: str, x_title: str = "Sessions") -> alt.LayerChart:
+    """Ordered categories (e.g. duration bands), each labelled with its share of the total."""
+    total = float(df[value_col].sum()) if len(df) else 0.0
+    return _ordered_labelled_bar(df, label_col, value_col, x_title, total, "% of total", 38)
 
 
 def top_events_bar(df: pd.DataFrame, name_col: str, value_col: str, x_title: str = "Events") -> alt.Chart:
@@ -97,7 +108,14 @@ def share_stacked_bar(
 
 def trend_line(df: pd.DataFrame, x_col: str, y_col: str, y_title: str) -> alt.Chart:
     """Trend over time: single series, thin line, markers only when points are sparse."""
-    base = alt.Chart(df).encode(
+    # Snowflake returns DATE as Python date objects, which Altair cannot serialise to
+    # JSON. Streamlit's Arrow transport tolerates them, so the app renders, but
+    # to_json() and any notebook/export path raise TypeError. Coercing here keeps the
+    # builder correct on every render path rather than relying on the caller.
+    data = df.copy()
+    data[x_col] = pd.to_datetime(data[x_col])
+
+    base = alt.Chart(data).encode(
         x=alt.X(f"{x_col}:T", title=None),
         y=alt.Y(f"{y_col}:Q", title=y_title),
         tooltip=[
@@ -111,34 +129,8 @@ def trend_line(df: pd.DataFrame, x_col: str, y_col: str, y_title: str) -> alt.Ch
     return line
 
 
-def distribution_histogram(
-    df: pd.DataFrame,
-    value_col: str,
-    x_title: str,
-    y_title: str = "Sessions",
-    nbins: int = 30,
-    clip_percentile: float = 0.95,
-) -> alt.Chart:
-    """Magnitude distribution, binned to the clip_percentile.
-
-    A long tail of outliers (a handful of stale sessions) would otherwise crush
-    the chart into one bar; the full range stays available in the table view.
-    """
-    values = df[value_col].astype(float)
-    lower = min(values.min(), 0.0)
-    upper = max(values.quantile(clip_percentile), lower + 1)
-
-    return (
-        alt.Chart(pd.DataFrame({value_col: values}))
-        .mark_bar(color=SEQUENTIAL_BLUE, stroke="#ffffff", strokeWidth=1)
-        .encode(
-            x=alt.X(
-                f"{value_col}:Q",
-                bin=alt.Bin(extent=[lower, upper], maxbins=nbins),
-                title=x_title,
-                scale=alt.Scale(domain=[lower, upper]),
-            ),
-            y=alt.Y("count():Q", title=y_title),
-            tooltip=[alt.Tooltip("count():Q", title=y_title, format=",")],
-        )
-    )
+# distribution_histogram was removed deliberately. It clipped its bin extent to the
+# 95th percentile, which silently dropped ~5% of rows from the drawing - including
+# the single largest value, which is usually the one worth seeing. Both callers now
+# use ordered_bar over SQL-computed bands, where every row lands in a labelled
+# bucket and the outliers get an explicit "over N" band.
