@@ -1,8 +1,10 @@
 import datetime as dt
+from functools import partial
 
 import streamlit as st
 
 from src.db import CACHE_TTL_SECONDS, clear_cache
+from src.prefetch import warm
 
 # Streamlit discards widget state on page navigation, so the selection is
 # mirrored into a plain (non-widget) key that survives, then fed back in as the
@@ -15,6 +17,12 @@ _WIDGET = "date_range_widget"
 # the measurements behind that. An hour of staleness on a 30-day window is
 # immaterial, but it must be visible and overridable rather than silent.
 _CACHE_NOTE = "Figures are cached for up to {mins} min. Refresh to re-query Snowflake."
+_WARMED = "warmed_range"
+_PRELOAD_HELP = "Runs every page's queries once (~30s) so each one opens instantly afterwards."
+
+
+def _tick(bar, done, total, page):
+    bar.progress(done / total, text=f"{page}  ({done}/{total})")
 
 
 def compact(value) -> str:
@@ -108,12 +116,24 @@ def date_range_filter(default_days: int = 30, key: str = _WIDGET) -> tuple[dt.da
     if isinstance(selected, (tuple, list)) and len(selected) == 2:
         st.session_state[_STORE] = (selected[0], selected[1])
 
-    # Rendered on every page, because the cache is what makes navigation fast and
-    # the reader needs a way out of it without knowing where the setting lives.
-    if st.sidebar.button("Refresh data", use_container_width=True):
-        clear_cache()
-        st.session_state.pop("warmed_range", None)
-        st.rerun()
-    st.sidebar.caption(_CACHE_NOTE.format(mins=CACHE_TTL_SECONDS // 60))
+    # Data controls live here rather than on a landing page, because since the
+    # Executive Dashboard became the landing page there is no neutral page to put
+    # them on - and they are wanted from wherever the reader happens to be.
+    chosen = st.session_state[_STORE]
+    prev_start, prev_end = previous_window(chosen[0], chosen[1])
+    with st.sidebar.expander("Data", expanded=False):
+        st.caption(_CACHE_NOTE.format(mins=CACHE_TTL_SECONDS // 60))
+        if st.button("Refresh data", width="stretch"):
+            clear_cache()
+            st.session_state.pop(_WARMED, None)
+            st.rerun()
+        if st.session_state.get(_WARMED) == chosen:
+            st.caption("All pages preloaded for this range.")
+        elif st.button("Preload all pages", width="stretch", help=_PRELOAD_HELP):
+            bar = st.progress(0.0, text="Starting...")
+            ok, total = warm(chosen[0], chosen[1], prev_start, prev_end, on_progress=partial(_tick, bar))
+            bar.empty()
+            st.session_state[_WARMED] = chosen
+            st.rerun()
 
-    return st.session_state[_STORE]
+    return chosen
