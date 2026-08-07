@@ -129,6 +129,68 @@ def trend_line(df: pd.DataFrame, x_col: str, y_col: str, y_title: str) -> alt.Ch
     return line
 
 
+def multi_trend_line(df: pd.DataFrame, x_col: str, y_col: str, series_col: str, y_title: str) -> alt.Chart:
+    """Several series over time - one line and one colour per series.
+
+    Legend order follows total volume rather than the alphabet, so the dominant
+    series reads first. Colours cycle if there are more series than the palette
+    holds; slicing CATEGORICAL directly would hand Altair a short range and silently
+    drop the colour encoding for the tail.
+    """
+    # Same date coercion as trend_line: Snowflake hands back Python date objects,
+    # which Altair's JSON encoder rejects even though Streamlit's Arrow path accepts
+    # them - so the app renders while to_json() raises.
+    data = df.copy()
+    data[x_col] = pd.to_datetime(data[x_col])
+
+    order = data.groupby(series_col)[y_col].sum().sort_values(ascending=False).index.astype(str).tolist()
+    palette = [CATEGORICAL[i % len(CATEGORICAL)] for i in range(len(order))]
+
+    return (
+        alt.Chart(data)
+        .mark_line(strokeWidth=2, point=len(data[x_col].unique()) <= 14)
+        .encode(
+            x=alt.X(f"{x_col}:T", title=None),
+            y=alt.Y(f"{y_col}:Q", title=y_title, axis=alt.Axis(format="~s")),
+            color=alt.Color(
+                f"{series_col}:N",
+                scale=alt.Scale(domain=order, range=palette),
+                legend=alt.Legend(orient="bottom", title=None, columns=3),
+            ),
+            tooltip=[
+                alt.Tooltip(f"{x_col}:T", title="Week of", format="%b %d"),
+                alt.Tooltip(f"{series_col}:N", title="Series"),
+                alt.Tooltip(f"{y_col}:Q", title=y_title, format=","),
+            ],
+        )
+    )
+
+
+def diverging_bar(df: pd.DataFrame, label_col: str, value_col: str, x_title: str) -> alt.Chart:
+    """Signed change per category: growth right in green, decline left in red.
+
+    Row order is held as supplied - callers rank by magnitude of change, so the
+    biggest movers in either direction stay at the top rather than all the growth
+    sorting to one end.
+    """
+    data = df.copy()
+    order = data[label_col].astype(str).tolist()
+    return (
+        alt.Chart(data)
+        .mark_bar()
+        .encode(
+            x=alt.X(f"{value_col}:Q", title=x_title, axis=alt.Axis(format="~s")),
+            y=alt.Y(f"{label_col}:N", title=None, sort=order),
+            color=alt.condition(f"datum.{value_col} > 0", alt.value(CATEGORICAL[2]), alt.value(CATEGORICAL[7])),
+            tooltip=[
+                alt.Tooltip(f"{label_col}:N", title=label_col.replace("_", " ").title()),
+                alt.Tooltip(f"{value_col}:Q", title=x_title, format="+,"),
+            ],
+        )
+        .properties(height=alt.Step(30))
+    )
+
+
 # distribution_histogram was removed deliberately. It clipped its bin extent to the
 # 95th percentile, which silently dropped ~5% of rows from the drawing - including
 # the single largest value, which is usually the one worth seeing. Both callers now
