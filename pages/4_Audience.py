@@ -101,9 +101,10 @@ accounts = run_query(top_accounts_sql(), params)
 if accounts.empty:
     st.info(NO_IDENTITY)
 else:
-    free = accounts[accounts["KIND"] == "Free mail"]
     corporate = accounts[accounts["KIND"] == "Corporate"]
-    st.caption(ACCOUNTS_NOTE.format(free_people=int(free["PEOPLE"].sum()), free_sessions=int(free["SESSIONS"].sum())))
+    # Free-mail totals come from the KPI query, not from summing the ranked table -
+    # that table is limited per kind, so summing it reports a partial as a total.
+    st.caption(ACCOUNTS_NOTE.format(free_people=int(now["FREE_MAIL_PEOPLE"]), free_sessions=int(now["FREE_MAIL_SESSIONS"])))
     if corporate.empty:
         st.info("No corporate domains in this date range.")
     else:
@@ -153,14 +154,15 @@ st.caption(
 )
 
 bands = run_query(visitor_sessions_bands_sql(), params)
+percentiles = run_query(visitor_sessions_percentiles_sql(), params)
 if bands.empty:
     st.info("No visitor activity in this date range.")
 else:
     st.altair_chart(ordered_bar(bands, "BAND", "VISITORS", x_title="IP addresses"), use_container_width=True)
     with st.expander("Percentiles and edge cases"):
-        st.dataframe(run_query(visitor_sessions_percentiles_sql(), params).T, use_container_width=True)
+        st.dataframe(percentiles.T, use_container_width=True)
 
-stats = run_query(visitor_sessions_percentiles_sql(), params).iloc[0]
+stats = percentiles.iloc[0]
 top = run_query(top_visitor_by_sessions_sql(), params)
 p95 = float(stats["P95_SESSIONS"])
 if not top.empty and p95 > 0 and float(top["SESSION_COUNT"].iloc[0]) > p95 * 5:

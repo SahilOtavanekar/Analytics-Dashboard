@@ -619,7 +619,14 @@ def audience_kpis_sql() -> str:
             COUNT(DISTINCT IFF({_VALID_EMAIL}, {_EMAIL}, NULL)) AS IDENTIFIED_PEOPLE,
             COUNT(DISTINCT IFF({_VALID_EMAIL}, {_DOMAIN}, NULL)) AS COMPANIES,
             COUNT(DISTINCT IFF({_VALID_EMAIL}, SESSION_ID, NULL)) AS IDENTIFIED_SESSIONS,
-            COUNT(DISTINCT SESSION_ID) AS TOTAL_SESSIONS
+            COUNT(DISTINCT SESSION_ID) AS TOTAL_SESSIONS,
+            -- Consumer-mailbox totals belong here, not in top_accounts_sql. Summing
+            -- them from a LIMITed ranking counts only those that survived the limit
+            -- and reports the result as a total.
+            COUNT(DISTINCT IFF({_VALID_EMAIL} AND {_DOMAIN} IN {_FREE_MAIL},
+                               {_EMAIL}, NULL)) AS FREE_MAIL_PEOPLE,
+            COUNT(DISTINCT IFF({_VALID_EMAIL} AND {_DOMAIN} IN {_FREE_MAIL},
+                               SESSION_ID, NULL)) AS FREE_MAIL_SESSIONS
         FROM {table_fqn()}
         WHERE EVENT_TS::DATE BETWEEN ? AND ?
           AND {_NOT_TEST}
@@ -664,8 +671,11 @@ def top_accounts_sql(limit: int = 15) -> str:
     """Companies by session volume, keyed on email domain.
 
     Returns the domain and a headcount, never an address - individual identities are
-    deliberately not queryable from the dashboard. KIND lets the page rank real
-    accounts without consumer mailboxes crowding them out.
+    deliberately not queryable from the dashboard.
+
+    The limit is applied per KIND, not overall. A plain LIMIT ranked both kinds
+    together, so consumer mailboxes took slots from the corporate chart: asking for
+    15 rendered 13 bars, silently. Partitioning gives a full N of each.
     """
     return f"""
         SELECT
@@ -680,8 +690,8 @@ def top_accounts_sql(limit: int = 15) -> str:
           AND SESSION_ID IS NOT NULL
           AND {_NOT_TEST}
         GROUP BY 1, 2
-        ORDER BY SESSIONS DESC
-        LIMIT {limit}
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY KIND ORDER BY SESSIONS DESC) <= {limit}
+        ORDER BY KIND, SESSIONS DESC
     """
 
 
