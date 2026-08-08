@@ -1,7 +1,14 @@
 import altair as alt
 import pandas as pd
 
-from src.theme import CATEGORICAL, SEQUENTIAL_BLUE
+from src.theme import (
+    categorical,
+    negative_color,
+    positive_color,
+    readable_on,
+    series_color,
+    surface,
+)
 
 
 def _ordered_labelled_bar(df, label_col, value_col, x_title, denominator, pct_title, step):
@@ -16,7 +23,7 @@ def _ordered_labelled_bar(df, label_col, value_col, x_title, denominator, pct_ti
     data["LABEL"] = [f"{int(v):,}  ({p:.1f}%)" for v, p in zip(data[value_col], data["PCT"])]
     order = data[label_col].astype(str).tolist()
 
-    bars = alt.Chart(data).mark_bar(color=SEQUENTIAL_BLUE).encode(
+    bars = alt.Chart(data).mark_bar(color=series_color()).encode(
         x=alt.X(f"{value_col}:Q", title=x_title, axis=alt.Axis(format="~s")),
         y=alt.Y(f"{label_col}:N", title=None, sort=order),
         tooltip=[
@@ -49,7 +56,7 @@ def top_events_bar(df: pd.DataFrame, name_col: str, value_col: str, x_title: str
     """Ranked magnitude: single hue, sorted, axis + tooltip carry values."""
     return (
         alt.Chart(df)
-        .mark_bar(color=SEQUENTIAL_BLUE)
+        .mark_bar(color=series_color())
         .encode(
             x=alt.X(f"{value_col}:Q", title=x_title),
             y=alt.Y(f"{name_col}:N", title=None, sort="-x"),
@@ -84,15 +91,23 @@ def share_stacked_bar(
     ranked["tip"] = ranked["share"].map(lambda s: f"{s * 100:.1f}%")
 
     order = ranked[name_col].astype(str).tolist()
+    hues = categorical()
+    palette = [hues[i % len(hues)] for i in range(len(order))]
+    # The share label sits on the fill, so its colour is chosen per segment rather
+    # than fixed to white. The validated palette deliberately spans light and dark
+    # slots - forcing every slot dark enough for white text is exactly what
+    # collapsed colour-blind separation when this palette was first derived.
+    ranked["ink"] = [readable_on(c) for c in palette]
+
     bars = (
         alt.Chart(ranked)
-        .mark_bar(stroke="#ffffff", strokeWidth=2)
+        .mark_bar(stroke=surface(), strokeWidth=2)
         .encode(
             x=alt.X("seg_start:Q", title=None, axis=None, scale=alt.Scale(domain=[0, 1])),
             x2="seg_end:Q",
             color=alt.Color(
                 f"{name_col}:N",
-                scale=alt.Scale(domain=order, range=CATEGORICAL[: len(order)]),
+                scale=alt.Scale(domain=order, range=palette),
                 legend=alt.Legend(orient="bottom", title=None, columns=3),
             ),
             tooltip=[alt.Tooltip(f"{name_col}:N", title="Type"), alt.Tooltip("tip:N", title="Share")],
@@ -100,8 +115,12 @@ def share_stacked_bar(
     )
     labels = (
         alt.Chart(ranked)
-        .mark_text(color="#ffffff", fontWeight="bold")
-        .encode(x=alt.X("seg_mid:Q", scale=alt.Scale(domain=[0, 1])), text="pct:N")
+        .mark_text(fontWeight="bold")
+        .encode(
+            x=alt.X("seg_mid:Q", scale=alt.Scale(domain=[0, 1])),
+            text="pct:N",
+            color=alt.Color("ink:N", scale=None, legend=None),
+        )
     )
     return (bars + labels).properties(height=180)
 
@@ -123,9 +142,9 @@ def trend_line(df: pd.DataFrame, x_col: str, y_col: str, y_title: str) -> alt.Ch
             alt.Tooltip(f"{y_col}:Q", title=y_title, format=","),
         ],
     )
-    line = base.mark_line(color=SEQUENTIAL_BLUE, strokeWidth=2)
+    line = base.mark_line(color=series_color(), strokeWidth=2)
     if len(df) <= 14:
-        return line + base.mark_point(color=SEQUENTIAL_BLUE, size=45, filled=True)
+        return line + base.mark_point(color=series_color(), size=45, filled=True)
     return line
 
 
@@ -134,7 +153,7 @@ def multi_trend_line(df: pd.DataFrame, x_col: str, y_col: str, series_col: str, 
 
     Legend order follows total volume rather than the alphabet, so the dominant
     series reads first. Colours cycle if there are more series than the palette
-    holds; slicing CATEGORICAL directly would hand Altair a short range and silently
+    holds; slicing the palette directly would hand Altair a short range and silently
     drop the colour encoding for the tail.
     """
     # Same date coercion as trend_line: Snowflake hands back Python date objects,
@@ -144,7 +163,8 @@ def multi_trend_line(df: pd.DataFrame, x_col: str, y_col: str, series_col: str, 
     data[x_col] = pd.to_datetime(data[x_col])
 
     order = data.groupby(series_col)[y_col].sum().sort_values(ascending=False).index.astype(str).tolist()
-    palette = [CATEGORICAL[i % len(CATEGORICAL)] for i in range(len(order))]
+    hues = categorical()
+    palette = [hues[i % len(hues)] for i in range(len(order))]
 
     return (
         alt.Chart(data)
@@ -181,7 +201,7 @@ def diverging_bar(df: pd.DataFrame, label_col: str, value_col: str, x_title: str
         .encode(
             x=alt.X(f"{value_col}:Q", title=x_title, axis=alt.Axis(format="~s")),
             y=alt.Y(f"{label_col}:N", title=None, sort=order),
-            color=alt.condition(f"datum.{value_col} > 0", alt.value(CATEGORICAL[2]), alt.value(CATEGORICAL[7])),
+            color=alt.condition(f"datum.{value_col} > 0", alt.value(positive_color()), alt.value(negative_color())),
             tooltip=[
                 alt.Tooltip(f"{label_col}:N", title=label_col.replace("_", " ").title()),
                 alt.Tooltip(f"{value_col}:Q", title=x_title, format="+,"),
