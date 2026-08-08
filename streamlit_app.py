@@ -17,7 +17,6 @@ st.set_page_config(page_title="Analytics Dashboard", page_icon="📊", layout="w
 
 PAGES = [
     st.Page("pages/1_Executive_Dashboard.py", title="Executive Dashboard", icon=":material/dashboard:", default=True),
-    st.Page("pages/2_Event_Analytics.py", title="Event Analytics", icon=":material/timeline:"),
     st.Page("pages/3_Session_Analytics.py", title="Session Analytics", icon=":material/schedule:"),
     st.Page("pages/4_Audience.py", title="Audience", icon=":material/groups:"),
     st.Page("pages/5_Campaign_Analytics.py", title="Campaign Analytics", icon=":material/campaign:"),

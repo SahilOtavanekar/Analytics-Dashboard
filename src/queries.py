@@ -190,80 +190,6 @@ def executive_kpis_sql() -> str:
     """
 
 
-def top_events_sql(limit: int = 10) -> str:
-    # EVENT_NAME arrives inconsistently cased and punctuated: "clicked"/"Clicked"
-    # and "form_submit"/"Form Submit" are the same action but ranked as separate
-    # bars, understating both. Normalise for grouping, title-case for display.
-    # Nulls are a real category (page views carrying no name), so they get a label
-    # rather than being silently dropped or shown as blank.
-    return f"""
-        SELECT
-            IFF(EVENT_NAME IS NULL, '(unnamed page view)',
-                INITCAP(LOWER(REPLACE(EVENT_NAME, '_', ' ')))) AS EVENT_NAME,
-            COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT
-        FROM {table_fqn()}
-        WHERE EVENT_TS::DATE BETWEEN ? AND ?
-          AND {_NOT_TEST}
-        GROUP BY 1
-        ORDER BY EVENT_COUNT DESC
-        LIMIT {limit}
-    """
-
-
-def event_type_share_sql() -> str:
-    # Superseded on the Event Analytics page by event_mix_sql(), which labels the
-    # split in business terms. Kept because the raw type breakdown is still useful.
-    return f"""
-        SELECT EVENT_TYPE, COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT
-        FROM {table_fqn()}
-        WHERE EVENT_TS::DATE BETWEEN ? AND ?
-        GROUP BY EVENT_TYPE
-        ORDER BY EVENT_COUNT DESC
-    """
-
-
-def event_split_kpis_sql() -> str:
-    """Page views vs tracked actions - the volume/intent split."""
-    return f"""
-        SELECT
-            COUNT(DISTINCT IFF({_PAGE_VIEW}, MESSAGE_ID, NULL)) AS PAGE_VIEWS,
-            COUNT(DISTINCT IFF(NOT {_PAGE_VIEW}, MESSAGE_ID, NULL)) AS TRACKED_ACTIONS
-        FROM {table_fqn()}
-        WHERE EVENT_TS::DATE BETWEEN ? AND ?
-          AND {_NOT_TEST}
-    """
-
-
-def tracked_actions_sql(limit: int = 15) -> str:
-    """Intent signals only. Page views outnumber these ~20:1 and bury them when ranked together."""
-    return f"""
-        SELECT
-            INITCAP(LOWER(REPLACE(EVENT_NAME, '_', ' '))) AS EVENT_NAME,
-            COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT
-        FROM {table_fqn()}
-        WHERE EVENT_TS::DATE BETWEEN ? AND ?
-          AND NOT {_PAGE_VIEW}
-          AND {_NOT_TEST}
-          AND EVENT_NAME IS NOT NULL
-        GROUP BY 1
-        ORDER BY EVENT_COUNT DESC
-        LIMIT {limit}
-    """
-
-
-def event_mix_sql() -> str:
-    return f"""
-        SELECT
-            IFF({_PAGE_VIEW}, 'Page views', 'Tracked actions') AS EVENT_GROUP,
-            COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT
-        FROM {table_fqn()}
-        WHERE EVENT_TS::DATE BETWEEN ? AND ?
-          AND {_NOT_TEST}
-        GROUP BY 1
-        ORDER BY EVENT_COUNT DESC
-    """
-
-
 def funnel_sql() -> str:
     """Three stages that genuinely nest, measured per session.
 
@@ -1245,15 +1171,4 @@ def tenant_movement_sql(limit: int = 12) -> str:
         FULL OUTER JOIN prv p ON c.TENANT = p.TENANT
         ORDER BY ABS(COALESCE(c.EVENTS, 0) - COALESCE(p.EVENTS, 0)) DESC
         LIMIT {limit}
-    """
-
-
-def channel_share_sql() -> str:
-    # CHANNEL holds device type (desktop / web / mobile), not an acquisition channel.
-    return f"""
-        SELECT CHANNEL, COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT
-        FROM {table_fqn()}
-        WHERE EVENT_TS::DATE BETWEEN ? AND ?
-        GROUP BY CHANNEL
-        ORDER BY EVENT_COUNT DESC
     """

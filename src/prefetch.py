@@ -38,11 +38,6 @@ def query_plan(start: dt.date, end: dt.date, prev_start: dt.date, prev_end: dt.d
         # The Executive Dashboard also charts sessions_over_time_sql, but Session
         # Analytics already warms it with the same parameters and the cache is keyed
         # on (sql, params) - listing it twice would just pay for it twice.
-        ("Event Analytics", Q.event_split_kpis_sql(), p),
-        ("Event Analytics", Q.event_split_kpis_sql(), v),
-        ("Event Analytics", Q.tracked_actions_sql(), p),
-        ("Event Analytics", Q.event_mix_sql(), p),
-        ("Event Analytics", Q.top_events_sql(limit=25), p),
         ("Session Analytics", Q.session_kpis_sql(), p),
         ("Session Analytics", Q.session_kpis_sql(), v),
         ("Session Analytics", Q.sessions_over_time_sql(), p),
@@ -64,7 +59,6 @@ def query_plan(start: dt.date, end: dt.date, prev_start: dt.date, prev_end: dt.d
         ("Campaign Analytics", Q.campaign_kpis_sql(), p),
         ("Campaign Analytics", Q.campaign_kpis_sql(), v),
         ("Campaign Analytics", Q.top_campaigns_sql(), p),
-        ("Campaign Analytics", Q.channel_share_sql(), p),
         ("Conversion", Q.funnel_sql(), p),
         ("Conversion", Q.funnel_sql(), v),
         ("Conversion", Q.form_performance_sql(), p),

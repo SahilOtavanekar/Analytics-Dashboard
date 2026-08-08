@@ -5,10 +5,10 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 import streamlit as st
 
-from src.charts import share_stacked_bar, top_events_bar
+from src.charts import top_events_bar
 from src.components import date_range_filter, kpi, kpi_row, previous_window
 from src.db import run_query
-from src.queries import campaign_kpis_sql, channel_share_sql, top_campaigns_sql
+from src.queries import campaign_kpis_sql, top_campaigns_sql
 
 st.set_page_config(page_title="Campaign Analytics", page_icon="🎯", layout="wide")
 st.title("Campaign Analytics")
@@ -36,14 +36,5 @@ else:
     st.altair_chart(top_events_bar(top_campaigns, "CAMPAIGN_LABEL", "EVENT_COUNT"), width="stretch")
     with st.expander("View as table"):
         st.dataframe(top_campaigns, width="stretch", hide_index=True)
-
-st.subheader("Traffic by Device")
-channel_share = run_query(channel_share_sql(), params)
-if channel_share.empty:
-    st.info("No device activity in this date range.")
-else:
-    st.altair_chart(share_stacked_bar(channel_share, "CHANNEL", "EVENT_COUNT"), width="stretch")
-    with st.expander("View as table"):
-        st.dataframe(channel_share, width="stretch", hide_index=True)
 
 st.caption(f"Showing {start_date} to {end_date}. Change is against {prev_start} to {prev_end}.")

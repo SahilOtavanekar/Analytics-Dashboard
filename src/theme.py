@@ -30,8 +30,6 @@ import streamlit as st
 BRAND_TEAL = "#056e6e"      # --t       primary; 6.07:1 under white text
 BRAND_AQUA = "#22c7b8"      # --tbright accent; 2.11:1 - never carries text
 INK = "#0b1a1a"             # --ink
-MUTED = "#546a6a"           # --muted
-LINE = "#e6ecec"            # --line
 
 # ----------------------------------------------------------------- categorical
 # Slot order is fixed and interleaved by hue so adjacent series - the ones a reader
@@ -62,12 +60,6 @@ CATEGORICAL_DARK = [
     # Darkened one step from #bf6512, where neither white (4.13:1) nor ink (4.32:1)
     # cleared 4.5 - that slot had no legible on-fill label at all.
     "#ae5b0f",
-]
-
-# Single hue, light to dark, monotonic in lightness by construction.
-SEQUENTIAL_TEAL = [
-    "#d9fefb", "#82fdf5", "#4dece4", "#3dd3cc", "#35bbb4",
-    "#2da39d", "#258b86", "#1c716d", "#145855", "#0b3e3b",
 ]
 
 # The one-series fill. Brand teal on light; on dark it must clear the surface
@@ -145,7 +137,3 @@ def readable_on(hex_color: str) -> str:
     return "#ffffff" if on_white >= on_ink else INK
 
 
-# Inter is the site's typeface, requested in .streamlit/config.toml. This stack is
-# what the charts use directly and what the app falls back to if that webfont is
-# blocked - Snowflake may apply a CSP that stops the Google Fonts request.
-FONT_FAMILY = "Inter, system-ui, -apple-system, 'Segoe UI', sans-serif"
