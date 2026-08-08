@@ -8,7 +8,7 @@ import streamlit as st
 from src.charts import multi_trend_line, share_stacked_bar
 from src.components import compact, date_range_filter, kpi, kpi_row, previous_window
 from src.db import run_query
-from src.queries import ai_cohort_sql, ai_kpis_sql, model_mix_sql, model_trend_sql
+from src.queries import ai_cohort_sql, ai_kpis_sql, executive_kpis_sql, model_mix_sql, model_trend_sql
 
 # Module level so every branch below stays a single indented line - the Snowsight
 # editor re-indents multi-line calls inside indented blocks and breaks them.
@@ -17,6 +17,12 @@ USAGE_BASIS = (
     "`PROPERTIES:llm` also sits on ~863k events where no request was made - it records the "
     "model a surface is *configured* with, so counting it would overstate AI usage roughly "
     "fourfold."
+)
+EVENTS_CAVEAT = (
+    "**AI-assisted events**, not conversations. 87% of these are page visits, consistent with "
+    "Smart Summaries generating on load rather than a buyer asking 87% of a question. Attach "
+    "rate is the honest adoption measure: the share of sessions that opened content and used "
+    "AI inside it."
 )
 COHORT_NOTE = (
     "Sessions making an AI request convert at **{conv_a:.2f}%** against {conv_b:.2f}% for those "
@@ -46,14 +52,22 @@ was = run_query(ai_kpis_sql(), [prev_start, prev_end]).iloc[0]
 now_share = float(now["AI_SESSIONS"]) / float(now["TOTAL_SESSIONS"]) * 100 if float(now["TOTAL_SESSIONS"]) else 0.0
 was_share = float(was["AI_SESSIONS"]) / float(was["TOTAL_SESSIONS"]) * 100 if float(was["TOTAL_SESSIONS"]) else 0.0
 
+# executive_kpis_sql is reused rather than a new attach query: the Executive
+# Dashboard has already run it for this same date range, so the cache serves it and
+# the attach rate cannot drift between the two pages.
+attach_now = run_query(executive_kpis_sql(), params).iloc[0]
+attach_was = run_query(executive_kpis_sql(), [prev_start, prev_end]).iloc[0]
+
 kpi_row(
     [
-        kpi("AI Requests", now["AI_REQUESTS"], was["AI_REQUESTS"]),
+        kpi("AI-assisted Events", now["AI_REQUESTS"], was["AI_REQUESTS"]),
         kpi("Sessions Using AI", now["AI_SESSIONS"], was["AI_SESSIONS"]),
-        kpi("Share of Sessions", now_share, was_share, decimals=1, suffix="%", delta_as_points=True),
+        kpi("Content AI Attach", attach_now["AI_ATTACH_PCT"], attach_was["AI_ATTACH_PCT"], decimals=1, suffix="%", delta_as_points=True),
+        kpi("Share of All Sessions", now_share, was_share, decimals=1, suffix="%", delta_as_points=True),
         kpi("Models in Use", now["MODELS_USED"], was["MODELS_USED"]),
     ]
 )
+st.caption(EVENTS_CAVEAT)
 
 if int(now["AI_REQUESTS"]) == 0:
     st.info(NO_AI)

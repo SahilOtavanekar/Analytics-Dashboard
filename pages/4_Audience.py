@@ -12,6 +12,8 @@ from src.queries import (
     audience_geo_sql,
     audience_kpis_sql,
     identity_cohort_sql,
+    personalisation_by_tenant_sql,
+    personalisation_kpis_sql,
     top_accounts_sql,
     top_visitor_by_sessions_sql,
     user_activity_kpis_sql,
@@ -46,6 +48,19 @@ NO_IDENTITY = (
     "No identified visitors in this date range. Identity comes from the `email` URL parameter, "
     "which only appears on traffic arriving from targeted email campaigns."
 )
+BROKEN_LINKS = (
+    "**{pct:.0f}% of personalised links are not resolving.** {broken:,} of {linked:,} sessions "
+    "that arrived through a link carrying the `email` parameter still held the email platform's "
+    "merge tag instead of an address, across **{tenants} tenants**. Those visitors cannot be "
+    "identified, so they are counted as anonymous above. Fixing it would raise identified "
+    "coverage from {now_pct:.0f}% to roughly {could_pct:.0f}% of all sessions."
+)
+BROKEN_HOW = (
+    "The tag names the sending platform, which is what support needs: `*|EMAIL|*` is Mailchimp, "
+    "`[EMAIL]` and `[[EMAIL_TO]]` are other builders. Truncated forms such as `*|EMAIL|\\` or "
+    "`[[EMAIL_TO` mean the link itself was cut rather than mis-templated."
+)
+LINKS_HEALTHY = "All personalised links in this range resolved to a real address."
 IP_PROXY_NOTE = (
     "The majority of traffic carries no identity. For those sessions IP address is the closest "
     "available proxy for 'who', acknowledging that it is shared by NAT, VPNs and bots and is "
@@ -95,6 +110,25 @@ else:
     table["MEDIAN_EVENTS"] = [f"{v:.0f}" for v in table["MEDIAN_EVENTS"]]
     table.columns = ["Cohort", "Sessions", "Engagement", "Lead conversion", "Median events"]
     st.dataframe(table, width="stretch", hide_index=True)
+
+st.subheader("Personalised Link Health")
+links = run_query(personalisation_kpis_sql(), params).iloc[0]
+linked = float(links["LINKED_SESSIONS"])
+broken = float(links["UNRESOLVED_SESSIONS"])
+all_sessions = float(links["TOTAL_SESSIONS"]) or 1.0
+if linked == 0 or broken == 0:
+    st.success(LINKS_HEALTHY)
+else:
+    st.warning(BROKEN_LINKS.format(pct=broken / linked * 100, broken=int(broken), linked=int(linked), tenants=int(links["TENANTS_AFFECTED"]), now_pct=float(links["RESOLVED_SESSIONS"]) / all_sessions * 100, could_pct=linked / all_sessions * 100))
+    st.caption(BROKEN_HOW)
+    worst = run_query(personalisation_by_tenant_sql(), params + params)
+    if worst.empty:
+        st.info("No tenant-level breakdown available for this range.")
+    else:
+        table = worst.copy()
+        table["PCT_BROKEN"] = [f"{v:.0f}%" for v in table["PCT_BROKEN"]]
+        table.columns = ["Tenant", "Merge tag seen", "Broken sessions", "Resolved sessions", "% broken"]
+        st.dataframe(table, width="stretch", hide_index=True)
 
 st.subheader("Top Companies")
 accounts = run_query(top_accounts_sql(), params)
