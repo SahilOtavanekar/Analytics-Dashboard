@@ -577,14 +577,6 @@ _EMAIL = (
 _VALID_EMAIL = f"({_EMAIL} LIKE '%@%.%')"
 _DOMAIN = f"SPLIT_PART({_EMAIL}, '@', 2)"
 
-# The parameter is present but still holds the email platform's merge tag, e.g.
-# "[EMAIL]", "*|EMAIL|*" (Mailchimp) or "[[EMAIL_TO]]" - the link was built without
-# the substitution ever running, or with the wrong syntax for that platform. 69% of
-# link-carrying sessions in a 30-day window are in this state, across 160 tenants,
-# so the product's Dynamic Visitor Profiling is silently failing for most traffic.
-# Distinguishing this from "no link at all" is the whole point: one is a customer
-# configuration fault worth chasing, the other is just organic traffic.
-_UNRESOLVED_EMAIL = f"({_EMAIL} IS NOT NULL AND NOT {_VALID_EMAIL})"
 
 # Consumer mailbox providers are people, not accounts. 19 of them account for 848
 # sessions, which would otherwise rank above real companies in an account list.
@@ -1095,73 +1087,6 @@ def tenant_comparison_sql(min_sessions: int = 50, limit: int = 25) -> str:
         GROUP BY s.TENANT, l.TOP_CAMPAIGN
         HAVING COUNT(*) >= {min_sessions}
         ORDER BY SESSIONS DESC
-        LIMIT {limit}
-    """
-
-
-def personalisation_kpis_sql() -> str:
-    """How much of the personalised-link traffic actually resolved. Takes 2 params.
-
-    LINKED_SESSIONS is the denominator that matters: sessions that arrived through
-    a link carrying the email parameter, i.e. traffic the customer intended to be
-    identified. Measuring against all sessions would bury the failure under
-    organic traffic that was never meant to carry an identity.
-    """
-    return f"""
-        SELECT
-            COUNT(DISTINCT IFF({_EMAIL} IS NOT NULL, SESSION_ID, NULL)) AS LINKED_SESSIONS,
-            COUNT(DISTINCT IFF({_VALID_EMAIL}, SESSION_ID, NULL)) AS RESOLVED_SESSIONS,
-            COUNT(DISTINCT IFF({_UNRESOLVED_EMAIL}, SESSION_ID, NULL)) AS UNRESOLVED_SESSIONS,
-            COUNT(DISTINCT IFF({_UNRESOLVED_EMAIL},
-                               PROPERTIES:tenant_id::STRING, NULL)) AS TENANTS_AFFECTED,
-            COUNT(DISTINCT SESSION_ID) AS TOTAL_SESSIONS
-        FROM {table_fqn()}
-        WHERE EVENT_TS::DATE BETWEEN ? AND ?
-          AND {_NOT_TEST}
-    """
-
-
-def personalisation_by_tenant_sql(limit: int = 15) -> str:
-    """Which customers to contact, worst first. Takes 4 parameters (range twice).
-
-    COMMON_TAG is the point of the table, not decoration: the tag syntax names the
-    email platform, so support knows what to tell the customer. "*|EMAIL|*" is
-    Mailchimp, "[[EMAIL_TO]]" and "[EMAIL]" are other builders, and the truncated
-    forms ("*|EMAIL|\\", "[[EMAIL_TO") indicate the link was cut rather than
-    mis-templated. Uppercased for display because _EMAIL lowercases for matching.
-    """
-    return f"""
-        WITH sess AS (
-            SELECT
-                {_TENANT} AS TENANT,
-                SESSION_ID,
-                MAX(IFF({_VALID_EMAIL}, 1, 0)) AS RESOLVED,
-                MAX(IFF({_UNRESOLVED_EMAIL}, 1, 0)) AS BROKEN
-            FROM {table_fqn()}
-            WHERE EVENT_TS::DATE BETWEEN ? AND ?
-              AND SESSION_ID IS NOT NULL
-              AND {_EMAIL} IS NOT NULL
-              AND {_NOT_TEST}
-            GROUP BY 1, 2
-        ), tags AS (
-            SELECT {_TENANT} AS TENANT, MODE(UPPER({_EMAIL})) AS COMMON_TAG
-            FROM {table_fqn()}
-            WHERE EVENT_TS::DATE BETWEEN ? AND ?
-              AND {_UNRESOLVED_EMAIL}
-              AND {_NOT_TEST}
-            GROUP BY 1
-        )
-        SELECT
-            s.TENANT,
-            COALESCE(t.COMMON_TAG, '') AS COMMON_TAG,
-            SUM(s.BROKEN) AS BROKEN_SESSIONS,
-            SUM(s.RESOLVED) AS RESOLVED_SESSIONS,
-            COALESCE((SUM(s.BROKEN) * 100.0 / NULLIF(COUNT(*), 0))::FLOAT, 0) AS PCT_BROKEN
-        FROM sess s
-        LEFT JOIN tags t ON s.TENANT = t.TENANT
-        GROUP BY s.TENANT, t.COMMON_TAG
-        HAVING SUM(s.BROKEN) > 0
-        ORDER BY BROKEN_SESSIONS DESC
         LIMIT {limit}
     """
 

@@ -48,8 +48,6 @@ def query_plan(start: dt.date, end: dt.date, prev_start: dt.date, prev_end: dt.d
         ("Audience", Q.audience_kpis_sql(), v),
         ("Audience", Q.identity_cohort_sql(), p),
         ("Audience", Q.top_accounts_sql(), p),
-        ("Audience", Q.personalisation_kpis_sql(), p),
-        ("Audience", Q.personalisation_by_tenant_sql(), p + p),
         ("Audience", Q.audience_geo_sql(), p),
         ("Audience", Q.user_activity_kpis_sql(), p),
         ("Audience", Q.user_activity_kpis_sql(), v),
