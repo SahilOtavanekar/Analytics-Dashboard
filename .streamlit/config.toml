@@ -4,6 +4,7 @@
 # Chart colours here and the palette in src/theme.py must stay in step: these
 # apply to charts that do not name their own colours, while our Altair builders
 # pass explicit ones. Changing only this file leaves teal chrome around blue charts.
+# They live under [theme], not the per-mode sections - Streamlit rejects them there.
 #
 # Both [theme.light] and [theme.dark] are defined so the mode toggle stays
 # available. The dark palette is re-selected against the dark surface, not flipped.
@@ -22,6 +23,25 @@ buttonRadius = "large"
 showSidebarBorder = true
 linkUnderline = false
 
+# Chart colours are only valid HERE, at top level. Streamlit 1.60 rejects
+# theme.light.chartCategoricalColors and theme.dark.chartCategoricalColors - it
+# logged "is not a valid config option" four times on every start and discarded
+# them, so the palette below never reached a chart.
+#
+# That also means a per-mode chart palette cannot be expressed in config at all.
+# Our Altair builders read src/theme.py through accessors that switch on
+# st.context.theme.type, so they are mode-aware regardless. These values are the
+# light palette, and act as the fallback for any chart that does not name its own
+# colours - Streamlit-native charts today, and anything added later.
+chartCategoricalColors = [
+    "#1d9485", "#913797", "#a9881b", "#0d53af",
+    "#c43d4d", "#41ba5d", "#7455c7", "#c66a19",
+]
+chartSequentialColors = [
+    "#d9fefb", "#82fdf5", "#4dece4", "#3dd3cc", "#35bbb4",
+    "#2da39d", "#258b86", "#1c716d", "#145855", "#0b3e3b",
+]
+
 [theme.light]
 primaryColor = "#056e6e"              # --t; 6.07:1 under the white button text
 backgroundColor = "#ffffff"
@@ -31,14 +51,6 @@ linkColor = "#056e6e"
 borderColor = "#e6ecec"               # --line
 dataframeBorderColor = "#e6ecec"
 dataframeHeaderBackgroundColor = "#f2f7f7"
-chartCategoricalColors = [
-    "#1d9485", "#913797", "#a9881b", "#0d53af",
-    "#c43d4d", "#41ba5d", "#7455c7", "#c66a19",
-]
-chartSequentialColors = [
-    "#d9fefb", "#82fdf5", "#4dece4", "#3dd3cc", "#35bbb4",
-    "#2da39d", "#258b86", "#1c716d", "#145855", "#0b3e3b",
-]
 
 [theme.light.sidebar]
 backgroundColor = "#f7fafa"
@@ -58,16 +70,6 @@ linkColor = "#4fd8c9"                 # 10.4:1; the accent aqua reads well here
 borderColor = "#26332f"
 dataframeBorderColor = "#26332f"
 dataframeHeaderBackgroundColor = "#16211f"
-chartCategoricalColors = [
-    "#1baa9e", "#973d9d", "#a38213", "#145ec1",
-    "#b93345", "#29a84c", "#7658cb", "#ae5b0f",
-]
-# Reversed: on a dark surface a sequential ramp has to run dark-to-light, or its
-# low end disappears into the background.
-chartSequentialColors = [
-    "#0b3e3b", "#145855", "#1c716d", "#258b86", "#2da39d",
-    "#35bbb4", "#3dd3cc", "#4dece4", "#82fdf5", "#d9fefb",
-]
 
 [theme.dark.sidebar]
 backgroundColor = "#0a1010"

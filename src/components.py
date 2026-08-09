@@ -100,6 +100,15 @@ def kpi_row(items) -> None:
         col.metric(item[0], item[1], delta=delta, help=help_text)
 
 
+# Tracking begins 2025-06-14; the table also holds 205 rows stamped before 2020
+# (earliest 1978) and three in the future (latest 2058) that are plainly corrupt.
+# Without a floor the picker offered every one of those, so a reader could land on
+# a range with no data at all - which is how the Session Analytics NaN crash was
+# reached. Deliberately a little earlier than the first event, so the true start of
+# data is visible rather than clipped.
+_DATA_STARTS = dt.date(2025, 6, 1)
+
+
 def date_range_filter(default_days: int = 30, key: str = _WIDGET) -> tuple[dt.date, dt.date]:
     # Snowflake's runtime clock can lag the viewer's local date by up to a day, so
     # max_value is padded - otherwise the viewer can't select their own "today".
@@ -108,8 +117,18 @@ def date_range_filter(default_days: int = 30, key: str = _WIDGET) -> tuple[dt.da
     if _STORE not in st.session_state:
         st.session_state[_STORE] = (today - dt.timedelta(days=default_days), today)
 
-    stored = st.session_state[_STORE]
-    selected = st.sidebar.date_input("Date range", value=stored, max_value=today + dt.timedelta(days=1), key=key)
+    # Clamp before handing the stored range back as `value`. st.date_input raises a
+    # StreamlitAPIException - on every page, not just one - if `value` sits outside
+    # [min_value, max_value], and the bounds can move under a live session: the
+    # upper bound rolls at midnight, and _DATA_STARTS moves whenever this file is
+    # redeployed. Adding the floor without this would trade one page's crash for
+    # every page's.
+    latest = today + dt.timedelta(days=1)
+    held = st.session_state[_STORE]
+    stored = (min(max(held[0], _DATA_STARTS), latest), min(max(held[1], _DATA_STARTS), latest))
+    if stored != tuple(held):
+        st.session_state[_STORE] = stored
+    selected = st.sidebar.date_input("Date range", value=stored, min_value=_DATA_STARTS, max_value=latest, key=key)
 
     # Half-finished selections come back as a 1-tuple; hold the last complete range
     # so the dashboard doesn't snap to the default for a rerun.

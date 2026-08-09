@@ -5,10 +5,16 @@ Two conventions worth knowing before editing:
 **Event counts use COUNT(DISTINCT MESSAGE_ID), never COUNT(*).** The source table
 contains ~1.29M exactly-duplicated rows (5.9% of the table, 2.4% of the last 30
 days) - same MESSAGE_ID, same timestamp to the millisecond, same session, same
-path. Verified by comparing distinct MESSAGE_IDs against distinct full-row hashes
-and by inspecting duplicate groups: 1,037,068 groups, of which 0 vary in
-SESSION_ID or PATH. MESSAGE_ID has no nulls anywhere, so deduplicating on it is
-exact. COUNT(*) overstates every event metric.
+path. MESSAGE_ID has no nulls anywhere. COUNT(*) overstates every event metric.
+
+Deduplicating on it is very nearly, but not quite, exact - an earlier version of
+this note claimed it was. Measured over a 30-day window: of 19,273 MESSAGE_IDs
+appearing more than once, 19,265 are byte-identical duplicates (the worst single
+ID carries 5,889 identical rows), but 8 carry genuinely distinct events, differing
+in timestamp, session or URL. Those collapse to one, losing 1,334 events - 0.08%
+of the window. Immaterial to any reading of these numbers, but it is an undercount
+rather than a guarantee, and worth knowing before anyone reconciles against a
+COUNT(*) from elsewhere.
 
 **NULL guards on SESSION_ID and REQUEST_IP.** SQL collapses all NULLs into one
 GROUP BY bucket, so without a guard the ~3.47M session-less rows become a single
@@ -485,26 +491,37 @@ def session_duration_bands_sql() -> str:
 
 
 def session_duration_percentiles_sql() -> str:
-    """Percentiles and degenerate-case counts - what .describe() should have shown."""
+    """Percentiles and degenerate-case counts - what .describe() should have shown.
+
+    Every aggregate is COALESCEd. SUM, MAX, AVG and APPROX_PERCENTILE all return
+    NULL over an empty set while COUNT returns 0, so a date range with no sessions
+    otherwise hands the page a row of NaN. See session_integrity_sql for the
+    variant of this that crashed a page outright.
+    """
     return f"""
         SELECT
             COUNT(*) AS SESSIONS,
-            ROUND(APPROX_PERCENTILE(DURATION_SECONDS, 0.50) / 60.0, 3) AS P50_MINUTES,
-            ROUND(APPROX_PERCENTILE(DURATION_SECONDS, 0.75) / 60.0, 3) AS P75_MINUTES,
-            ROUND(APPROX_PERCENTILE(DURATION_SECONDS, 0.90) / 60.0, 2) AS P90_MINUTES,
-            ROUND(APPROX_PERCENTILE(DURATION_SECONDS, 0.95) / 60.0, 2) AS P95_MINUTES,
-            ROUND(APPROX_PERCENTILE(DURATION_SECONDS, 0.99) / 60.0, 2) AS P99_MINUTES,
-            ROUND(AVG(DURATION_SECONDS) / 60.0, 2) AS MEAN_MINUTES,
-            ROUND(MAX(DURATION_SECONDS) / 86400.0, 2) AS MAX_DAYS,
-            SUM(IFF(DURATION_SECONDS = 0, 1, 0)) AS INSTANT_SESSIONS,
-            SUM(IFF(DURATION_SECONDS > 7200, 1, 0)) AS OVER_2_HOURS,
-            SUM(IFF(DURATION_SECONDS > 86400, 1, 0)) AS OVER_24_HOURS
+            COALESCE(ROUND(APPROX_PERCENTILE(DURATION_SECONDS, 0.50) / 60.0, 3), 0) AS P50_MINUTES,
+            COALESCE(ROUND(APPROX_PERCENTILE(DURATION_SECONDS, 0.75) / 60.0, 3), 0) AS P75_MINUTES,
+            COALESCE(ROUND(APPROX_PERCENTILE(DURATION_SECONDS, 0.90) / 60.0, 2), 0) AS P90_MINUTES,
+            COALESCE(ROUND(APPROX_PERCENTILE(DURATION_SECONDS, 0.95) / 60.0, 2), 0) AS P95_MINUTES,
+            COALESCE(ROUND(APPROX_PERCENTILE(DURATION_SECONDS, 0.99) / 60.0, 2), 0) AS P99_MINUTES,
+            COALESCE(ROUND(AVG(DURATION_SECONDS) / 60.0, 2), 0) AS MEAN_MINUTES,
+            COALESCE(ROUND(MAX(DURATION_SECONDS) / 86400.0, 2), 0) AS MAX_DAYS,
+            COALESCE(SUM(IFF(DURATION_SECONDS = 0, 1, 0)), 0) AS INSTANT_SESSIONS,
+            COALESCE(SUM(IFF(DURATION_SECONDS > 7200, 1, 0)), 0) AS OVER_2_HOURS,
+            COALESCE(SUM(IFF(DURATION_SECONDS > 86400, 1, 0)), 0) AS OVER_24_HOURS
         FROM ({_session_summary_cte()})
     """
 
 
 def session_integrity_sql() -> str:
-    """How far SESSION_ID can be trusted to mean "one visit".
+    """How far SESSION_ID can be trusted to mean "one visit". Aggregates COALESCEd.
+
+    Without the COALESCE this returned SESSIONS = 0 alongside NULL for the other
+    three columns on any range with no sessions, and Session Analytics called
+    int() on one of them - a hard ValueError and a red traceback in place of the
+    page. COUNT returns 0 over an empty set; SUM and MAX return NULL.
 
     Measured, not assumed: the worst session in a recent 60-day window carried 45
     distinct IPs across 36 active days. Session IDs are reused across unrelated
@@ -523,9 +540,9 @@ def session_integrity_sql() -> str:
         )
         SELECT
             COUNT(*) AS SESSIONS,
-            SUM(IFF(IPS > 1, 1, 0)) AS MULTI_IP_SESSIONS,
-            MAX(IPS) AS MAX_IPS_ON_ONE_SESSION,
-            SUM(IFF(DURATION_SECONDS > 86400, 1, 0)) AS OVER_24_HOURS
+            COALESCE(SUM(IFF(IPS > 1, 1, 0)), 0) AS MULTI_IP_SESSIONS,
+            COALESCE(MAX(IPS), 0) AS MAX_IPS_ON_ONE_SESSION,
+            COALESCE(SUM(IFF(DURATION_SECONDS > 86400, 1, 0)), 0) AS OVER_24_HOURS
         FROM s
     """
 
@@ -787,18 +804,24 @@ def visitor_sessions_bands_sql() -> str:
 
 
 def visitor_sessions_percentiles_sql() -> str:
+    """Aggregates COALESCEd - see session_duration_percentiles_sql for why.
+
+    P95_SESSIONS additionally feeds the bot-warning threshold on the Audience
+    page. A NaN there made every comparison false, so the warning silently could
+    not fire rather than failing loudly.
+    """
     return f"""
         SELECT
             COUNT(*) AS VISITORS,
-            APPROX_PERCENTILE(SESSION_COUNT, 0.50) AS P50_SESSIONS,
-            APPROX_PERCENTILE(SESSION_COUNT, 0.75) AS P75_SESSIONS,
-            APPROX_PERCENTILE(SESSION_COUNT, 0.90) AS P90_SESSIONS,
-            APPROX_PERCENTILE(SESSION_COUNT, 0.95) AS P95_SESSIONS,
-            APPROX_PERCENTILE(SESSION_COUNT, 0.99) AS P99_SESSIONS,
-            ROUND(AVG(SESSION_COUNT), 2) AS MEAN_SESSIONS,
-            MAX(SESSION_COUNT) AS MAX_SESSIONS,
-            SUM(IFF(SESSION_COUNT = 1, 1, 0)) AS SINGLE_SESSION_VISITORS,
-            SUM(IFF(SESSION_COUNT > 100, 1, 0)) AS OVER_100_SESSIONS
+            COALESCE(APPROX_PERCENTILE(SESSION_COUNT, 0.50), 0) AS P50_SESSIONS,
+            COALESCE(APPROX_PERCENTILE(SESSION_COUNT, 0.75), 0) AS P75_SESSIONS,
+            COALESCE(APPROX_PERCENTILE(SESSION_COUNT, 0.90), 0) AS P90_SESSIONS,
+            COALESCE(APPROX_PERCENTILE(SESSION_COUNT, 0.95), 0) AS P95_SESSIONS,
+            COALESCE(APPROX_PERCENTILE(SESSION_COUNT, 0.99), 0) AS P99_SESSIONS,
+            COALESCE(ROUND(AVG(SESSION_COUNT), 2), 0) AS MEAN_SESSIONS,
+            COALESCE(MAX(SESSION_COUNT), 0) AS MAX_SESSIONS,
+            COALESCE(SUM(IFF(SESSION_COUNT = 1, 1, 0)), 0) AS SINGLE_SESSION_VISITORS,
+            COALESCE(SUM(IFF(SESSION_COUNT > 100, 1, 0)), 0) AS OVER_100_SESSIONS
         FROM ({_visitor_summary_cte()})
     """
 
