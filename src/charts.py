@@ -52,20 +52,163 @@ def ordered_bar(df: pd.DataFrame, label_col: str, value_col: str, x_title: str =
     return _ordered_labelled_bar(df, label_col, value_col, x_title, total, "% of total", 38)
 
 
-def top_events_bar(df: pd.DataFrame, name_col: str, value_col: str, x_title: str = "Events") -> alt.Chart:
-    """Ranked magnitude: single hue, sorted, axis + tooltip carry values."""
+def top_events_bar(
+    df: pd.DataFrame, name_col: str, value_col: str, x_title: str = "Events", tooltip=None
+) -> alt.Chart:
+    """Ranked magnitude: single hue, sorted, axis + tooltip carry values.
+
+    `tooltip` replaces the default two-field tooltip for callers with more to say. Seven
+    charts across five pages share this function, so the default is left exactly as it
+    was - a new argument rather than a richer default, which would have changed six
+    charts to improve one.
+    """
     return (
         alt.Chart(df)
         .mark_bar(color=series_color())
         .encode(
             x=alt.X(f"{value_col}:Q", title=x_title),
             y=alt.Y(f"{name_col}:N", title=None, sort="-x"),
-            tooltip=[
+            tooltip=tooltip
+            or [
                 alt.Tooltip(f"{name_col}:N", title=name_col.replace("_", " ").title()),
                 alt.Tooltip(f"{value_col}:Q", title=x_title, format=","),
             ],
         )
     )
+
+
+# Ranked by sessions where they exist, by events where they do not. The axis title has to
+# follow, because a bar chart whose length silently changes meaning is worse than either
+# metric alone - see top_campaigns_sql for why both regimes exist in one dataset.
+_CAMPAIGN_FALLBACK = (
+    "Ranked by events, not sessions: session IDs were not recorded on campaign rows "
+    "before 2025-11, so campaigns in this range have no session count."
+)
+_CAMPAIGN_OPAQUE = (
+    "{n} of these campaigns have no campaign name, so their tracking ID is shown "
+    "instead. Name capture began 2026-03."
+)
+_CAMPAIGN_CLASH = (
+    "{n} campaign names are used by more than one campaign, so the tracking ID is "
+    "appended to tell them apart."
+)
+# Called Tenant, not Customer. The value is PROPERTIES:tenant_id and it is an opaque
+# number - 1, 125, 45363964055 - with no name anywhere in the dataset to map it to. The
+# rest of the app already calls these tenants, and "Customer" would promise a company
+# name that the tooltip cannot deliver.
+_CAMPAIGN_UNTAGGED = (
+    "Tenant is not shown: tenant IDs were not recorded on campaign rows before 2025-11, "
+    "so no campaign in this range is attributed to one."
+)
+_UNTAGGED = "(untagged)"
+
+# Name of the Vega selection parameter on the campaign chart. The page reads the click
+# back under this key, so it is defined here beside the chart that declares it rather than
+# spelled twice.
+CAMPAIGN_PICK = "campaign_pick"
+
+
+def campaign_bar(df: pd.DataFrame, window_start, window_end):
+    """Top Campaigns, with a tooltip that describes each campaign.
+
+    Returns (chart, notes). The notes are caveats the chart cannot carry itself; the
+    page prints them beneath it.
+
+    Two things are done in pandas rather than Vega deliberately. Duplicate labels are
+    disambiguated first, because the y encoding is nominal - two campaigns sharing a
+    name would silently merge into one bar with summed values and a tooltip describing
+    neither. 16 names are shared across the dataset; none reach a top 10 today, which
+    makes this the kind of bug that would appear on one date range and no other. And
+    every tooltip line is pre-rendered into a string, because Vega's `format` cannot
+    express "17 of 92 days active" or a recency measured against the window end.
+    """
+    data = df.copy()
+    notes = []
+    window_days = (window_end - window_start).days + 1
+
+    ranked_by_sessions = float(data["SESSIONS"].sum()) > 0
+    metric = "SESSIONS" if ranked_by_sessions else "EVENTS"
+    axis_title = "Sessions" if ranked_by_sessions else "Events"
+    if not ranked_by_sessions:
+        notes.append(_CAMPAIGN_FALLBACK)
+
+    opaque = int(data["LABEL_IS_OPAQUE"].sum())
+    if opaque:
+        notes.append(_CAMPAIGN_OPAQUE.format(n=opaque))
+
+    clashes = data["CAMPAIGN_LABEL"].duplicated(keep=False)
+    if clashes.any():
+        notes.append(_CAMPAIGN_CLASH.format(n=int(data.loc[clashes, "CAMPAIGN_LABEL"].nunique())))
+        suffix = data["CAMPAIGN_ID"].astype(str).str.slice(0, 8)
+        data.loc[clashes, "CAMPAIGN_LABEL"] = data.loc[clashes, "CAMPAIGN_LABEL"] + "  [" + suffix + "]"
+
+    # Recency is measured against the end of the selected window, never against today -
+    # on a range ending in March, "150 days idle" would be an artefact of when the page
+    # was opened rather than anything about the campaign.
+    data["RECENCY"] = [
+        "Active on the last day of the range"
+        if last >= window_end
+        else f"Last active {(window_end - last).days:,} days before the range ended"
+        for last in data["LAST_SEEN"]
+    ]
+    data["RAN"] = [
+        f"{first} to {last}   ({int(active):,} of {window_days:,} days active)"
+        for first, last, active in zip(data["FIRST_SEEN"], data["LAST_SEEN"], data["ACTIVE_DAYS"])
+    ]
+    data["REACH"] = [
+        f"{int(s):,} sessions   ({share:.1f}% of campaign sessions)"
+        for s, share in zip(data["SESSIONS"], data["SESSION_SHARE_PCT"])
+    ]
+    data["VOLUME"] = [
+        f"{int(e):,} events   ({per:.1f} per session)" if per else f"{int(e):,} events"
+        for e, per in zip(data["EVENTS"], data["EVENTS_PER_SESSION"])
+    ]
+    data["CONTENT"] = [
+        f"{pct:.1f}% of sessions opened content   ({int(n):,} assets)"
+        for pct, n in zip(data["ASSET_PCT"], data["ASSETS"])
+    ]
+    data["LEADS"] = [f"{pct:.2f}% of sessions submitted a form" for pct in data["LEAD_PCT"]]
+
+    tooltip = [alt.Tooltip("CAMPAIGN_LABEL:N", title="Campaign")]
+    # Withheld only when it would say (untagged) for every campaign, which means the
+    # window predates tenant tagging. A single untagged campaign among tagged ones is a
+    # real answer about that campaign and stays.
+    tagged = (data["TENANT"].astype(str) != _UNTAGGED).any()
+    if tagged:
+        tooltip.append(alt.Tooltip("TENANT:N", title="Tenant"))
+    else:
+        notes.append(_CAMPAIGN_UNTAGGED)
+    # Session-derived lines are withheld, not zeroed, where sessions do not exist: a
+    # tooltip reading "0.0% of sessions opened content" asserts a measurement that was
+    # never taken. Same for content where the window predates asset tagging (2026-03).
+    if ranked_by_sessions:
+        tooltip.append(alt.Tooltip("REACH:N", title="Reach"))
+    tooltip.append(alt.Tooltip("VOLUME:N", title="Activity"))
+    tooltip.append(alt.Tooltip("RAN:N", title="Ran"))
+    tooltip.append(alt.Tooltip("RECENCY:N", title="Recency"))
+    if ranked_by_sessions and float(data["ASSETS"].sum()) > 0:
+        tooltip.append(alt.Tooltip("CONTENT:N", title="Content"))
+    if ranked_by_sessions:
+        tooltip.append(alt.Tooltip("LEADS:N", title="Leads"))
+
+    # Only the encoded columns are handed to Altair, derived from the tooltip list itself
+    # so the two cannot drift. Two reasons. FIRST_SEEN and LAST_SEEN arrive from Snowflake
+    # as date objects, and a date is not JSON serialisable - chart.to_json() raises on
+    # them even though Streamlit's own path survives by shipping data as Arrow, so the
+    # chart was one serialisation route away from failing. And the raw columns are already
+    # spent: they were read in pandas to build RAN and RECENCY, so sending them too would
+    # push ten unused columns to the browser on every rerun.
+    fields = [str(t.shorthand).split(":")[0] for t in tooltip]
+    keep = list(dict.fromkeys(fields + ["CAMPAIGN_LABEL", metric, "CAMPAIGN_ID"]))
+    chart = top_events_bar(data[keep], "CAMPAIGN_LABEL", metric, x_title=axis_title, tooltip=tooltip)
+
+    # The selection carries CAMPAIGN_ID, not the label. Labels are display strings - they
+    # can be a name, a tracking ID, or a name with an ID appended to break a collision -
+    # so keying a drill-down on one would break exactly where two campaigns share a name.
+    # CAMPAIGN_ID rides in the data without being encoded or shown in the tooltip; Vega can
+    # still read it off the datum.
+    chart = chart.add_params(alt.selection_point(name=CAMPAIGN_PICK, fields=["CAMPAIGN_ID"]))
+    return chart, notes
 
 
 def share_stacked_bar(

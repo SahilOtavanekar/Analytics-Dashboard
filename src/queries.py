@@ -945,17 +945,106 @@ def campaign_kpis_sql() -> str:
 
 
 def top_campaigns_sql(limit: int = 10) -> str:
-    # CAMPAIGN_ID is the stable key, but it's often an opaque UUID; PROPERTIES:campaign_name
-    # is only ~62% populated and occasionally drifts (renames/whitespace), so MODE() picks
-    # the most common label per campaign and we fall back to the raw ID when no name exists.
+    """The window's biggest campaigns, with enough context to describe each one.
+
+    CAMPAIGN_ID is the stable key, but it is not a label. Three shapes exist, measured
+    over the whole dataset: 425 campaigns whose ID is a readable slug and which carry no
+    campaign_name at all (ibm-ai, epicor-ai), 526 with a UUID and a name, and 70 with a
+    UUID and no name. Only that last group is unreadable, and it can rank - its largest
+    member has 2,569 sessions against a rank-10 floor of 2,018 on a 3-month window - so
+    LABEL_IS_OPAQUE is returned rather than letting a UUID pass as a campaign name.
+    campaign_name capture began 2026-03; before that every label comes from the ID.
+
+    Ranked by sessions, then events, then ID. That ordering does three jobs:
+
+      - sessions is reach, which the old events ranking did not measure. Events are
+        97-99.9% page views, so ranking on them ranked content volume: SE0426-005 sat
+        7th on 642 sessions because each of its sessions fired 159 events.
+      - events is a tiebreak that carries real weight. SESSION_ID was not recorded on
+        campaign rows before 2025-11 (0% of rows for 2025-06..2025-10, 2.93M events),
+        so on any window inside that period every campaign has zero sessions and this
+        ordering degenerates to exactly the old events ranking - the same ten rows the
+        reader would otherwise have seen, not an arbitrary ten. The page relabels the
+        axis when it happens rather than drawing ten bars of length zero.
+      - CAMPAIGN_ID last, because ties straddle rank 10 on narrow windows (3 of 11
+        windows tested) and LIMIT without a total order reshuffles between loads.
+
+    CAMPAIGN_ID IS NOT NULL is not cosmetic. Without it the null-campaign group ranks
+    on its own: 2025-06-14..07-14 currently returns a single bar with a NULL label and
+    660 events, and the group holds 109,989 events across the whole dataset. _NOT_TEST
+    matches every sibling ranking query; no campaign row is a test event today, so it
+    changes nothing now and stops it mattering later.
+
+    Every rate is COALESCEd because its denominator genuinely reaches zero: on the
+    October 2025 window all ten ranked campaigns have no sessions, and an unguarded
+    ratio there is NULL, which reaches the tooltip as a blank and reads as a zero.
+    """
     return f"""
+        WITH ev AS (
+            SELECT
+                CAMPAIGN_ID, SESSION_ID, MESSAGE_ID, EVENT_TS,
+                PROPERTIES:campaign_name::STRING AS NAME,
+                {_TENANT} AS TENANT,
+                {_ASSET} AS ASSET,
+                IFF({_LEAD_SUBMIT}, 1, 0) AS IS_LEAD
+            FROM {table_fqn()}
+            WHERE EVENT_TS::DATE BETWEEN ? AND ?
+              AND CAMPAIGN_ID IS NOT NULL
+              AND {_NOT_TEST}
+        ), per_session AS (
+            SELECT
+                CAMPAIGN_ID, SESSION_ID,
+                MAX(IFF(ASSET IS NOT NULL, 1, 0)) AS HAD_ASSET,
+                MAX(IS_LEAD) AS HAD_LEAD
+            FROM ev
+            WHERE SESSION_ID IS NOT NULL
+            GROUP BY 1, 2
+        ), sess AS (
+            SELECT
+                CAMPAIGN_ID,
+                COUNT(*) AS SESSIONS,
+                SUM(HAD_ASSET) AS ASSET_SESSIONS,
+                SUM(HAD_LEAD) AS LEAD_SESSIONS
+            FROM per_session
+            GROUP BY 1
+        ), camp AS (
+            SELECT
+                CAMPAIGN_ID,
+                MODE(NAME) AS NAME,
+                MODE(TENANT) AS TENANT,
+                COUNT(DISTINCT MESSAGE_ID) AS EVENTS,
+                COUNT(DISTINCT ASSET) AS ASSETS,
+                MIN(EVENT_TS)::DATE AS FIRST_SEEN,
+                MAX(EVENT_TS)::DATE AS LAST_SEEN,
+                COUNT(DISTINCT EVENT_TS::DATE) AS ACTIVE_DAYS
+            FROM ev
+            GROUP BY 1
+        ), window_total AS (
+            SELECT COUNT(DISTINCT SESSION_ID) AS WINDOW_SESSIONS FROM ev
+        )
         SELECT
-            COALESCE(MODE(PROPERTIES:campaign_name::STRING), CAMPAIGN_ID) AS CAMPAIGN_LABEL,
-            COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT
-        FROM {table_fqn()}
-        WHERE EVENT_TS::DATE BETWEEN ? AND ?
-        GROUP BY CAMPAIGN_ID
-        ORDER BY EVENT_COUNT DESC
+            c.CAMPAIGN_ID,
+            COALESCE(c.NAME, c.CAMPAIGN_ID) AS CAMPAIGN_LABEL,
+            IFF(c.NAME IS NULL, FALSE, TRUE) AS HAS_NAME,
+            IFF(c.NAME IS NULL AND REGEXP_LIKE(c.CAMPAIGN_ID,
+                '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$', 'i'),
+                TRUE, FALSE) AS LABEL_IS_OPAQUE,
+            c.TENANT,
+            COALESCE(s.SESSIONS, 0) AS SESSIONS,
+            c.EVENTS,
+            w.WINDOW_SESSIONS,
+            COALESCE((c.EVENTS / NULLIF(s.SESSIONS, 0))::FLOAT, 0) AS EVENTS_PER_SESSION,
+            COALESCE((s.SESSIONS / NULLIF(w.WINDOW_SESSIONS, 0) * 100)::FLOAT, 0) AS SESSION_SHARE_PCT,
+            c.ASSETS,
+            COALESCE((s.ASSET_SESSIONS / NULLIF(s.SESSIONS, 0) * 100)::FLOAT, 0) AS ASSET_PCT,
+            COALESCE((s.LEAD_SESSIONS / NULLIF(s.SESSIONS, 0) * 100)::FLOAT, 0) AS LEAD_PCT,
+            c.FIRST_SEEN,
+            c.LAST_SEEN,
+            c.ACTIVE_DAYS
+        FROM camp c
+        LEFT JOIN sess s ON c.CAMPAIGN_ID = s.CAMPAIGN_ID
+        CROSS JOIN window_total w
+        ORDER BY SESSIONS DESC, c.EVENTS DESC, c.CAMPAIGN_ID
         LIMIT {limit}
     """
 
@@ -1119,4 +1208,364 @@ def tenant_movement_sql(limit: int = 12) -> str:
         FULL OUTER JOIN prv p ON c.TENANT = p.TENANT
         ORDER BY ABS(COALESCE(c.EVENTS, 0) - COALESCE(p.EVENTS, 0)) DESC
         LIMIT {limit}
+    """
+
+
+# ------------------------------------------------------------------ campaign drill-down
+#
+# One campaign, every angle that has data for it. EVERY query below takes exactly three
+# parameters in this order: start date, end date, campaign id - so the SQL text is
+# identical for every campaign and only the bound parameter changes. run_query caches on
+# (sql, params), so each campaign gets its own cache entry and switching between two
+# already-viewed campaigns costs nothing.
+#
+# Which sections are worth building was measured across the 336 campaigns with >=50
+# sessions in a 3-month window, rather than assumed:
+#
+#   geography, session duration, actions, activity   100%   always rendered
+#   referrers                                         95%   conditional
+#   content (assets)                                  87%   conditional
+#   pdf read depth                                    65%   conditional
+#   lead conversion                                   50%   conditional
+#   identity (any)                                    57%   conditional, and gated
+#   identity (>=5 identified people)                  42%   the PII floor below
+#   AI usage                                          19%   conditional
+#
+# Two angles the global dashboard has are deliberately NOT reproduced here. Top Pages:
+# a campaign resolves to 1-5 distinct paths, because the campaign essentially IS one
+# document, so the chart would be one or two bars. Language: locale is 0 or 1 distinct
+# value per campaign. Both would be permanently near-empty.
+#
+# AI is a conditional section rather than an absent one. An earlier note in this project
+# claimed ml_request events carry no campaign ID; that was wrong - 1,265,377 of 1,265,649
+# of them do. AI is simply concentrated in 138 of 1,023 campaigns, none of which are the
+# largest by sessions.
+_CAMPAIGN_SCOPE = """
+        WHERE EVENT_TS::DATE BETWEEN ? AND ?
+          AND CAMPAIGN_ID = ?
+          AND {not_test}"""
+
+
+def _campaign_events_cte() -> str:
+    """Every column the drill-down needs, for one campaign, read in a single scan."""
+    return f"""
+        SELECT
+            SESSION_ID, MESSAGE_ID, EVENT_TS, EVENT_NAME, EVENT_TYPE, TIMEZONE,
+            SEARCH_URL, REFERER_URL,
+            PROPERTIES:campaign_name::STRING AS NAME,
+            {_TENANT} AS TENANT,
+            {_EMAIL} AS ADDR,
+            {_ASSET} AS ASSET,
+            PROPERTIES:page_visited AS PAGE_VISITED,
+            IFF({_AI_REQUEST}, 1, 0) AS IS_AI,
+            IFF({_LEAD_SUBMIT}, 1, 0) AS IS_LEAD,
+            IFF({_COOKIE_FORM}, 1, 0) AS IS_COOKIE,
+            IFF(NOT {_PAGE_VIEW}, 1, 0) AS IS_ACTION
+        FROM {table_fqn()}
+        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+    """
+
+
+# Validity is re-tested against the CTE's own ADDR column rather than reusing
+# _VALID_EMAIL, which re-derives the address from QUERY_PARAMETERS and would not resolve
+# against a projected column. Same rule, applied one layer up.
+_ADDR_VALID = "ADDR LIKE '%@%.%'"
+
+
+def campaign_detail_kpis_sql() -> str:
+    """One row describing the campaign, and the gate for every conditional section.
+
+    Deliberately one query rather than ten small ones. The page needs to know whether a
+    section has any data BEFORE it decides to render it, and asking that per section
+    would mean a round trip per section just to discover an empty state. Everything here
+    comes from a single scan; the section queries only run for sections that survive.
+
+    Counts, not rates. The page divides them, so a zero denominator is handled once in
+    Python rather than needing a COALESCE on every ratio here.
+    """
+    return f"""
+        WITH ev AS ({_campaign_events_cte()}
+        ), sess AS (
+            SELECT
+                SESSION_ID,
+                MAX(IS_AI) AS USED_AI,
+                MAX(IS_LEAD) AS CONVERTED,
+                MAX(IS_ACTION) AS ACTED,
+                MAX(IFF(ASSET IS NOT NULL, 1, 0)) AS SAW_CONTENT,
+                MAX(IFF({_ADDR_VALID}, 1, 0)) AS IDENTIFIED,
+                COUNT(DISTINCT MESSAGE_ID) AS EVENTS,
+                DATEDIFF('second', MIN(EVENT_TS), MAX(EVENT_TS)) AS SECS
+            FROM ev
+            WHERE SESSION_ID IS NOT NULL
+            GROUP BY SESSION_ID
+        ), ev_agg AS (
+            -- One pass over the events, not one pass per column. Written as 13 scalar
+            -- subqueries first, which measured 4-6s because each re-scanned the CTE;
+            -- folded into a single aggregate row it lands near a second. This query is on
+            -- the critical path of every drill-in, so it is the one worth flattening.
+            SELECT
+                MODE(NAME) AS CAMPAIGN_NAME,
+                MODE(TENANT) AS TENANT,
+                COUNT(DISTINCT MESSAGE_ID) AS EVENTS,
+                MIN(EVENT_TS)::DATE AS FIRST_SEEN,
+                MAX(EVENT_TS)::DATE AS LAST_SEEN,
+                COUNT(DISTINCT EVENT_TS::DATE) AS ACTIVE_DAYS,
+                COUNT(DISTINCT ASSET) AS ASSETS,
+                COUNT(DISTINCT IFF({_ADDR_VALID}, ADDR, NULL)) AS PEOPLE,
+                COUNT(DISTINCT IFF({_ADDR_VALID}, SPLIT_PART(ADDR, '@', 2), NULL)) AS COMPANIES,
+                COUNT(DISTINCT IFF(IS_AI = 1, MESSAGE_ID, NULL)) AS AI_EVENTS,
+                COUNT(DISTINCT IFF(PAGE_VISITED IS NOT NULL, MESSAGE_ID, NULL)) AS PDF_EVENTS,
+                COUNT(DISTINCT IFF(COALESCE(REFERER_URL, '') <> '', REFERER_URL, NULL)) AS REFERRERS,
+                COUNT(DISTINCT TIMEZONE) AS TIMEZONES
+            FROM ev
+        ), sess_agg AS (
+            SELECT
+                COUNT(*) AS SESSIONS,
+                COALESCE(SUM(USED_AI), 0) AS AI_SESSIONS,
+                COALESCE(SUM(CONVERTED), 0) AS LEAD_SESSIONS,
+                COALESCE(SUM(ACTED), 0) AS ACTED_SESSIONS,
+                COALESCE(SUM(SAW_CONTENT), 0) AS CONTENT_SESSIONS,
+                COALESCE(SUM(IDENTIFIED), 0) AS IDENTIFIED_SESSIONS,
+                COALESCE((APPROX_PERCENTILE(EVENTS, 0.5))::FLOAT, 0) AS MEDIAN_EVENTS,
+                COALESCE((APPROX_PERCENTILE(SECS, 0.5) / 60.0)::FLOAT, 0) AS MEDIAN_DURATION_MINUTES,
+                COALESCE((AVG(SECS) / 60.0)::FLOAT, 0) AS MEAN_DURATION_MINUTES,
+                COALESCE(SUM(IFF(SECS = 0, 1, 0)), 0) AS INSTANT_SESSIONS
+            FROM sess
+        )
+        SELECT * FROM ev_agg CROSS JOIN sess_agg
+    """
+
+
+def campaign_daily_sql() -> str:
+    """Daily sessions and events for one campaign - the shape of its run."""
+    return f"""
+        SELECT
+            EVENT_TS::DATE AS EVENT_DATE,
+            COUNT(DISTINCT SESSION_ID) AS SESSION_COUNT,
+            COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT
+        FROM {table_fqn()}
+        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+        GROUP BY EVENT_DATE
+        ORDER BY EVENT_DATE
+    """
+
+
+def campaign_duration_bands_sql() -> str:
+    """Session duration in the same seven bands Session Analytics uses.
+
+    The most discriminating section per campaign, measured: ibm-ai has 2,584 of 9,306
+    sessions with any duration at all and a 0s median, while snowflake-apac-ai has 8,733
+    of 8,977 and a 42s median. Same order of size, entirely different reading behaviour.
+    Bands are shared with page 3 on purpose so the two are directly comparable.
+    """
+    return f"""
+        WITH s AS (
+            SELECT SESSION_ID, DATEDIFF('second', MIN(EVENT_TS), MAX(EVENT_TS)) AS DURATION_SECONDS
+            FROM {table_fqn()}
+            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+              AND SESSION_ID IS NOT NULL
+            GROUP BY SESSION_ID
+        )
+        SELECT
+            CASE
+                WHEN DURATION_SECONDS = 0 THEN '0s (instant)'
+                WHEN DURATION_SECONDS <= 10 THEN '1-10 seconds'
+                WHEN DURATION_SECONDS <= 60 THEN '10-60 seconds'
+                WHEN DURATION_SECONDS <= 300 THEN '1-5 minutes'
+                WHEN DURATION_SECONDS <= 1800 THEN '5-30 minutes'
+                WHEN DURATION_SECONDS <= 7200 THEN '30 min - 2 hours'
+                ELSE 'over 2 hours'
+            END AS BAND,
+            CASE
+                WHEN DURATION_SECONDS = 0 THEN 1
+                WHEN DURATION_SECONDS <= 10 THEN 2
+                WHEN DURATION_SECONDS <= 60 THEN 3
+                WHEN DURATION_SECONDS <= 300 THEN 4
+                WHEN DURATION_SECONDS <= 1800 THEN 5
+                WHEN DURATION_SECONDS <= 7200 THEN 6
+                ELSE 7
+            END AS BAND_ORDER,
+            COUNT(*) AS SESSIONS
+        FROM s
+        GROUP BY BAND, BAND_ORDER
+        ORDER BY BAND_ORDER
+    """
+
+
+def campaign_funnel_sql() -> str:
+    """The same three nesting stages as page 6, scoped to one campaign."""
+    return f"""
+        WITH sess AS (
+            SELECT
+                SESSION_ID,
+                MAX(IFF(NOT {_PAGE_VIEW}, 1, 0)) AS DID_ACT,
+                MAX(IFF({_LEAD_SUBMIT}, 1, 0)) AS DID_CONVERT
+            FROM {table_fqn()}
+            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+              AND SESSION_ID IS NOT NULL
+            GROUP BY SESSION_ID
+        )
+        SELECT 1 AS STAGE_ORDER, 'Visited' AS STAGE, COUNT(*) AS SESSIONS FROM sess
+        UNION ALL
+        SELECT 2, 'Took an action', COALESCE(SUM(DID_ACT), 0) FROM sess
+        UNION ALL
+        SELECT 3, 'Submitted a lead form', COALESCE(SUM(DID_CONVERT), 0) FROM sess
+        ORDER BY STAGE_ORDER
+    """
+
+
+def campaign_actions_sql() -> str:
+    """Which actions this campaign's visitors took, as reach.
+
+    The denominator comes from a scalar subquery over the same CTE rather than a second
+    scan, which also keeps this at three parameters like every other query here - the
+    global action_reach_sql needs its range twice for exactly this reason.
+    """
+    return f"""
+        WITH ev AS ({_campaign_events_cte()}
+        ), all_sessions AS (
+            SELECT COUNT(DISTINCT SESSION_ID) AS N FROM ev WHERE SESSION_ID IS NOT NULL
+        ), acted AS (
+            SELECT DISTINCT
+                SESSION_ID,
+                IFF(IS_COOKIE = 1, 'Cookie Consent',
+                    INITCAP(LOWER(REPLACE(EVENT_NAME, '_', ' ')))) AS ACTION
+            FROM ev
+            WHERE SESSION_ID IS NOT NULL
+              AND EVENT_NAME IS NOT NULL
+              AND IS_ACTION = 1
+        )
+        SELECT
+            ACTION,
+            COUNT(DISTINCT SESSION_ID) AS SESSIONS,
+            COALESCE((COUNT(DISTINCT SESSION_ID) * 100.0
+                / NULLIF((SELECT N FROM all_sessions), 0))::FLOAT, 0) AS PCT_OF_SESSIONS
+        FROM acted
+        GROUP BY ACTION
+        ORDER BY SESSIONS DESC
+    """
+
+
+def campaign_geo_sql(timezone_limit: int = 10) -> str:
+    """Region and timezone for one campaign, one scan, split by KIND like audience_geo_sql."""
+    return f"""
+        WITH base AS (
+            SELECT SESSION_ID, TIMEZONE
+            FROM {table_fqn()}
+            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+              AND SESSION_ID IS NOT NULL
+        ), region AS (
+            SELECT 'region' AS KIND, {_REGION} AS LABEL, COUNT(DISTINCT SESSION_ID) AS SESSIONS
+            FROM base GROUP BY 1, 2
+        ), tz AS (
+            SELECT 'timezone' AS KIND, TIMEZONE AS LABEL, COUNT(DISTINCT SESSION_ID) AS SESSIONS
+            FROM base
+            WHERE TIMEZONE IS NOT NULL AND TRIM(TIMEZONE) <> ''
+            GROUP BY 1, 2
+            QUALIFY ROW_NUMBER() OVER (ORDER BY SESSIONS DESC) <= {timezone_limit}
+        )
+        SELECT * FROM region
+        UNION ALL SELECT * FROM tz
+        ORDER BY KIND, SESSIONS DESC
+    """
+
+
+def campaign_assets_sql(limit: int = 12) -> str:
+    """Content this campaign put in front of people, by reach."""
+    return f"""
+        SELECT
+            {_ASSET_LABEL} AS ASSET,
+            COUNT(DISTINCT SESSION_ID) AS SESSIONS,
+            COUNT(DISTINCT MESSAGE_ID) AS EVENTS,
+            ROUND(COUNT(DISTINCT MESSAGE_ID) * 1.0
+                  / NULLIF(COUNT(DISTINCT SESSION_ID), 0), 1) AS EVENTS_PER_SESSION
+        FROM {table_fqn()}
+        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+          AND {_ASSET} IS NOT NULL
+          AND SESSION_ID IS NOT NULL
+        GROUP BY {_ASSET}
+        ORDER BY SESSIONS DESC
+        LIMIT {limit}
+    """
+
+
+def campaign_read_depth_sql(limit: int = 10) -> str:
+    """How far into this campaign's documents people got."""
+    return f"""
+        SELECT
+            {_ASSET_LABEL} AS ASSET,
+            COUNT(DISTINCT SESSION_ID) AS SESSIONS,
+            ROUND(AVG(TRY_TO_NUMBER(PROPERTIES:page_visited::STRING)), 1) AS AVG_PAGE_REACHED,
+            MAX(TRY_TO_NUMBER(PROPERTIES:page_visited::STRING)) AS DEEPEST_PAGE
+        FROM {table_fqn()}
+        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+          AND PROPERTIES:page_visited IS NOT NULL
+          AND {_ASSET} IS NOT NULL
+          AND SESSION_ID IS NOT NULL
+        GROUP BY {_ASSET}
+        ORDER BY SESSIONS DESC
+        LIMIT {limit}
+    """
+
+
+def campaign_companies_sql(limit: int = 12) -> str:
+    """Which accounts this campaign actually reached.
+
+    Consumer mailboxes are excluded, matching Top Companies on the Audience page - they
+    are people, not accounts. Returns domains and headcounts only; an individual address
+    is never returned by any query in this module.
+    """
+    return f"""
+        SELECT
+            {_DOMAIN} AS COMPANY,
+            COUNT(DISTINCT {_EMAIL}) AS PEOPLE,
+            COUNT(DISTINCT SESSION_ID) AS SESSIONS
+        FROM {table_fqn()}
+        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+          AND {_VALID_EMAIL}
+          AND {_DOMAIN} NOT IN {_FREE_MAIL}
+          AND SESSION_ID IS NOT NULL
+        GROUP BY 1
+        ORDER BY SESSIONS DESC
+        LIMIT {limit}
+    """
+
+
+def campaign_sources_sql(referrer_limit: int = 8) -> str:
+    """Source mix and named referrers for one campaign, one scan, split by KIND."""
+    return f"""
+        WITH base AS (
+            SELECT MESSAGE_ID, REFERER_URL
+            FROM {table_fqn()}
+            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+        ), grp AS (
+            SELECT 'group' AS KIND, {_SOURCE_GROUP} AS LABEL,
+                   COUNT(DISTINCT MESSAGE_ID) AS EVENTS
+            FROM base GROUP BY 1, 2
+        ), ref AS (
+            SELECT 'referrer' AS KIND, {_REF_HOST} AS LABEL,
+                   COUNT(DISTINCT MESSAGE_ID) AS EVENTS
+            FROM base
+            WHERE {_SOURCE_GROUP} = 'External'
+            GROUP BY 1, 2
+            QUALIFY ROW_NUMBER() OVER (ORDER BY EVENTS DESC) <= {referrer_limit}
+        )
+        SELECT * FROM grp
+        UNION ALL SELECT * FROM ref
+        ORDER BY KIND, EVENTS DESC
+    """
+
+
+def campaign_ai_sql() -> str:
+    """Model mix for one campaign. Only 19% of campaigns reach this query."""
+    return f"""
+        SELECT
+            {_MODEL} AS MODEL,
+            COUNT(DISTINCT MESSAGE_ID) AS REQUESTS,
+            COUNT(DISTINCT SESSION_ID) AS SESSIONS
+        FROM {table_fqn()}
+        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+          AND {_AI_REQUEST}
+        GROUP BY 1
+        ORDER BY REQUESTS DESC
     """
