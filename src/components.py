@@ -3,7 +3,7 @@ from functools import partial
 
 import streamlit as st
 
-from src.db import CACHE_TTL_SECONDS, clear_cache
+from src.db import CACHE_TTL_SECONDS, EXCLUDE_INTERNAL_KEY, clear_cache
 from src.prefetch import warm
 
 # Streamlit discards widget state on page navigation, so the selection is
@@ -108,6 +108,23 @@ def kpi_row(items) -> None:
 # data is visible rather than clipped.
 _DATA_STARTS = dt.date(2025, 6, 1)
 
+# Same two-key pattern as the date range: the widget key is purged on navigation, so
+# the durable key is what db.exclude_internal() reads and what survives a page
+# change. Named to match EXCLUDE_INTERNAL_KEY exactly - they must not drift.
+_EXCLUDE_STORE = EXCLUDE_INTERNAL_KEY
+_EXCLUDE_WIDGET = "exclude_internal_widget"
+_EXCLUDE_LABEL = "Exclude internal traffic"
+_EXCLUDE_HELP = (
+    "Removes Demand AI's own traffic (tenant demand_ai) - the marketing site, localhost "
+    "and preview builds used for testing. Applies to every page at once."
+)
+# Rendered in the page body, not the sidebar, so a screenshot of any page carries the
+# caveat with it. A filtered figure that looks unfiltered is the real risk here.
+_EXCLUDE_ACTIVE = (
+    ":material/filter_alt: **Internal traffic excluded.** Figures on this page omit Demand AI's "
+    "own tenant. Turn this off in the sidebar to see all traffic."
+)
+
 
 def date_range_filter(default_days: int = 30, key: str = _WIDGET) -> tuple[dt.date, dt.date]:
     # Snowflake's runtime clock can lag the viewer's local date by up to a day, so
@@ -135,24 +152,36 @@ def date_range_filter(default_days: int = 30, key: str = _WIDGET) -> tuple[dt.da
     if isinstance(selected, (tuple, list)) and len(selected) == 2:
         st.session_state[_STORE] = (selected[0], selected[1])
 
+    if _EXCLUDE_STORE not in st.session_state:
+        st.session_state[_EXCLUDE_STORE] = False
+    excluding = st.sidebar.checkbox(_EXCLUDE_LABEL, value=st.session_state[_EXCLUDE_STORE], key=_EXCLUDE_WIDGET, help=_EXCLUDE_HELP)
+    st.session_state[_EXCLUDE_STORE] = excluding
+    if excluding:
+        st.caption(_EXCLUDE_ACTIVE)
+
     # Data controls live here rather than on a landing page, because since the
     # Executive Dashboard became the landing page there is no neutral page to put
     # them on - and they are wanted from wherever the reader happens to be.
     chosen = st.session_state[_STORE]
     prev_start, prev_end = previous_window(chosen[0], chosen[1])
+    # The warmed marker carries the exclusion flag as well as the range. Toggling the
+    # filter rewrites every query's SQL, so the cache for the other state is cold -
+    # keying on the range alone would keep claiming "preloaded" while every page went
+    # back to querying Snowflake.
+    warm_key = (chosen, excluding)
     with st.sidebar.expander("Data", expanded=False):
         st.caption(_CACHE_NOTE.format(mins=CACHE_TTL_SECONDS // 60))
         if st.button("Refresh data", width="stretch"):
             clear_cache()
             st.session_state.pop(_WARMED, None)
             st.rerun()
-        if st.session_state.get(_WARMED) == chosen:
+        if st.session_state.get(_WARMED) == warm_key:
             st.caption("All pages preloaded for this range.")
         elif st.button("Preload all pages", width="stretch", help=_PRELOAD_HELP):
             bar = st.progress(0.0, text="Starting...")
             ok, total = warm(chosen[0], chosen[1], prev_start, prev_end, on_progress=partial(_tick, bar))
             bar.empty()
-            st.session_state[_WARMED] = chosen
+            st.session_state[_WARMED] = warm_key
             st.rerun()
 
     return chosen
