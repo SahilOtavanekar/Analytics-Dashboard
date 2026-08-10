@@ -32,6 +32,29 @@ CACHE_TTL_SECONDS = 3600
 INTERNAL_TENANT = "demand_ai"
 EXCLUDE_INTERNAL_KEY = "exclude_internal"
 
+# Internal traffic arrives two independent ways, and filtering only the first left
+# demandai.co at the top of Top Companies with the filter switched on:
+#
+#   tenant_id = 'demand_ai'  - whose CONTENT is being viewed (Demand AI's own site)
+#   email domain demandai.co - who the VISITOR is (Demand AI staff)
+#
+# All 1,113 sessions from staff addresses in a 30-day window sit on CUSTOMER
+# tenants, none on demand_ai, so the tenant rule could never reach them.
+#
+# Matched by pattern, not equality: the data carries five spellings - demandai.co,
+# a malformed demandai.co" with a trailing quote, demandai.com, demandai-ai.co and
+# demand-ai.co. Two patterns cover all five. The COALESCE matters - a row with no
+# email must not match and be dropped.
+_VISITOR_DOMAIN = (
+    "SPLIT_PART(LOWER(COALESCE(QUERY_PARAMETERS:email::STRING, "
+    'QUERY_PARAMETERS:"amp;email"::STRING, \'\')), \'@\', 2)'
+)
+_INTERNAL_PREDICATE = (
+    f"COALESCE(PROPERTIES:tenant_id::STRING, '') <> '{INTERNAL_TENANT}'"
+    f" AND NOT (COALESCE({_VISITOR_DOMAIN}, '') ILIKE '%demandai%'"
+    f" OR COALESCE({_VISITOR_DOMAIN}, '') ILIKE '%demand-ai%')"
+)
+
 
 def exclude_internal() -> bool:
     """Is the reader currently excluding Demand AI's own traffic?
@@ -59,13 +82,17 @@ def table_fqn() -> str:
 
     Because run_query caches on the SQL text, the two states produce different cache
     keys automatically; toggling does not serve stale figures from the other state.
+
+    The filter is row-level, not session-level. A staff member browsing a customer's
+    document loses the rows carrying their address - so they vanish from Top
+    Companies and every identity metric - but the remaining rows of that session
+    still count toward that customer's session total, as anonymous activity. A
+    deliberate choice: excluding whole sessions would need a window over the
+    unfiltered table on every query, and the activity did happen on that content.
     """
     if not exclude_internal():
         return TABLE_FQN
-    return (
-        f"(SELECT * FROM {TABLE_FQN} "
-        f"WHERE COALESCE(PROPERTIES:tenant_id::STRING, '') <> '{INTERNAL_TENANT}')"
-    )
+    return f"(SELECT * FROM {TABLE_FQN} WHERE {_INTERNAL_PREDICATE})"
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner="Querying Snowflake...")
