@@ -1,0 +1,7 @@
+name: app_environment
+channels:
+  - snowflake
+dependencies:
+  - pandas
+# streamlit and snowflake-snowpark-python are preinstalled by the warehouse
+# runtime, and altair ships with streamlit - so charts need no extra package.

@@ -62,7 +62,7 @@ instead of `authenticator = "externalbrowser"`:
    `.streamlit/secrets.toml.example` (with your actual private key content —
    never commit that file to git).
 
-**Streamlit in Snowflake** — files are already uploaded to
+**Streamlit in Snowflake (manual stage upload)** — files are already uploaded to
 `@CIT_DATA_CORE.TRACKING.ANALYTICS_DASHBOARD_STAGE`. Once `CREATE STREAMLIT` is
 granted on the schema, an admin (or you, once granted) can run:
 ```sql
@@ -74,6 +74,34 @@ CREATE STREAMLIT CIT_DATA_CORE.TRACKING.ANALYTICS_DASHBOARD
 Note: the version currently on this stage predates the key-pair auth addition
 above — it would need re-uploading to pick up that change (not required for
 native Snowflake hosting, which doesn't use key-pair auth at all).
+
+**Streamlit in Snowflake (Git integration)** — the `streamlit-in-snowflake`
+branch deploys straight from this public GitHub repo, no stage upload and no
+secrets needed at all. `src/db.py` auto-detects the active Snowpark session
+and connects with it directly when running inside Snowflake.
+
+One-time setup (needs `CREATE INTEGRATION` privilege, e.g. `ACCOUNTADMIN`):
+```sql
+CREATE OR REPLACE API INTEGRATION git_api_integration
+  API_PROVIDER = git_https_api
+  API_ALLOWED_PREFIXES = ('https://github.com/SahilOtavanekar')
+  ENABLED = TRUE;
+
+CREATE OR REPLACE GIT REPOSITORY CIT_DATA_CORE.TRACKING.ANALYTICS_DASHBOARD_REPO
+  API_INTEGRATION = git_api_integration
+  ORIGIN = 'https://github.com/SahilOtavanekar/Analytics-Dashboard.git';
+
+ALTER GIT REPOSITORY CIT_DATA_CORE.TRACKING.ANALYTICS_DASHBOARD_REPO FETCH;
+
+CREATE OR REPLACE STREAMLIT CIT_DATA_CORE.TRACKING.ANALYTICS_DASHBOARD_SIS
+  ROOT_LOCATION = '@CIT_DATA_CORE.TRACKING.ANALYTICS_DASHBOARD_REPO/branches/streamlit-in-snowflake'
+  MAIN_FILE = 'streamlit_app.py'
+  QUERY_WAREHOUSE = 'SNOWFLAKE_LEARNING_WH';
+```
+To pick up new commits pushed to the branch, run `ALTER GIT REPOSITORY
+CIT_DATA_CORE.TRACKING.ANALYTICS_DASHBOARD_REPO FETCH;` again, then reopen the
+app in Snowsight. Python packages for this deployment come from
+`environment.yml` (Snowflake Anaconda channel), not `requirements.txt`.
 
 ## Project structure
 

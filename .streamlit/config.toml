@@ -1,42 +1,78 @@
-# Theme matches the validated chart palette in src/theme.py, so the app
-# chrome and the Plotly charts read as one system in both light and dark.
+# Theme matched to demandai.net/insyte. Colour values are the site's own CSS
+# custom properties (--t, --ink, --muted, --line), read off the live page.
+#
+# Chart colours here and the palette in src/theme.py must stay in step: these
+# apply to charts that do not name their own colours, while our Altair builders
+# pass explicit ones. Changing only this file leaves teal chrome around blue charts.
+# They live under [theme], not the per-mode sections - Streamlit rejects them there.
+#
+# Both [theme.light] and [theme.dark] are defined so the mode toggle stays
+# available. The dark palette is re-selected against the dark surface, not flipped.
 
 [theme]
-font = "sans-serif"
-baseRadius = "small"
-buttonRadius = "small"
+# The site uses Inter. This fetch happens in the viewer's browser rather than
+# Snowflake's container, so the lack of an External Access Integration should not
+# block it - but Snowflake may apply a CSP that does. If it fails the browser
+# falls back to its default sans, which is why src/theme.py keeps a system stack.
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+headingFont = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@600;700&display=swap"
+
+# The site rounds cards at 12-18px, against Streamlit's 4px default.
+baseRadius = "large"
+buttonRadius = "large"
 showSidebarBorder = true
-linkColor = "#2a78d6"
+linkUnderline = false
+
+# Chart colours are only valid HERE, at top level. Streamlit 1.60 rejects
+# theme.light.chartCategoricalColors and theme.dark.chartCategoricalColors - it
+# logged "is not a valid config option" four times on every start and discarded
+# them, so the palette below never reached a chart.
+#
+# That also means a per-mode chart palette cannot be expressed in config at all.
+# Our Altair builders read src/theme.py through accessors that switch on
+# st.context.theme.type, so they are mode-aware regardless. These values are the
+# light palette, and act as the fallback for any chart that does not name its own
+# colours - Streamlit-native charts today, and anything added later.
 chartCategoricalColors = [
-    "#2a78d6", # blue
-    "#eb6834", # orange
-    "#1baf7a", # aqua
-    "#eda100", # yellow
-    "#e87ba4", # magenta
-    "#008300", # green
-    "#4a3aa7", # violet
-    "#e34948", # red
+    "#1d9485", "#913797", "#a9881b", "#0d53af",
+    "#c43d4d", "#41ba5d", "#7455c7", "#c66a19",
+]
+chartSequentialColors = [
+    "#d9fefb", "#82fdf5", "#4dece4", "#3dd3cc", "#35bbb4",
+    "#2da39d", "#258b86", "#1c716d", "#145855", "#0b3e3b",
 ]
 
 [theme.light]
-primaryColor = "#2a78d6"
-backgroundColor = "#fcfcfb"
-secondaryBackgroundColor = "#f9f9f7"
-textColor = "#0b0b0b"
-borderColor = "#e1e0d9"
-dataframeBorderColor = "#e1e0d9"
+primaryColor = "#056e6e"              # --t; 6.07:1 under the white button text
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f2f7f7"  # tinted toward --line, which is pure white on the site
+textColor = "#0b1a1a"                 # --ink, 17.8:1
+linkColor = "#056e6e"
+borderColor = "#e6ecec"               # --line
+dataframeBorderColor = "#e6ecec"
+dataframeHeaderBackgroundColor = "#f2f7f7"
 
 [theme.light.sidebar]
-backgroundColor = "#f9f9f7"
+backgroundColor = "#f7fafa"
+secondaryBackgroundColor = "#eef4f4"
+borderColor = "#e6ecec"
+primaryColor = "#056e6e"
 
 [theme.dark]
-primaryColor = "#3987e5"
-backgroundColor = "#1a1a19"
-secondaryBackgroundColor = "#0d0d0d"
-textColor = "#ffffff"
-borderColor = "#2c2c2a"
-dataframeBorderColor = "#2c2c2a"
-linkColor = "#3987e5"
+# Primary is a joint solve: white button text needs 4.5:1, and the button needs
+# 3:1 against the surface. #056e6e satisfies the first and fails the second here,
+# so the teal lifts one step - 4.91:1 under white text, 3.82:1 against #0c1313.
+primaryColor = "#077e7a"
+backgroundColor = "#0c1313"           # --ink pushed to a surface, not pure black
+secondaryBackgroundColor = "#16211f"
+textColor = "#e8f0ef"                 # 15.7:1
+linkColor = "#4fd8c9"                 # 10.4:1; the accent aqua reads well here
+borderColor = "#26332f"
+dataframeBorderColor = "#26332f"
+dataframeHeaderBackgroundColor = "#16211f"
 
 [theme.dark.sidebar]
-backgroundColor = "#0d0d0d"
+backgroundColor = "#0a1010"
+secondaryBackgroundColor = "#16211f"
+borderColor = "#26332f"
+primaryColor = "#077e7a"
