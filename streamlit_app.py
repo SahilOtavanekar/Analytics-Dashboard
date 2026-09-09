@@ -19,7 +19,12 @@ PAGES = [
     st.Page("pages/1_Executive_Dashboard.py", title="Executive Dashboard", icon=":material/dashboard:", default=True),
     st.Page("pages/3_Session_Analytics.py", title="Session Analytics", icon=":material/schedule:"),
     st.Page("pages/4_Audience.py", title="Audience", icon=":material/groups:"),
-    st.Page("pages/5_Campaign_Analytics.py", title="Campaign Analytics", icon=":material/campaign:"),
+    # url_path pinned, alone among these pages, because this one has shareable deep links:
+    # /Campaign_Analytics?campaign_id=<id> opens a single campaign. Left to derive from the
+    # title, the path would silently change the day someone renames the page, and every link
+    # anyone had shared would 404. The value matches what the title derives to today, so
+    # existing URLs are unaffected.
+    st.Page("pages/5_Campaign_Analytics.py", title="Campaign Analytics", icon=":material/campaign:", url_path="Campaign_Analytics"),
     st.Page("pages/6_Conversion.py", title="Conversion", icon=":material/filter_alt:"),
     st.Page("pages/7_Pages_and_Sources.py", title="Pages & Sources", icon=":material/explore:"),
     st.Page("pages/8_Content_Performance.py", title="Content Performance", icon=":material/description:"),

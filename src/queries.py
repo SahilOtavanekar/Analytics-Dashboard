@@ -50,7 +50,92 @@ _NORM = "LOWER(REPLACE(EVENT_NAME, '_', ' '))"
 # Consent is still a real event and still appears in Action Reach, labelled as
 # itself. It is only excluded from the conversion definition.
 _COOKIE_FORM = "COALESCE(PROPERTIES:form_id::STRING, '') = 'cookie-form'"
-_LEAD_SUBMIT = f"({_NORM} = 'form submit' AND NOT {_COOKIE_FORM})"
+
+# Consent was not the only thing riding the lead event. Enumerated across all 36 distinct
+# form_id values in the data: alongside cookie-form there are consent-form and consentForm
+# (39 sessions), unsubscribeForm (4) and commentform (2), and every one of them was counted
+# as a conversion. A campaign named dai-unsubscribe was reporting a 5.9% conversion rate.
+#
+# Matched by PATTERN rather than by a list of ids, because a list of ids demonstrably drifts:
+# the data already holds consent-form AND consentForm, registerForm AND registrationForm AND
+# register-form, and ngd-user-data-form AND ngd-user-data-formss. Exact-matching one spelling
+# is how cookie-form came to be the only form ever excluded.
+#
+# Confirmed as not-a-lead rather than assumed: these forms never carry an identity - 0% of
+# their sessions arrive with an email against 25.7% for genuine lead forms.
+#
+# question-form is deliberately NOT here, though it looks similar (2.5% identified, 2,557
+# sessions across 377 campaigns). It is half of all non-cookie conversions, so excluding it
+# would roughly halve the reported rate everywhere - too large a move to make on an inference
+# about what the form is. That one needs a product answer.
+_FORM_ID = "LOWER(COALESCE(PROPERTIES:form_id::STRING, ''))"
+_NOT_A_LEAD_FORM = (
+    f"({_FORM_ID} LIKE '%cookie%'"
+    f" OR {_FORM_ID} LIKE '%consent%'"
+    f" OR {_FORM_ID} LIKE '%unsubscribe%'"
+    f" OR {_FORM_ID} LIKE '%comment%')"
+)
+_LEAD_SUBMIT = f"({_NORM} = 'form submit' AND NOT {_NOT_A_LEAD_FORM})"
+
+# A consent decision, recorded TWO different ways - which is how half of it stayed hidden.
+# ACCEPTING fires form_submit with form_id='cookie-form'. REJECTING fires `clicked` on a button
+# carrying attributes:consent='rejected'. Measured over 30 days: 4,586 rejections across 1,714
+# sessions and 318 campaigns were counted as ordinary clicks, so one decision appeared as two
+# unrelated bars and the rejection half read as interest in the content.
+# Three spellings, not two: `consent-response` is its own event name carrying a consent_status
+# property. Small - 12 rows, 2 sessions, 1 campaign - but leaving it out meant the page excluded
+# two kinds of consent and then charted a third as an action.
+_CONSENT_EVENT = (
+    f"({_COOKIE_FORM}"
+    f" OR PROPERTIES:attributes:consent IS NOT NULL"
+    f" OR LOWER(COALESCE(EVENT_NAME, '')) = 'consent-response')"
+)
+
+# What "engaged" means: the session did something that was neither a page view nor a consent
+# decision. Dismissing a cookie banner is not engagement with a campaign, and counting it
+# inflated Engaged everywhere - on SG0326-009, 18 of the 100 "engaged" sessions did nothing but
+# answer the banner, so 5.0% should read 4.1%.
+_ENGAGED_EVENT = f"(NOT {_PAGE_VIEW} AND NOT {_CONSENT_EVENT})"
+
+# What the action MEANT, read from PROPERTIES:attributes rather than from EVENT_NAME. Almost
+# every action in this data is called `clicked`, so labelling by name produced a single bar
+# reading "Clicked" that mixed opening a document (17,629 rows across 325 campaigns), asking a
+# question (894) and dismissing a consent banner (4,586) into one number.
+#
+# attributes is where the product records what was clicked. attributes:element is deliberately
+# NOT used: it holds the HTML tag (li, button, div, a, input, summary), and a reader does not
+# care that a click landed on a <li>.
+#
+# `visited` is mapped by its top-level asset rather than left to fall through. Untouched it
+# rendered as "Visited", the same word as the funnel's first stage but meaning something else
+# entirely - 1,127 sessions across 6 campaigns, and every one of them carries an asset and a
+# title, so it belongs with the content clicks.
+# Order matters. Every key was enumerated by flattening OBJECT_KEYS(PROPERTIES:attributes)
+# rather than guessed, after a first attempt that tested only `asset` and dropped 37 of one
+# campaign's 63 engaged sessions into "Other click" when they were titled link clicks:
+#
+#   title   18,270 rows / 341 campaigns   asset  17,762 / 325   consent 4,619 / 318
+#   click    2,346 / 1 campaign           category  894 / 71    dismiss   383 / 78
+#   file        23 / 1 campaign
+#
+# asset and title co-occur on a content open, so asset is tested FIRST and only title-without-
+# asset falls through to a link click. `file` is one campaign's spelling of the same thing.
+# `click` and `id`/`set` are single-campaign keys and are left to the generic buckets.
+_ACTION_LABEL = f"""
+        CASE
+            WHEN PROPERTIES:attributes:asset IS NOT NULL
+              OR PROPERTIES:attributes:file IS NOT NULL THEN 'Opened content'
+            WHEN LOWER(COALESCE(EVENT_NAME, '')) = 'visited'
+                 AND PROPERTIES:asset IS NOT NULL THEN 'Opened content'
+            WHEN PROPERTIES:attributes:category::STRING = 'query' THEN 'Asked a question'
+            WHEN LOWER(COALESCE(EVENT_NAME, '')) = 'pdf-page-visit' THEN 'Read a document'
+            WHEN {_NORM} = 'form submit' THEN 'Submitted a form'
+            WHEN PROPERTIES:attributes:title IS NOT NULL
+              OR PROPERTIES:attributes:click IS NOT NULL THEN 'Opened a link'
+            WHEN PROPERTIES:attributes:dismiss IS NOT NULL THEN 'Dismissed a prompt'
+            WHEN LOWER(COALESCE(EVENT_NAME, '')) IN ('clicked', 'button clicked') THEN 'Other click'
+            ELSE INITCAP(LOWER(REPLACE(EVENT_NAME, '_', ' ')))
+        END"""
 
 # Page identity comes from SEARCH_URL, not PATH. The tracking implementation was
 # swapped around Mar-Apr 2026: PATH and TAB_URL fell from 100% populated to 0%,
@@ -215,7 +300,7 @@ def funnel_sql() -> str:
         WITH sess AS (
             SELECT
                 SESSION_ID,
-                MAX(IFF(NOT {_PAGE_VIEW}, 1, 0)) AS DID_ACT,
+                MAX(IFF({_ENGAGED_EVENT}, 1, 0)) AS DID_ACT,
                 MAX(IFF({_LEAD_SUBMIT}, 1, 0)) AS DID_CONVERT
             FROM {table_fqn()}
             WHERE EVENT_TS::DATE BETWEEN ? AND ?
@@ -235,9 +320,13 @@ def funnel_sql() -> str:
 def action_reach_sql() -> str:
     """Share of sessions performing each action. Overlapping, deliberately not a funnel.
 
-    Cookie consent is split out from Form Submit rather than dropped. Both fire the
-    same event name, so merging them showed one "Form Submit" bar that was 87%
-    consent clicks - the single most misleading bar on the dashboard.
+    Grouped on what the action MEANT, from PROPERTIES:attributes - see _ACTION_LABEL. Grouping
+    on EVENT_NAME collapsed opening a document, asking a question and rejecting a cookie banner
+    into one bar reading "Clicked", because almost every action in this data carries that name.
+
+    Consent is excluded entirely rather than shown as a peer bar. Accepting was already split
+    out; REJECTING was not, and arrived here as an ordinary click - 1,714 sessions across 318
+    campaigns. One decision, two bars, and half of it presented as interest.
     """
     return f"""
         WITH all_sessions AS (
@@ -247,13 +336,12 @@ def action_reach_sql() -> str:
               AND SESSION_ID IS NOT NULL
             GROUP BY SESSION_ID
         ), acted AS (
-            SELECT DISTINCT SESSION_ID,
-                   IFF({_COOKIE_FORM}, 'Cookie Consent', INITCAP({_NORM})) AS ACTION
+            SELECT DISTINCT SESSION_ID, {_ACTION_LABEL} AS ACTION
             FROM {table_fqn()}
             WHERE EVENT_TS::DATE BETWEEN ? AND ?
               AND SESSION_ID IS NOT NULL
               AND EVENT_NAME IS NOT NULL
-              AND NOT {_PAGE_VIEW}
+              AND {_ENGAGED_EVENT}
               AND {_NOT_TEST}
         )
         SELECT
@@ -276,7 +364,10 @@ def form_performance_sql() -> str:
     return f"""
         SELECT
             COALESCE(PROPERTIES:form_id::STRING, '(unidentified)') AS FORM_ID,
-            IFF({_COOKIE_FORM}, 'Consent banner', 'Lead form') AS FORM_KIND,
+            -- Split on the SAME rule the conversion metric uses, not on cookie-form alone.
+            -- Keyed on _COOKIE_FORM this table listed consent-form under "Lead form" while the
+            -- funnel beside it excluded that form from conversions - one page, two answers.
+            IFF({_NOT_A_LEAD_FORM}, 'Consent / not a lead', 'Lead form') AS FORM_KIND,
             COUNT(DISTINCT MESSAGE_ID) AS SUBMITS,
             COUNT(DISTINCT SESSION_ID) AS SESSIONS
         FROM {table_fqn()}
@@ -289,13 +380,19 @@ def form_performance_sql() -> str:
 
 
 def consent_split_kpis_sql() -> str:
-    """Lead submits vs consent clicks, so the size of the correction stays visible."""
+    """Lead submits vs excluded submits, so the size of the correction stays visible.
+
+    The two buckets have to PARTITION every form submit, because the page adds them together
+    and reports the sum as the total. Counting the excluded side with _COOKIE_FORM while the
+    lead side used the wider rule left consent, unsubscribe and comment submits in neither
+    bucket, so that total silently under-reported and the percentage drawn from it was wrong.
+    """
     return f"""
         SELECT
             COUNT(DISTINCT IFF({_LEAD_SUBMIT}, SESSION_ID, NULL)) AS LEAD_SESSIONS,
-            COUNT(DISTINCT IFF({_COOKIE_FORM}, SESSION_ID, NULL)) AS CONSENT_SESSIONS,
+            COUNT(DISTINCT IFF({_NOT_A_LEAD_FORM}, SESSION_ID, NULL)) AS CONSENT_SESSIONS,
             COUNT(DISTINCT IFF({_LEAD_SUBMIT}, MESSAGE_ID, NULL)) AS LEAD_SUBMITS,
-            COUNT(DISTINCT IFF({_COOKIE_FORM}, MESSAGE_ID, NULL)) AS CONSENT_SUBMITS
+            COUNT(DISTINCT IFF({_NOT_A_LEAD_FORM}, MESSAGE_ID, NULL)) AS CONSENT_SUBMITS
         FROM {table_fqn()}
         WHERE EVENT_TS::DATE BETWEEN ? AND ?
           AND {_NORM} = 'form submit'
@@ -372,7 +469,7 @@ def asset_cohort_sql() -> str:
             SELECT
                 SESSION_ID,
                 MAX(IFF({_ASSET} IS NOT NULL, 1, 0)) AS SAW_ASSET,
-                MAX(IFF(NOT {_PAGE_VIEW}, 1, 0)) AS ACTED,
+                MAX(IFF({_ENGAGED_EVENT}, 1, 0)) AS ACTED,
                 MAX(IFF({_LEAD_SUBMIT}, 1, 0)) AS CONVERTED,
                 COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT
             FROM {table_fqn()}
@@ -633,7 +730,7 @@ def identity_cohort_sql() -> str:
             SELECT
                 SESSION_ID,
                 MAX(IFF({_VALID_EMAIL}, 1, 0)) AS IDENTIFIED,
-                MAX(IFF(NOT {_PAGE_VIEW}, 1, 0)) AS ACTED,
+                MAX(IFF({_ENGAGED_EVENT}, 1, 0)) AS ACTED,
                 MAX(IFF({_LEAD_SUBMIT}, 1, 0)) AS CONVERTED,
                 COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT
             FROM {table_fqn()}
@@ -906,7 +1003,7 @@ def ai_cohort_sql() -> str:
             SELECT
                 SESSION_ID,
                 MAX(IFF({_AI_REQUEST}, 1, 0)) AS USED_AI,
-                MAX(IFF(NOT {_PAGE_VIEW}, 1, 0)) AS ACTED,
+                MAX(IFF({_ENGAGED_EVENT}, 1, 0)) AS ACTED,
                 MAX(IFF({_LEAD_SUBMIT}, 1, 0)) AS CONVERTED,
                 COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT
             FROM {table_fqn()}
@@ -927,6 +1024,22 @@ def ai_cohort_sql() -> str:
     """
 
 
+def _campaign_table() -> str:
+    """The table for every campaign-scoped query on Campaign Analytics.
+
+    Identical to table_fqn() except when the reader has internal traffic excluded, where it
+    keeps campaigns running on the demand_ai tenant and still drops demandai.co visitors. A
+    list OF campaigns should contain Demand AI's own - demand_ai_internal_website_track is
+    third by sessions and disappeared completely with the filter on - while staff activity
+    stays out of every audience and identity figure. See db.table_fqn for the full reasoning.
+
+    Every campaign builder below routes through this one function, for the same reason
+    table_fqn exists: 14 call sites, one rule, and no chance of one query reporting a
+    different population from the query beside it.
+    """
+    return table_fqn(keep_own_campaigns=True)
+
+
 def campaign_kpis_sql() -> str:
     return f"""
         SELECT
@@ -939,9 +1052,22 @@ def campaign_kpis_sql() -> str:
                 (COUNT(DISTINCT IFF(CAMPAIGN_ID IS NOT NULL, MESSAGE_ID, NULL))
                  / NULLIF(COUNT(DISTINCT CAMPAIGN_ID), 0))::FLOAT, 0
             ) AS AVG_EVENTS_PER_CAMPAIGN
-        FROM {table_fqn()}
+        FROM {_campaign_table()}
         WHERE EVENT_TS::DATE BETWEEN ? AND ?
     """
+
+
+# The page asks for far more campaigns than it charts, because the search-as-you-type
+# picker needs every campaign in the window and the LIMIT does not reduce the work: measured
+# on a 3-month window, top_campaigns_sql costs 4.62s at LIMIT 10 and 4.68s at LIMIT 2000 for
+# the same GROUP BY. A separate lighter query for the picker was built first and measured
+# 2.3s at three months and 12.4s at a year - a whole extra scan to re-derive rows this query
+# already had. The page charts the first ten rows and offers all of them in the picker.
+#
+# The number is a payload guard rather than a ranking. The widest window in this dataset
+# holds 1,027 campaigns, so it is never reached today; it exists so a table that grows an
+# order of magnitude does not silently start shipping tens of thousands of options.
+CAMPAIGN_PICKER_LIMIT = 2000
 
 
 def top_campaigns_sql(limit: int = 10) -> str:
@@ -987,7 +1113,7 @@ def top_campaigns_sql(limit: int = 10) -> str:
                 {_TENANT} AS TENANT,
                 {_ASSET} AS ASSET,
                 IFF({_LEAD_SUBMIT}, 1, 0) AS IS_LEAD
-            FROM {table_fqn()}
+            FROM {_campaign_table()}
             WHERE EVENT_TS::DATE BETWEEN ? AND ?
               AND CAMPAIGN_ID IS NOT NULL
               AND {_NOT_TEST}
@@ -1100,7 +1226,7 @@ def tenant_spread_sql(min_sessions: int = 50) -> str:
                 {_TENANT} AS TENANT,
                 SESSION_ID,
                 MAX(IFF({_LEAD_SUBMIT}, 1, 0)) AS CONVERTED,
-                MAX(IFF(NOT {_PAGE_VIEW}, 1, 0)) AS ACTED
+                MAX(IFF({_ENGAGED_EVENT}, 1, 0)) AS ACTED
             FROM {table_fqn()}
             WHERE EVENT_TS::DATE BETWEEN ? AND ?
               AND SESSION_ID IS NOT NULL
@@ -1149,7 +1275,7 @@ def tenant_comparison_sql(min_sessions: int = 50, limit: int = 25) -> str:
             SELECT
                 {_TENANT} AS TENANT,
                 SESSION_ID,
-                MAX(IFF(NOT {_PAGE_VIEW}, 1, 0)) AS ACTED,
+                MAX(IFF({_ENGAGED_EVENT}, 1, 0)) AS ACTED,
                 MAX(IFF({_LEAD_SUBMIT}, 1, 0)) AS CONVERTED,
                 COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT
             FROM {table_fqn()}
@@ -1260,8 +1386,15 @@ def _campaign_events_cte() -> str:
             IFF({_AI_REQUEST}, 1, 0) AS IS_AI,
             IFF({_LEAD_SUBMIT}, 1, 0) AS IS_LEAD,
             IFF({_COOKIE_FORM}, 1, 0) AS IS_COOKIE,
-            IFF(NOT {_PAGE_VIEW}, 1, 0) AS IS_ACTION
-        FROM {table_fqn()}
+            -- The two halves of a consent decision, kept apart because they answer different
+            -- questions and were previously in two unrelated places on the page.
+            IFF({_COOKIE_FORM}, 1, 0) AS IS_CONSENT_YES,
+            IFF(PROPERTIES:attributes:consent IS NOT NULL, 1, 0) AS IS_CONSENT_NO,
+            -- Projected here so the action chart can group on meaning rather than on EVENT_NAME;
+            -- the label needs PROPERTIES, which does not survive this CTE's column list.
+            {_ACTION_LABEL} AS ACTION_LABEL,
+            IFF({_ENGAGED_EVENT}, 1, 0) AS IS_ACTION
+        FROM {_campaign_table()}
         {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
     """
 
@@ -1291,6 +1424,8 @@ def campaign_detail_kpis_sql() -> str:
                 MAX(IS_AI) AS USED_AI,
                 MAX(IS_LEAD) AS CONVERTED,
                 MAX(IS_ACTION) AS ACTED,
+                MAX(IS_CONSENT_YES) AS SAID_YES,
+                MAX(IS_CONSENT_NO) AS SAID_NO,
                 MAX(IFF(ASSET IS NOT NULL, 1, 0)) AS SAW_CONTENT,
                 MAX(IFF({_ADDR_VALID}, 1, 0)) AS IDENTIFIED,
                 COUNT(DISTINCT MESSAGE_ID) AS EVENTS,
@@ -1324,6 +1459,8 @@ def campaign_detail_kpis_sql() -> str:
                 COALESCE(SUM(USED_AI), 0) AS AI_SESSIONS,
                 COALESCE(SUM(CONVERTED), 0) AS LEAD_SESSIONS,
                 COALESCE(SUM(ACTED), 0) AS ACTED_SESSIONS,
+                COALESCE(SUM(SAID_YES), 0) AS CONSENT_YES_SESSIONS,
+                COALESCE(SUM(SAID_NO), 0) AS CONSENT_NO_SESSIONS,
                 COALESCE(SUM(SAW_CONTENT), 0) AS CONTENT_SESSIONS,
                 COALESCE(SUM(IDENTIFIED), 0) AS IDENTIFIED_SESSIONS,
                 COALESCE((APPROX_PERCENTILE(EVENTS, 0.5))::FLOAT, 0) AS MEDIAN_EVENTS,
@@ -1336,6 +1473,34 @@ def campaign_detail_kpis_sql() -> str:
     """
 
 
+def campaign_lookup_sql() -> str:
+    """Does this campaign id exist, and does it have anything in the selected window?
+
+    Three parameters like every other drill-down query: start, end, campaign id.
+
+    Both halves are needed because "nothing found" has two very different causes, and a
+    reader typing an id deserves to be told which one they hit. An id that is simply wrong
+    is a typo. An id that is real but ran outside the selected dates is a date-range
+    problem, and this returns the dates it did run so the message can say so instead of
+    leaving someone to widen the range by trial and error.
+
+    Bounded to the data floor rather than left unbounded: the table holds 205 rows stamped
+    before 2020 and three in the future, and an unbounded MIN/MAX would report 1978.
+    """
+    return f"""
+        SELECT
+            COUNT(DISTINCT IFF(EVENT_TS::DATE BETWEEN ? AND ?, MESSAGE_ID, NULL)) AS EVENTS_IN_WINDOW,
+            COUNT(DISTINCT MESSAGE_ID) AS EVENTS_EVER,
+            MIN(EVENT_TS)::DATE AS FIRST_EVER,
+            MAX(EVENT_TS)::DATE AS LAST_EVER,
+            MODE(PROPERTIES:campaign_name::STRING) AS CAMPAIGN_NAME
+        FROM {_campaign_table()}
+        WHERE CAMPAIGN_ID = ?
+          AND EVENT_TS::DATE BETWEEN '2025-06-01' AND CURRENT_DATE()
+          AND {_NOT_TEST}
+    """
+
+
 def campaign_daily_sql() -> str:
     """Daily sessions and events for one campaign - the shape of its run."""
     return f"""
@@ -1343,7 +1508,7 @@ def campaign_daily_sql() -> str:
             EVENT_TS::DATE AS EVENT_DATE,
             COUNT(DISTINCT SESSION_ID) AS SESSION_COUNT,
             COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT
-        FROM {table_fqn()}
+        FROM {_campaign_table()}
         {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
         GROUP BY EVENT_DATE
         ORDER BY EVENT_DATE
@@ -1361,7 +1526,7 @@ def campaign_duration_bands_sql() -> str:
     return f"""
         WITH s AS (
             SELECT SESSION_ID, DATEDIFF('second', MIN(EVENT_TS), MAX(EVENT_TS)) AS DURATION_SECONDS
-            FROM {table_fqn()}
+            FROM {_campaign_table()}
             {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
               AND SESSION_ID IS NOT NULL
             GROUP BY SESSION_ID
@@ -1398,9 +1563,9 @@ def campaign_funnel_sql() -> str:
         WITH sess AS (
             SELECT
                 SESSION_ID,
-                MAX(IFF(NOT {_PAGE_VIEW}, 1, 0)) AS DID_ACT,
+                MAX(IFF({_ENGAGED_EVENT}, 1, 0)) AS DID_ACT,
                 MAX(IFF({_LEAD_SUBMIT}, 1, 0)) AS DID_CONVERT
-            FROM {table_fqn()}
+            FROM {_campaign_table()}
             {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
               AND SESSION_ID IS NOT NULL
             GROUP BY SESSION_ID
@@ -1426,10 +1591,10 @@ def campaign_actions_sql() -> str:
         ), all_sessions AS (
             SELECT COUNT(DISTINCT SESSION_ID) AS N FROM ev WHERE SESSION_ID IS NOT NULL
         ), acted AS (
-            SELECT DISTINCT
-                SESSION_ID,
-                IFF(IS_COOKIE = 1, 'Cookie Consent',
-                    INITCAP(LOWER(REPLACE(EVENT_NAME, '_', ' ')))) AS ACTION
+            -- Consent is absent from this chart by construction: IS_ACTION excludes it, and the
+            -- accept/reject counts are reported as a sentence beside the chart instead. It used
+            -- to be the second-largest bar here while not being engagement at all.
+            SELECT DISTINCT SESSION_ID, ACTION_LABEL AS ACTION
             FROM ev
             WHERE SESSION_ID IS NOT NULL
               AND EVENT_NAME IS NOT NULL
@@ -1451,7 +1616,7 @@ def campaign_geo_sql(timezone_limit: int = 10) -> str:
     return f"""
         WITH base AS (
             SELECT SESSION_ID, TIMEZONE
-            FROM {table_fqn()}
+            FROM {_campaign_table()}
             {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
               AND SESSION_ID IS NOT NULL
         ), region AS (
@@ -1479,7 +1644,7 @@ def campaign_assets_sql(limit: int = 12) -> str:
             COUNT(DISTINCT MESSAGE_ID) AS EVENTS,
             ROUND(COUNT(DISTINCT MESSAGE_ID) * 1.0
                   / NULLIF(COUNT(DISTINCT SESSION_ID), 0), 1) AS EVENTS_PER_SESSION
-        FROM {table_fqn()}
+        FROM {_campaign_table()}
         {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
           AND {_ASSET} IS NOT NULL
           AND SESSION_ID IS NOT NULL
@@ -1497,7 +1662,7 @@ def campaign_read_depth_sql(limit: int = 10) -> str:
             COUNT(DISTINCT SESSION_ID) AS SESSIONS,
             ROUND(AVG(TRY_TO_NUMBER(PROPERTIES:page_visited::STRING)), 1) AS AVG_PAGE_REACHED,
             MAX(TRY_TO_NUMBER(PROPERTIES:page_visited::STRING)) AS DEEPEST_PAGE
-        FROM {table_fqn()}
+        FROM {_campaign_table()}
         {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
           AND PROPERTIES:page_visited IS NOT NULL
           AND {_ASSET} IS NOT NULL
@@ -1520,7 +1685,7 @@ def campaign_companies_sql(limit: int = 12) -> str:
             {_DOMAIN} AS COMPANY,
             COUNT(DISTINCT {_EMAIL}) AS PEOPLE,
             COUNT(DISTINCT SESSION_ID) AS SESSIONS
-        FROM {table_fqn()}
+        FROM {_campaign_table()}
         {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
           AND {_VALID_EMAIL}
           AND {_DOMAIN} NOT IN {_FREE_MAIL}
@@ -1536,7 +1701,7 @@ def campaign_sources_sql(referrer_limit: int = 8) -> str:
     return f"""
         WITH base AS (
             SELECT MESSAGE_ID, REFERER_URL
-            FROM {table_fqn()}
+            FROM {_campaign_table()}
             {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
         ), grp AS (
             SELECT 'group' AS KIND, {_SOURCE_GROUP} AS LABEL,
@@ -1563,7 +1728,7 @@ def campaign_ai_sql() -> str:
             {_MODEL} AS MODEL,
             COUNT(DISTINCT MESSAGE_ID) AS REQUESTS,
             COUNT(DISTINCT SESSION_ID) AS SESSIONS
-        FROM {table_fqn()}
+        FROM {_campaign_table()}
         {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
           AND {_AI_REQUEST}
         GROUP BY 1

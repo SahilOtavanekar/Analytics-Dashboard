@@ -1,5 +1,7 @@
 import calendar
 import datetime as dt
+import inspect
+import re
 from functools import partial
 
 import streamlit as st
@@ -126,6 +128,18 @@ _EXCLUDE_ACTIVE = (
     ":material/filter_alt: **Internal traffic excluded.** Figures on this page omit Demand AI's "
     "own tenant. Turn this off in the sidebar to see all traffic."
 )
+# Campaign Analytics keeps Demand AI's own campaigns even with the filter on, so it must not
+# show the banner above - that one asserts the demand_ai tenant is omitted, which would be
+# false there. Still ONE message, not this one plus a correction: a screenshot of the page has
+# to carry an accurate caveat, and two captions disagreeing about the same filter is worse
+# than either alone. See db.table_fqn(keep_own_campaigns=True).
+_EXCLUDE_ACTIVE_OWN = (
+    ":material/filter_alt: **Internal traffic excluded, except Demand AI's own campaigns.** "
+    "Visits from demandai.co addresses are removed from every figure, but campaigns running on "
+    "the demand_ai tenant are still ranked and openable here - so this page's campaign and "
+    "session totals include them where other pages' do not. Turn this off in the sidebar to "
+    "see all traffic."
+)
 
 # Quick ranges. Whole calendar months, not day counts: six months before 31 August is
 # 28 February, and a year is 365 or 366 days depending on which side of the leap day
@@ -202,7 +216,14 @@ def _preset_label(today: dt.date, window) -> str:
     return next((name for name, m in _PRESETS if _preset_range(today, m) == tuple(window)), _CUSTOM)
 
 
-def date_range_filter(default_days: int = 30, key: str = _WIDGET) -> tuple[dt.date, dt.date]:
+def date_range_filter(default_days: int = 30, key: str = _WIDGET, keep_own_campaigns: bool = False) -> tuple[dt.date, dt.date]:
+    """The shared sidebar controls, and the internal-traffic banner that describes them.
+
+    `keep_own_campaigns` only changes which banner is shown. It must be passed by exactly the
+    pages that query through db.table_fqn(keep_own_campaigns=True) - today that is Campaign
+    Analytics alone - because the default banner claims the demand_ai tenant is omitted, and on
+    those pages it is not.
+    """
     # Snowflake's runtime clock can lag the viewer's local date by up to a day, so
     # max_value is padded - otherwise the viewer can't select their own "today".
     today = dt.date.today()
@@ -279,7 +300,7 @@ def date_range_filter(default_days: int = 30, key: str = _WIDGET) -> tuple[dt.da
     excluding = st.sidebar.checkbox(_EXCLUDE_LABEL, value=st.session_state[_EXCLUDE_STORE], key=_EXCLUDE_WIDGET, help=_EXCLUDE_HELP)
     st.session_state[_EXCLUDE_STORE] = excluding
     if excluding:
-        st.caption(_EXCLUDE_ACTIVE)
+        st.caption(_EXCLUDE_ACTIVE_OWN if keep_own_campaigns else _EXCLUDE_ACTIVE)
 
     # Data controls live here rather than on a landing page, because since the
     # Executive Dashboard became the landing page there is no neutral page to put
@@ -312,3 +333,88 @@ def date_range_filter(default_days: int = 30, key: str = _WIDGET) -> tuple[dt.da
             st.rerun()
 
     return chosen
+
+
+# ------------------------------------------------------ a download started from a URL
+# Python cannot start a download. There is no st.download and no st.navigate_to - checked,
+# not assumed - and browsers require the click to originate in the DOM. So this clicks the
+# real st.download_button instead of building a second delivery path beside it.
+#
+# That choice is what makes it portable. st.download_button's own handler resolves the file
+# through Streamlit's endpoints, applies the host's DOWNLOAD_ASSETS_BASE_URL rule and
+# decides between a `download` attribute and a new tab. Nothing here knows the URL, so the
+# behaviour is whatever the host does for a human click - identical on localhost and inside
+# Snowsight - and the bytes are the ones already registered for the button, not a second copy.
+#
+# st.html is the only route to the real DOM: it is not iframed, where st.components.v1.html
+# is. Read from the shipped frontend bundle rather than taken on faith, with
+# unsafe_allow_javascript=True it sanitises with ADD_TAGS:['script'] and then re-creates each
+# script node so it executes - assigning innerHTML alone would leave the tag inert.
+_JS_KWARG = "unsafe_allow_javascript"
+_HTML = getattr(st, "html", None)
+_JS_SUPPORTED = bool(_HTML) and _JS_KWARG in inspect.signature(_HTML).parameters
+_AUTO_FIRED = "auto_download_fired"
+
+AUTO_ARMED = "armed"
+AUTO_DONE = "already"
+AUTO_UNSUPPORTED = "unsupported"
+
+# Polls because the script and the button mount independently - React need not have placed
+# the button when this first runs - and gives up after four seconds rather than spinning.
+# Giving up costs one click, not the file: the caller keeps a visible button either way.
+#
+# The window flag is keyed on the same token as the session guard below, because the two
+# catch different things. Python's guard stops this being injected twice; the window flag
+# stops one injection downloading twice if React re-mounts an identical element, which
+# Python cannot see. The fallback selector only fires when the page has exactly one download
+# button - clicking the wrong file would be worse than not clicking at all.
+_AUTO_SCRIPT = """
+<script>
+(function () {
+var token = "__TOKEN__";
+if (window.__insyteAutoDownload === token) { return; }
+var tries = 0;
+function fire() {
+var scope = document.querySelector(".st-key-__KEY__");
+var button = scope ? scope.querySelector("button") : null;
+if (!button) {
+var only = document.querySelectorAll('[data-testid="stDownloadButton"] button');
+if (only.length === 1) { button = only[0]; }
+}
+if (button) { window.__insyteAutoDownload = token; button.click(); return; }
+if (++tries < 40) { window.setTimeout(fire, 100); }
+}
+fire();
+})();
+</script>
+"""
+
+
+def _css_key(key: str) -> str:
+    """The class Streamlit puts on a keyed element's container, by its own rule."""
+    return re.sub(r"[^a-zA-Z0-9_-]", "-", str(key).strip())
+
+
+def _js_token(token: str) -> str:
+    """Reduced to characters that can neither close the script element nor end the string
+    literal holding them. Campaign ids are mostly slugs and UUIDs, but not all of them."""
+    return re.sub(r"[^A-Za-z0-9_.-]", "-", str(token))[:120]
+
+
+def auto_download(key: str, token: str) -> str:
+    """Click the download_button registered under `key` once, from the browser.
+
+    Returns AUTO_ARMED, AUTO_DONE or AUTO_UNSUPPORTED so the caller can say which happened.
+    A silent automatic download that the browser declined leaves no trace at all, so the
+    outcome is reported rather than hoped for.
+
+    `token` says what is being downloaded - typically the filename. Firing is recorded
+    against it, so a rerun cannot download again, and a different file re-arms.
+    """
+    if not _JS_SUPPORTED:
+        return AUTO_UNSUPPORTED
+    if st.session_state.get(_AUTO_FIRED) == token:
+        return AUTO_DONE
+    st.session_state[_AUTO_FIRED] = token
+    st.html(_AUTO_SCRIPT.replace("__TOKEN__", _js_token(token)).replace("__KEY__", _css_key(key)), **{_JS_KWARG: True})
+    return AUTO_ARMED

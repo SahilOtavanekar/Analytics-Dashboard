@@ -2,3 +2,6 @@ streamlit==1.60.0
 snowflake-snowpark-python==1.53.0
 pandas==2.3.3
 altair==6.2.2
+
+# No PDF package: the campaign report is written by src/minipdf.py from the standard library.
+# See environment.yml for why a dependency was not viable on the deployed runtime.

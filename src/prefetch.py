@@ -56,7 +56,9 @@ def query_plan(start: dt.date, end: dt.date, prev_start: dt.date, prev_end: dt.d
         ("Audience", Q.top_visitor_by_sessions_sql(), p),
         ("Campaign Analytics", Q.campaign_kpis_sql(), p),
         ("Campaign Analytics", Q.campaign_kpis_sql(), v),
-        ("Campaign Analytics", Q.top_campaigns_sql(), p),
+        # Same limit the page asks for, or the warmed entry is keyed on different SQL and the
+        # page still queries Snowflake while the sidebar claims it is preloaded.
+        ("Campaign Analytics", Q.top_campaigns_sql(Q.CAMPAIGN_PICKER_LIMIT), p),
         ("Conversion", Q.funnel_sql(), p),
         ("Conversion", Q.funnel_sql(), v),
         ("Conversion", Q.form_performance_sql(), p),
