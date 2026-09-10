@@ -123,14 +123,66 @@ Privileges on the target role (`R_CIT_DATA_ADMIN` here):
 | `USAGE` | compute pool `DEV` | container runtime only (path A) |
 | `SELECT` | `CIT_DATA_CORE.TRACKING.INSYTE_TRAKING_EVENTS` | the data |
 
-Files that must be present at the source root — Deploy fails without them:
+### What goes in the workspace
 
-- `streamlit_app.py` — the entry point named in `snowflake.yml`
-- `pyproject.toml` — **required even though it only requests `streamlit[snowflake]`.**
-  Deleting it fails with *"Installing dependencies failed because the pyproject.toml file
-  does not exist"*
-- `snowflake.yml` — the app identifier, warehouse, compute pool and main file
-- `environment.yml` — used by path B only, harmless on path A
+Twenty-four files. This is the deploy manifest — every file the app actually reaches — and
+it is deliberately smaller than the repo; see [Project structure](#project-structure) for
+the full tree. Both paths need this same set, path B just puts it on a stage instead.
+
+```
+Analytics_Dashboard/
+├── streamlit_app.py              main_file, named in snowflake.yml
+├── pyproject.toml                required - Deploy fails without it
+├── snowflake.yml                 app identifier, warehouse, compute pool
+├── environment.yml               path B only; harmless on path A
+├── .streamlit/
+│   └── config.toml               theme; without it you get default styling
+├── pages/                        9 files - names must match streamlit_app.py
+│   ├── 1_Executive_Dashboard.py
+│   ├── 3_Session_Analytics.py
+│   ├── 4_Audience.py
+│   ├── 5_Campaign_Analytics.py
+│   ├── 6_Conversion.py
+│   ├── 7_Pages_and_Sources.py
+│   ├── 8_Content_Performance.py
+│   ├── 9_AI_Usage.py
+│   └── 10_Tenant_Breakdown.py
+└── src/                          10 files - the whole import graph
+    ├── __init__.py
+    ├── campaign_detail.py
+    ├── campaign_report.py
+    ├── charts.py
+    ├── components.py
+    ├── db.py
+    ├── minipdf.py
+    ├── prefetch.py
+    ├── queries.py
+    └── theme.py
+```
+
+`pyproject.toml` is required **even though it only requests `streamlit[snowflake]`**.
+Deleting it fails with *"Installing dependencies failed because the pyproject.toml file
+does not exist"*.
+
+Everything else in the repo is deliberately left out:
+
+| Left out | Why |
+|---|---|
+| `.streamlit/secrets.toml` and `.example` | Ignored inside Snowflake — `st.connection` resolves the active session before it ever reads secrets, so uploading the real one ships credentials for no benefit |
+| `requirements.txt` | Local and Community Cloud only; the container runtime reads `pyproject.toml` |
+| `campaign_report_owners.csv` | No app code reads it — it seeds the planned scheduled delivery |
+| `notebooks/`, `scripts/`, `sql/`, `keys/` | Not imported by the app, and `keys/` holds private keys |
+| `README.md`, `Streamlit-dashboard.docx` | Documentation |
+| `.venv/`, `__pycache__/`, `.gitignore` | Never |
+
+Two things that catch people:
+
+- **`src/campaign_report.py` and `src/minipdf.py` are easy to miss.** `minipdf` is imported
+  lazily inside `campaign_report`, so omitting either breaks *export* rather than load —
+  the deployment looks healthy until someone clicks **Download report**.
+- **Don't renumber `pages/`.** The gap at `2_` is expected. The numbers are vestigial, but
+  the filename strings must match `streamlit_app.py` character-for-character or the page
+  404s.
 
 ### Path A — Snowsight Workspaces Deploy (the live deployment)
 
