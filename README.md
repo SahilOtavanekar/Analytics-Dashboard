@@ -103,36 +103,158 @@ streamlit run streamlit_app.py
 
 Opens at `http://localhost:8501`.
 
-## Deployment
+## Running in Streamlit in Snowflake
 
-### Snowsight Workspaces — the live deployment
+Two paths work. **Workspaces Deploy** is the live one and the primary loop; **stage +
+`CREATE STREAMLIT`** is the fallback, and the two use different runtimes with different
+package rules. Both are verified — the notes under each are measured, not assumed.
 
-`snowflake.yml` is the config that deploys today, via **Deploy** from Snowsight
-Workspaces. Deploy ships the whole folder regardless of the `artifacts` list, and the
-live app runs the **container runtime** on compute pool `DEV`, with
-`query_warehouse = COMPUTE_WH`.
+**No secrets file is needed inside Snowflake.** `st.connection("snowflake")` resolves the
+active session, so `secrets.toml` is a local-development concern only.
 
-One consequence is worth knowing: the container runtime resolves packages from
-`pyproject.toml` via PyPI, which needs an External Access Integration this account does
-not have. **The dependency list is effectively closed** — which is why the charts are
-Altair (it ships with Streamlit) and why the PDF is written by `src/minipdf.py` from the
-standard library rather than by a third-party package.
+### Prerequisites
 
-### Stage + `CREATE STREAMLIT` — warehouse-runtime fallback
+Privileges on the target role (`R_CIT_DATA_ADMIN` here):
 
-`sql/deploy_warehouse_app.sql` creates the app from
-`@CIT_DATA_CORE.TRACKING.ANALYTICS_DASHBOARD_STAGE`. The warehouse runtime reads
-`environment.yml` (Snowflake Anaconda channel) instead of `pyproject.toml`, so no
-External Access Integration is needed. Uploading to the stage is manual, and the path
-field must be set per directory so `pages/`, `src/` and `.streamlit/` keep their layout.
+| Privilege | On | Why |
+|---|---|---|
+| `CREATE STREAMLIT` | schema `CIT_DATA_CORE.TRACKING` | to create the app object |
+| `USAGE` | warehouse `COMPUTE_WH` | where the app's SQL runs |
+| `USAGE` | compute pool `DEV` | container runtime only (path A) |
+| `SELECT` | `CIT_DATA_CORE.TRACKING.INSYTE_TRAKING_EVENTS` | the data |
 
-### Headless hosting
+Files that must be present at the source root — Deploy fails without them:
 
-No secrets file is needed inside Snowflake — `st.connection("snowflake")` resolves the
-active session. For headless hosting outside Snowflake (e.g. Streamlit Community Cloud)
-there is no browser to complete SSO, so key-pair auth is required; the variant is
-commented in `.streamlit/secrets.toml.example`. Never commit `secrets.toml` or anything
-under `keys/` — both are gitignored.
+- `streamlit_app.py` — the entry point named in `snowflake.yml`
+- `pyproject.toml` — **required even though it only requests `streamlit[snowflake]`.**
+  Deleting it fails with *"Installing dependencies failed because the pyproject.toml file
+  does not exist"*
+- `snowflake.yml` — the app identifier, warehouse, compute pool and main file
+- `environment.yml` — used by path B only, harmless on path A
+
+### Path A — Snowsight Workspaces Deploy (the live deployment)
+
+1. In Snowsight, open **Projects → Workspaces**.
+2. Create a workspace (or open the existing `Analytics_Dashboard` one) and get the repo
+   files into it — from a connected Git repo, or by uploading the folder.
+3. Confirm `snowflake.yml` matches the target you want:
+
+   ```yaml
+   entities:
+     streamlit_app:
+       type: streamlit
+       identifier:
+         database: CIT_DATA_CORE
+         schema: TRACKING
+         name: ANALYTICS_DASHBOARD
+       query_warehouse: COMPUTE_WH
+       compute_pool: DEV
+       main_file: streamlit_app.py
+   ```
+
+4. Click **Deploy**.
+5. Open the app from **Projects → Streamlit**.
+
+**Deploy ships the whole folder.** It ignores `snowflake.yml`'s `artifacts` list entirely
+— the committed list names a nonexistent `srs.txt` and omits `pages/` and `src/`, yet
+every page deploys and imports from `src` correctly. Don't spend time curating that list.
+
+**The app's source is the workspace, not a stage.** Deploy links the app to
+`snow://workspace/"USER$"."PUBLIC"."DEFAULT$"/versions/live/Analytics_Dashboard/` and
+versions it (`VERSION$1`, `LAST`). `ANALYTICS_DASHBOARD_STAGE` is vestigial on this path.
+
+**To update:** change the files in the workspace and press **Deploy** again.
+
+### Verify what you actually got
+
+```sql
+DESCRIBE STREAMLIT CIT_DATA_CORE.TRACKING.ANALYTICS_DASHBOARD;
+```
+
+Read three fields:
+
+- `runtime_name` — `SYSTEM$ST_CONTAINER_RUNTIME_PY3_11` means the container runtime
+- `compute_pool` — `DEV`
+- `query_warehouse` — `COMPUTE_WH`
+
+Note that **`run_mode: WarehouseOnly` in `snowflake.yml` is ignored by Deploy** — the
+`compute_pool` wins. So cost splits two ways: queries bill to the warehouse, the app
+itself to the pool. `idle_auto_shutdown_time_seconds: 86400` keeps the app resident for a
+full day after last use; lower it if pool cost matters.
+
+### The container runtime's dependency list is closed
+
+The resolved package set is exactly `python==3.11.*`, `snowflake-snowpark-python`,
+`streamlit` — with `pandas` and `altair` arriving transitively. The runtime installs from
+`pyproject.toml` via **PyPI, which needs an External Access Integration this account does
+not have**, so:
+
+> **Any new third-party import will break the deployment.**
+
+This is not a style preference. It is why the charts are Altair (bundled with Streamlit)
+rather than Plotly, and why the campaign PDF is written by `src/minipdf.py` from the
+standard library rather than by `fpdf2`.
+
+Measured on the running app: streamlit **1.60.0**, python **3.11.15**, pandas **2.3.3**,
+altair **6.2.2**.
+
+### Path B — stage + `CREATE STREAMLIT` (warehouse runtime)
+
+Use this if you need the warehouse runtime, where packages come from `environment.yml`
+via the Snowflake Anaconda channel and no External Access Integration is involved.
+
+1. Upload the files to the stage — **Data → Databases → CIT_DATA_CORE → TRACKING →
+   Stages → ANALYTICS_DASHBOARD_STAGE → + Files**. Set the *path* field per directory so
+   `pages/`, `src/` and `.streamlit/` keep their layout; a flat upload will not import.
+2. Verify the layout survived:
+
+   ```sql
+   LS @CIT_DATA_CORE.TRACKING.ANALYTICS_DASHBOARD_STAGE;
+   ```
+
+3. Create the app (also in `sql/deploy_warehouse_app.sql`):
+
+   ```sql
+   CREATE OR REPLACE STREAMLIT CIT_DATA_CORE.TRACKING.ANALYTICS_DASHBOARD
+     ROOT_LOCATION = '@CIT_DATA_CORE.TRACKING.ANALYTICS_DASHBOARD_STAGE'
+     MAIN_FILE = 'streamlit_app.py'
+     QUERY_WAREHOUSE = COMPUTE_WH;
+   ```
+
+**To update:** re-upload the changed files, then close and reopen the app — a
+`ROOT_LOCATION` app re-reads the stage on each new session. Re-running the `CREATE`
+statement is only needed if something seems cached, and **`CREATE OR REPLACE` drops the
+object's grants**, so re-grant afterwards if anyone else has `USAGE`.
+
+`ROOT_LOCATION` is the legacy form: no multi-file editing in Snowsight (the classic
+editor writes only `streamlit_app.py`, straight to the stage), no Git integration, and
+`ALTER STREAMLIT` limited to `SET`/`UNSET`/`RENAME`.
+
+### Known traps
+
+- **There is no supported way to sync workspace files to a stage.** Workspace files live
+  in an internal user-specific database with no documented export path, so the two paths
+  above are genuinely separate — you cannot deploy via Workspaces and then reuse those
+  files for path B.
+- **`snow streamlit deploy` (CLI) is not used here.** An attempt bundled `pages/`, `src/`
+  and `.streamlit/` as *empty* directories.
+- **`SQL compilation error: Missing MAIN_FILE`** has appeared once from Deploy and then
+  the same unmodified `snowflake.yml` deployed fine. If you see it, retry before
+  debugging the config.
+- **The Snowsight editor re-indents multi-line calls on paste** and breaks them. If you
+  edit in the browser, keep calls on one line and verify before saving.
+- **Notebooks have a separate environment** from the app — they carry altair, pandas and
+  snowpark but *no streamlit*, so packages must be satisfied twice. Notebook chart cells
+  also need `alt.renderers.enable("mimetype")` in the setup cell.
+- **The Snowflake clock can lag your local date** by up to a day, which is why the date
+  picker pads its `max_value`.
+
+## Other hosting
+
+For headless hosting outside Snowflake (e.g. Streamlit Community Cloud) there is no
+browser to complete SSO, so key-pair auth is required; the variant is commented in
+`.streamlit/secrets.toml.example`. Never commit `secrets.toml` or anything under `keys/`
+— both are gitignored.
 
 ## Project structure
 
