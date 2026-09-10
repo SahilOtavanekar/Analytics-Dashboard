@@ -22,9 +22,9 @@ NOT_A_FUNNEL = (
 # Kept at module level so the branch using it stays a single indented line - the
 # Snowsight editor re-indents multi-line calls inside indented blocks and breaks them.
 CONSENT_NOTE = (
-    "{consent:,} of {total:,} form submits here ({pct:.0f}%) were cookie-consent clicks. "
-    "The consent banner fires the same form_submit event as a real form, so it is excluded "
-    "from Conversion Rate and charted separately."
+    "{consent:,} of {total:,} form submits here ({pct:.0f}%) were consent, unsubscribe or "
+    "comment submissions rather than leads. They fire the same form_submit event as a real "
+    "form, so they are excluded from Conversion Rate and charted separately."
 )
 
 st.set_page_config(page_title="Conversion", page_icon="🔻", layout="wide")
@@ -81,7 +81,7 @@ else:
         st.info("No lead-form submissions in this date range.")
     else:
         st.altair_chart(top_events_bar(leads, "FORM_ID", "SUBMITS", x_title="Submits"), width="stretch")
-    with st.expander("All forms, including the consent banner"):
+    with st.expander("All forms, including consent and unsubscribe"):
         st.dataframe(forms, width="stretch", hide_index=True)
 
 st.subheader("Action Reach")

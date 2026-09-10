@@ -291,6 +291,63 @@ def trend_line(df: pd.DataFrame, x_col: str, y_col: str, y_title: str) -> alt.Ch
     return line
 
 
+def trend_bar(df: pd.DataFrame, x_col: str, y_col: str, y_title: str) -> alt.Chart:
+    """Daily totals as columns. Same data as trend_line, a different claim about it.
+
+    A line interpolates: it draws a value for every instant between two days, and there is no
+    such thing as half a session. One column per day says the quantity belongs to that day and
+    that nothing sits between them - which is what a daily count is.
+
+    Deliberately still a TEMPORAL axis rather than one band per day. The daily query returns only
+    days that had activity, so on a temporal axis a silent day is a gap where it actually
+    happened; on an ordinal axis the inactive days collapse together and a quiet week disappears
+    from the chart entirely. This campaign is active on 27 of 31 days, so that is not a
+    hypothetical.
+
+    A sibling of trend_line rather than a flag on it: trend_line is on the Executive Dashboard
+    and Session Analytics too, and neither asked for this.
+    """
+    # Same date coercion as trend_line - Snowflake hands back Python date objects, which
+    # Altair's JSON encoder rejects even though Streamlit's Arrow path accepts them.
+    data = df.copy()
+    data[x_col] = pd.to_datetime(data[x_col])
+
+    # Rounded caps only while the columns are wide enough to carry one. Across a year the band
+    # is a couple of pixels, and a 3px radius on a 3px column renders as a lozenge - a
+    # different mark rather than a rounded one. Squared at the baseline either way.
+    corner = 3 if len(data) <= 60 else 0
+    base = alt.Chart(data).encode(
+        x=alt.X(f"{x_col}:T", title=None),
+        y=alt.Y(f"{y_col}:Q", title=y_title),
+        tooltip=[
+            alt.Tooltip(f"{x_col}:T", title="Date", format="%b %d"),
+            alt.Tooltip(f"{y_col}:Q", title=y_title, format=","),
+        ],
+    )
+    # width={"band": 1} fills the whole slot, so consecutive days touch. Altair's default leaves
+    # padding either side, which reads as a gap between every day; asked for adjacent columns
+    # instead. Days with no activity are still gaps, because those rows are absent from the data
+    # rather than zero - which is the reason this axis is temporal.
+    # A hairline in the surface colour, matching the PDF: adjacent full-width columns in one flat
+    # colour merge into a block, and where two meet this scores a thin division between them.
+    # surface() rather than a darkened teal because it is mode-aware - white on the light surface,
+    # near-black on the dark one - where a darker edge would vanish into a dark background.
+    # Dropped past ~120 columns, where a 1px stroke either side would be most of the column.
+    stroke_w = 1 if len(data) <= 120 else 0
+    bars = base.mark_bar(color=series_color(), width=alt.RelativeBandSize(1),
+                         stroke=surface(), strokeWidth=stroke_w,
+                         cornerRadiusTopLeft=corner, cornerRadiusTopRight=corner)
+    # The figure above each column, on screen as well as in the PDF. Only while they fit: past
+    # roughly forty days the labels are wider than the slot and would overprint each other, and
+    # Altair has no collision-avoidance to fall back on the way the PDF's own walk does. The
+    # tooltip still answers every column at any range.
+    if len(data) <= 40:
+        return bars + base.mark_text(dy=-6, fontSize=9, color=readable_on(surface())).encode(
+            text=alt.Text(f"{y_col}:Q", format=","),
+        )
+    return bars
+
+
 def multi_trend_line(df: pd.DataFrame, x_col: str, y_col: str, series_col: str, y_title: str) -> alt.Chart:
     """Several series over time - one line and one colour per series.
 

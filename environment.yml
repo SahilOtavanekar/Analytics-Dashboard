@@ -3,5 +3,10 @@ channels:
   - snowflake
 dependencies:
   - pandas
+# PDF export needs nothing here. fpdf2 was listed until it was measured: the deployed app runs
+# the CONTAINER runtime, which installs from pyproject.toml via PyPI and so needs an External
+# Access Integration, while this file is only read by the WAREHOUSE runtime. The package was
+# therefore never installed where the app actually runs. src/minipdf.py writes the PDF from the
+# standard library instead, so the export works on either runtime with no manifest at all.
 # streamlit and snowflake-snowpark-python are preinstalled by the warehouse
 # runtime, and altair ships with streamlit - so charts need no extra package.

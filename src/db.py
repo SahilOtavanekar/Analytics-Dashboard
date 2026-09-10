@@ -49,11 +49,15 @@ _VISITOR_DOMAIN = (
     "SPLIT_PART(LOWER(COALESCE(QUERY_PARAMETERS:email::STRING, "
     'QUERY_PARAMETERS:"amp;email"::STRING, \'\')), \'@\', 2)'
 )
-_INTERNAL_PREDICATE = (
-    f"COALESCE(PROPERTIES:tenant_id::STRING, '') <> '{INTERNAL_TENANT}'"
-    f" AND NOT (COALESCE({_VISITOR_DOMAIN}, '') ILIKE '%demandai%'"
+
+# The two halves are named separately because Campaign Analytics keeps one and drops the
+# other - see table_fqn(keep_own_campaigns=True). Everywhere else applies both.
+_TENANT_IS_EXTERNAL = f"COALESCE(PROPERTIES:tenant_id::STRING, '') <> '{INTERNAL_TENANT}'"
+_VISITOR_IS_EXTERNAL = (
+    f"NOT (COALESCE({_VISITOR_DOMAIN}, '') ILIKE '%demandai%'"
     f" OR COALESCE({_VISITOR_DOMAIN}, '') ILIKE '%demand-ai%')"
 )
+_INTERNAL_PREDICATE = f"{_TENANT_IS_EXTERNAL} AND {_VISITOR_IS_EXTERNAL}"
 
 
 def exclude_internal() -> bool:
@@ -71,8 +75,25 @@ def exclude_internal() -> bool:
         return False
 
 
-def table_fqn() -> str:
+def table_fqn(keep_own_campaigns: bool = False) -> str:
     """The table every query reads from, filtered if the reader asked for it.
+
+    `keep_own_campaigns` drops only the TENANT half of the filter, keeping the visitor half.
+    Campaign Analytics passes it, and nothing else does. The reason is that the two halves
+    answer different questions, and only one of them is unwanted there:
+
+        tenant_id = 'demand_ai'   whose CONTENT this is - Demand AI's own campaigns
+        demandai.co visitor       who is VISITING - Demand AI staff
+
+    Excluding internal traffic is about keeping staff activity out of customer figures. On
+    Campaign Analytics the reader is looking at a list OF campaigns, and Demand AI's own are
+    legitimately part of that list - demand_ai_internal_website_track is the third largest by
+    sessions and vanished entirely with the filter on. Staff visitors are still stripped, so
+    the audience and identity sections of any campaign stay free of demandai.co people.
+
+    The consequence is deliberate and stated on the page: with the filter on, this page's
+    campaign count and session total include the demand_ai tenant while every other page's
+    exclude it. See _EXCLUDE_ACTIVE_OWN in src/components.py for the wording.
 
     Applying the filter here rather than in each WHERE clause is deliberate. All 34
     table references in queries.py go through this function, so one substitution
@@ -92,7 +113,8 @@ def table_fqn() -> str:
     """
     if not exclude_internal():
         return TABLE_FQN
-    return f"(SELECT * FROM {TABLE_FQN} WHERE {_INTERNAL_PREDICATE})"
+    predicate = _VISITOR_IS_EXTERNAL if keep_own_campaigns else _INTERNAL_PREDICATE
+    return f"(SELECT * FROM {TABLE_FQN} WHERE {predicate})"
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner="Querying Snowflake...")
