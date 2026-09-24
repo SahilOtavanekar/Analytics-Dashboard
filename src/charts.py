@@ -1,3 +1,5 @@
+import math
+
 import altair as alt
 import pandas as pd
 
@@ -9,6 +11,14 @@ from src.theme import (
     series_color,
     surface,
 )
+
+
+# The gutter reserves `label_limit`, the text is allowed `label_limit - _LABEL_GAP`. Setting
+# both to the same value left the longest names cut flat against the first bar with no ellipsis
+# at all - the text filled the gutter exactly, so there was nowhere for Vega to draw one, and a
+# name that merely stops reads as a name that ends. The gap is what turns a hard clip into a
+# visible "...", and it doubles as the breathing room between the labels and the bars.
+_LABEL_GAP = 14
 
 
 def _ordered_labelled_bar(df, label_col, value_col, x_title, denominator, pct_title, step):
@@ -32,7 +42,11 @@ def _ordered_labelled_bar(df, label_col, value_col, x_title, denominator, pct_ti
             alt.Tooltip("PCT:Q", title=pct_title, format=".1f"),
         ],
     )
-    labels = alt.Chart(data).mark_text(align="left", dx=6).encode(
+    # The label sits in the gutter BESIDE the bar, not on the fill, so it is read against the
+    # surface rather than against series_color() - hence readable_on(surface()) and not
+    # readable_on(series_color()). Without an explicit colour Vega defaults to black, which
+    # is invisible on the dark surface: the count and share simply vanished in dark mode.
+    labels = alt.Chart(data).mark_text(align="left", dx=6, color=readable_on(surface())).encode(
         x=alt.X(f"{value_col}:Q"),
         y=alt.Y(f"{label_col}:N", sort=order),
         text="LABEL:N",
@@ -53,21 +67,44 @@ def ordered_bar(df: pd.DataFrame, label_col: str, value_col: str, x_title: str =
 
 
 def top_events_bar(
-    df: pd.DataFrame, name_col: str, value_col: str, x_title: str = "Events", tooltip=None
+    df: pd.DataFrame, name_col: str, value_col: str, x_title: str = "Events", tooltip=None,
+    label_limit: float | None = None,
 ) -> alt.Chart:
     """Ranked magnitude: single hue, sorted, axis + tooltip carry values.
 
-    `tooltip` replaces the default two-field tooltip for callers with more to say. Seven
-    charts across five pages share this function, so the default is left exactly as it
-    was - a new argument rather than a richer default, which would have changed six
-    charts to improve one.
+    `tooltip` replaces the default two-field tooltip for callers with more to say, and
+    `label_limit` widens the y-axis label gutter. Seven charts across five pages share this
+    function, so both are arguments rather than richer defaults, which would have changed
+    six charts to improve one.
+
+    On `label_limit`: Vega's default is 180px, and it does two things at once when a label
+    is wider. It ellipsises the text, AND the gutter it reserves stops growing - so on the
+    campaign ranking the labels were both cut short and then clipped again by the left edge
+    of the plot, losing their leading characters: "SG0626-015 Logitech" rendered as
+    "S0626-015 Logit...", and "US0623-090" lost "US0" entirely. A truncated name is a
+    nuisance; one missing its first characters is unidentifiable, and these IDs are
+    prefixed by region, which is exactly the part that disappeared.
+
+    The labels are also flush LEFT, which is what makes the ellipsis land at the end where
+    it belongs. A left axis anchors its labels at the axis line and right-aligns them, so
+    every name ends flush against its bar and starts at a different x - the eye has no
+    column to run down, and any clipping eats the start. Anchoring at labelPadding out from
+    the axis and aligning left puts the anchor at the far edge of the gutter instead: names
+    start in one column, and what runs out of room is the tail.
+
+    Deliberately NOT solved by shortening the strings in pandas. The y encoding is nominal,
+    so two names sharing a truncated prefix would merge into one bar with summed values -
+    the failure campaign_bar already disambiguates for, and the one campaign_pages_sql was
+    rewritten to avoid. Vega's own ellipsis is presentation only and cannot merge two rows.
     """
     return (
         alt.Chart(df)
         .mark_bar(color=series_color())
         .encode(
             x=alt.X(f"{value_col}:Q", title=x_title),
-            y=alt.Y(f"{name_col}:N", title=None, sort="-x"),
+            y=alt.Y(f"{name_col}:N", title=None, sort="-x",
+                    axis=alt.Axis(labelLimit=label_limit - _LABEL_GAP, labelAlign="left",
+                                  labelPadding=label_limit) if label_limit else alt.Undefined),
             tooltip=tooltip
             or [
                 alt.Tooltip(f"{name_col}:N", title=name_col.replace("_", " ").title()),
@@ -75,6 +112,34 @@ def top_events_bar(
             ],
         )
     )
+
+
+# The y-axis label gutter for the two charts whose labels are identifiers rather than words:
+# campaign names (up to 140 characters, one a chain of "-clone-<uuid>" suffixes) and page paths.
+# Vega's 180px default clipped the leading characters off both. 300px is about 46 characters at
+# the axis font and still leaves the plot the majority of a full-width chart; past that the bars
+# become the smaller half of the figure, which trades one unreadable thing for another.
+_LABEL_LIMIT = 300
+
+
+def page_bar(df: pd.DataFrame) -> alt.Chart:
+    """Pages for one campaign: the path labels the bar, the host rides in the tooltip.
+
+    Its own function rather than a tooltip list built at the call site, for the reason
+    campaign_bar is one: the encoding and the columns it depends on belong together, and
+    src/campaign_detail.py does not otherwise import Altair.
+
+    campaign_pages_sql guarantees PAGE is unique - it falls back to the full URL where two
+    hosts share a path - so the nominal y encoding here cannot merge two pages into one bar.
+    """
+    return top_events_bar(df, "PAGE", "SESSIONS", x_title="Sessions", label_limit=_LABEL_LIMIT, tooltip=[
+        alt.Tooltip("PAGE:N", title="Page"),
+        alt.Tooltip("HOST:N", title="Host"),
+        alt.Tooltip("SESSIONS:Q", title="Sessions", format=","),
+        alt.Tooltip("VIEWS:Q", title="Views", format=","),
+        alt.Tooltip("VIEWS_PER_SESSION:Q", title="Views / session", format=".1f"),
+        alt.Tooltip("PCT_OF_SESSIONS:Q", title="% of campaign sessions", format=".1f"),
+    ])
 
 
 # Ranked by sessions where they exist, by events where they do not. The axis title has to
@@ -200,7 +265,7 @@ def campaign_bar(df: pd.DataFrame, window_start, window_end):
     # push ten unused columns to the browser on every rerun.
     fields = [str(t.shorthand).split(":")[0] for t in tooltip]
     keep = list(dict.fromkeys(fields + ["CAMPAIGN_LABEL", metric, "CAMPAIGN_ID"]))
-    chart = top_events_bar(data[keep], "CAMPAIGN_LABEL", metric, x_title=axis_title, tooltip=tooltip)
+    chart = top_events_bar(data[keep], "CAMPAIGN_LABEL", metric, x_title=axis_title, tooltip=tooltip, label_limit=_LABEL_LIMIT)
 
     # The selection carries CAMPAIGN_ID, not the label. Labels are display strings - they
     # can be a name, a tracking ID, or a name with an ID appended to break a collision -
@@ -266,6 +331,162 @@ def share_stacked_bar(
         )
     )
     return (bars + labels).properties(height=180)
+
+
+# Arc geometry in one place. The label radius is DERIVED from the band rather than typed
+# again: the two were independent numbers and the share label drifted off the ring.
+_DONUT_INNER = 70
+_DONUT_OUTER = 110
+_DONUT_LABEL_R = (_DONUT_INNER + _DONUT_OUTER) / 2
+# Explicit, because an arc chart with no width is rescaled to whatever container it lands
+# in - and mark radii are absolute pixels, so the ring grew while the labels stayed put.
+# Render this one with width="content", never "stretch".
+# Wider than the ring so the bottom legend has room - at 2*outer+40 the third entry
+# clipped to "Form subm".
+#
+# width/height size the PLOT AREA only, so height needs the ring plus a margin and nothing
+# else. It briefly also reserved 56px for the bottom legend, which was surplus: autosize
+# "pad" already grows the view to fit the legend, so that space was counted twice and left
+# a large empty band above the ring. Let pad handle the legend; size the plot for the ring.
+_DONUT_MARGIN = 24      # breathing room above and below the ring, inside the plot area
+_DONUT_BOX_W = 2 * _DONUT_OUTER + 2 * _DONUT_MARGIN  # square; the legend sits outside it
+_DONUT_BOX_H = 2 * _DONUT_OUTER + 2 * _DONUT_MARGIN
+
+def donut_chart(df: pd.DataFrame, name_col: str, value_col: str, order=None,
+                centre_label: str = "", centre_sublabel: str = "") -> alt.LayerChart:
+    """Part-to-whole ring, total in the hole.
+
+    A donut is only legible as part-to-whole at a glance and only up to about six segments -
+    past that, or for comparing close values, a bar is the right form and this is the wrong
+    one. Callers are expected to have partitioned their data before arriving here.
+
+    `order` pins the slice-to-colour mapping to a FIXED list rather than to rank. Without it a
+    campaign whose clicks outnumber its page visits would repaint both slices, and colour that
+    moves with rank stops being an identity cue the moment two campaigns are compared.
+
+    The hole exists to hold a number - this chart replaced a KPI tile, and `centre_label` is
+    how that tile's figure survives.
+    """
+    data = df.copy()
+    total = float(data[value_col].sum())
+    data["share"] = data[value_col] / total if total else 0.0
+    # Below ~8% the arc is too short to seat a label without it overrunning its own slice, so
+    # the number falls back to the tooltip and the table view rather than being drawn badly.
+    data["pct"] = data["share"].map(lambda v: f"{v * 100:.0f}%" if v * 100 >= 8 else "")
+    data["tip"] = data["share"].map(lambda v: f"{v * 100:.1f}%")
+
+    domain = list(order) if order else data[name_col].astype(str).tolist()
+    data = data[data[name_col].isin(domain)]
+    hues = categorical()
+    palette = [hues[i % len(hues)] for i in range(len(domain))]
+    inks = dict(zip(domain, [readable_on(c) for c in palette]))
+    data["ink"] = data[name_col].map(inks)
+
+    # The legend carries the VALUE and SHARE, not just the name, because a slice small enough
+    # to matter is a slice too thin to label. At a tenth of a percent the arc is under a pixel
+    # wide: no font size, radius or offset makes that band readable, and inflating it to a
+    # minimum angle would make the ring stop matching its own numbers. The legend has room,
+    # always renders, and its swatch is the only place that colour is visible at all.
+    #
+    # A real count must never be captioned "0%". One decimal is not enough on its own -
+    # 7 of 100,507 rounds to "0.0%", which reads exactly as broken as "0%" - so anything
+    # under a tenth of a percent is reported as a bound instead of a rounded zero.
+    def _legend(name, value, share):
+        pct_val = share * 100
+        if pct_val <= 0:
+            pct = "0%"
+        elif pct_val < 0.1:
+            pct = "<0.1%"
+        elif pct_val < 1:
+            pct = f"{pct_val:.1f}%"
+        else:
+            pct = f"{pct_val:.0f}%"
+        return f"{name} - {int(value):,} ({pct})"
+
+    labelled = {r[name_col]: _legend(r[name_col], r[value_col], r["share"]) for _, r in data.iterrows()}
+    # Ordered by the fixed domain, so legend order and palette stay pinned to the entity.
+    legend_domain = [labelled[n] for n in domain if n in labelled]
+    legend_range = [palette[i] for i, n in enumerate(domain) if n in labelled]
+    data["legend_label"] = data[name_col].map(labelled)
+    # Sorted to the fixed order so the arcs are laid out in the same sequence as the legend
+    # and the palette, whatever order the query happened to return.
+    data["_seq"] = data[name_col].map({n: i for i, n in enumerate(domain)})
+    data = data.sort_values("_seq")
+
+    # Explicit start/end angles in radians, for the same reason share_stacked_bar computes its
+    # own seg_start/seg_end: with theta=...stack=True the arc layer and the label layer each
+    # stack independently, and the arc layer's colour encoding reorders it. The layers then
+    # disagree about where a slice begins - the share label for Clicks was drawn over the Page
+    # visit arc. Computing the angles once in pandas keeps both layers on the same geometry.
+    turn = 2 * math.pi
+    data["t_end"] = data["share"].cumsum() * turn
+    data["t_start"] = data["t_end"] - data["share"] * turn
+    data["t_mid"] = (data["t_start"] + data["t_end"]) / 2
+
+    base = alt.Chart(data)
+    arcs = base.mark_arc(innerRadius=_DONUT_INNER, outerRadius=_DONUT_OUTER, stroke=surface(), strokeWidth=2).encode(
+        theta=alt.Theta("t_start:Q", scale=None),
+        theta2="t_end:Q",
+        color=alt.Color(
+            "legend_label:N",
+            scale=alt.Scale(domain=legend_domain, range=legend_range),
+            # Right, not bottom. The entries carry counts now, so they are too long to sit
+            # three-across without clipping, and stacked underneath they made the element
+            # tall and narrow - a 340px column of content on a page three times that wide.
+            # Beside the ring they use the horizontal room the page already has, and the
+            # whole chart gets shorter instead of taller.
+            # offset pulls the legend in towards the ring - the Vega default of 18 pushed
+            # these long entries out to the card edge. labelLimit stays generous enough
+            # for the longest entry ("Page visit - 139,825 (98%)") so none of them ellipse.
+            legend=alt.Legend(orient="right", title=None, columns=1, labelLimit=230,
+                              offset=2, labelFontSize=12, symbolSize=90, rowPadding=4),
+        ),
+        tooltip=[
+            alt.Tooltip(f"{name_col}:N", title="Event"),
+            alt.Tooltip(f"{value_col}:Q", title="Events", format=","),
+            alt.Tooltip("tip:N", title="Share"),
+        ],
+    )
+    # The share sits ON the fill, so its colour is per slice for the same reason
+    # share_stacked_bar chooses per segment: the validated palette spans light and dark slots.
+    labels = base.mark_text(radius=_DONUT_LABEL_R, fontWeight="bold", fontSize=11).encode(
+        theta=alt.Theta("t_mid:Q", scale=None),
+        text="pct:N",
+        color=alt.Color("ink:N", scale=None, legend=None),
+    )
+    layers = [arcs, labels]
+
+    # The hole holds the total, and `centre_sublabel` names it - a bare number in a ring is
+    # ambiguous about which of the page's several totals it is. Nudged apart with dy so the
+    # pair reads as one block rather than two overlapping marks.
+    if centre_label:
+        centre = alt.Chart(pd.DataFrame({"t": [centre_label]})).mark_text(
+            fontSize=22, fontWeight="bold", dy=-9 if centre_sublabel else 0,
+            color=readable_on(surface()),
+        ).encode(text="t:N")
+        layers.append(centre)
+    if centre_sublabel:
+        sub = alt.Chart(pd.DataFrame({"t": [centre_sublabel]})).mark_text(
+            fontSize=11, dy=13, opacity=0.75, color=readable_on(surface()),
+        ).encode(text="t:N")
+        layers.append(sub)
+    # autosize "pad" grows the view to fit its contents. The default "fit" does the opposite -
+    # it shrinks the view to the given size, and since the arc cannot shrink with it, the ring
+    # is what gets clipped.
+    # autosize "pad" grows the view to fit its contents. The default "fit" does the opposite -
+    # it shrinks the view to the given size, and since an arc cannot shrink with it, the ring
+    # is what gets clipped.
+    #
+    # `padding` is separate from, and does more than, the height arithmetic above: width and
+    # height describe the PLOT AREA only, and a top-anchored label or the ring's own edge can
+    # still sit against the view boundary. This reserves space outside the plot area, which is
+    # the part that was cropping along the top.
+    return alt.layer(*layers).properties(
+        width=_DONUT_BOX_W,
+        height=_DONUT_BOX_H,
+        padding={"left": 10, "right": 10, "top": 8, "bottom": 8},
+        autosize=alt.AutoSizeParams(type="pad", contains="padding"),
+    )
 
 
 def trend_line(df: pd.DataFrame, x_col: str, y_col: str, y_title: str) -> alt.Chart:

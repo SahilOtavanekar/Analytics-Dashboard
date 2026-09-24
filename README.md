@@ -29,7 +29,18 @@ Campaign Analytics is the deepest page:
 
 - **Click a bar** — or search every campaign in the range from the picker — to replace the
   ranking with one campaign's full breakdown: activity over time, session quality,
-  engagement funnel, geography, content, accounts reached, sources and AI usage.
+  engagement funnel, geography, pages, content, accounts reached, sources and AI usage.
+- **Pages and content are a pair, in that order.** *Pages* is which pages the campaign's
+  sessions landed on; *Content* is which assets they opened on those pages. Both are reach
+  per session, and both overlap — one session visits several pages, so the shares sum past
+  100%, the same way action reach does. Roughly half of campaign page views carry an
+  `asset`, so the two sections agree more often than not.
+- **Bars are labelled by path, the table carries the full address.** A path is readable and
+  a URL is followable, and they are not the same job: the chart's axis takes the path, and
+  the expander lists the absolute `scheme://host/path` as a link you can click or copy. The
+  scheme is taken per page rather than assumed — 0.9% of campaign page views are `http`.
+- **Most campaigns have one page.** 437 of 592 in a 30-day window, so a single page is
+  stated in a sentence rather than drawn as a lone bar.
 - **Sections are gated on measured availability.** A section with no data says why in one
   line instead of drawing an empty axis — an empty axis reads as "zero", which is a
   stronger and different claim than "not measured here".
@@ -43,13 +54,17 @@ Campaign Analytics is the deepest page:
 
 ## Things worth knowing before reading the numbers
 
-**Internal-traffic filter.** A sidebar toggle removes Demand AI's own traffic on two
-counts: content under the `demand_ai` tenant, and visits from `demandai.co` addresses
-(staff browsing customers' content). It is row-level and applied once in
-`db.table_fqn()`, so all 48 query builders inherit it. Campaign Analytics keeps the
-*tenant* half — a list *of* campaigns should include Demand AI's own — while still
-dropping staff visitors. Which rule is active is stated in the page body, so a
-screenshot carries the caveat with it.
+**Internal-traffic filter.** A sidebar toggle removes Demand AI's own traffic on three
+counts: content under the `demand_ai` tenant, visits from `demandai.co` addresses (staff
+browsing customers' content), and anything served from `localhost` or `127.0.0.1` — a
+developer's machine, not a visit. That third rule reaches what the other two cannot: about
+half of all localhost rows sit on *customer* tenants, 7,544 rows and 34 campaigns in a
+30-day window. A row with no host at all is deliberately left in, because `about:srcdoc`
+and a null `SEARCH_URL` both resolve to one and thousands of those are ordinary events.
+It is row-level and applied once in `db.table_fqn()`, so every query builder inherits it.
+Campaign Analytics keeps the *tenant* rule — a list *of* campaigns should include Demand
+AI's own — while still dropping staff visitors and localhost. Which rule is active is
+stated in the page body, so a screenshot carries the caveat with it.
 
 **Engagement excludes consent.** Dismissing a cookie banner is not engagement with a
 campaign. Consent is recorded three separate ways — a `cookie-form` submit, a click
@@ -114,7 +129,7 @@ active session, so `secrets.toml` is a local-development concern only.
 
 ### Prerequisites
 
-Privileges on the target role (`R_CIT_DATA_ADMIN` here):
+Privileges on the target role (`R_CIT_DATA_CORE_ADMIN_DEV` here):
 
 | Privilege | On | Why |
 |---|---|---|
@@ -357,6 +372,18 @@ how a figure should be read.
   `SESSION_ID` as an explicit proxy, not verified identity.
 - **Region comes from the browser timezone** — the only location signal present. `UTC` and
   `Etc/*` are settings rather than places, so they group as unknown.
+- **A page is its host and path, with the query string stripped.** Identity comes from
+  `SEARCH_URL`, the one URL column populated across the whole history — `PATH` and `TAB_URL`
+  were retired in the March–April 2026 tracking change. Dropping the query string is a privacy
+  rule, not tidiness: `email` rides in the query string on personalised links, so grouping on
+  the raw URL would put individual addresses into a downloadable report.
+- **One metric is keyed on the full URL instead, and masks the address rather than dropping
+  it.** `LEAD_PAGE_SUBMITS` counts lead submits per session *and URL*, so two `?asset=`
+  variants of one page count separately — that is the distinction it exists to show. It is the
+  only key not built on the stripped page identity above, and it is safe for the same reason
+  the rule exists: the `email` parameter is replaced with a placeholder before the key is
+  built, and the key is only ever counted, never displayed. Measured: masking changes the
+  count by zero, because no session+page pair in the data differs only by its email value.
 - **"Direct / none" traffic means no referrer was recorded**, not that someone typed the
   URL. For a link opened from an email client that is the normal case.
 - **Duration is the span from a session's first to last event**, not time spent reading.

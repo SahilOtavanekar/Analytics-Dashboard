@@ -40,9 +40,11 @@ from src.queries import (
     campaign_daily_sql,
     campaign_detail_kpis_sql,
     campaign_duration_bands_sql,
+    campaign_event_mix_sql,
     campaign_funnel_sql,
     campaign_geo_sql,
     campaign_lookup_sql,
+    campaign_pages_sql,
     campaign_read_depth_sql,
     campaign_sources_sql,
 )
@@ -51,6 +53,33 @@ from src.queries import (
 # one identified person, and "1 person at acme.com" is an individual described by a report
 # that promises domain-level aggregation only. Below the floor the breakdown is not queried.
 IDENTITY_FLOOR = 5
+
+# When one network address accounts for this much of a campaign's sessions, the session
+# count stops describing reach and starts describing one place. Both numbers are measured,
+# not picked: across 169 campaigns with 50+ sessions the top address takes a median 20%,
+# and the distribution is bimodal - 65 campaigns under 20%, 21 above 90%, little between -
+# so a threshold separates two kinds of campaign rather than cutting a gradient.
+#
+# The session floor is what keeps it meaningful. With no floor the rule fires on 165 of 594
+# campaigns, because four sessions out of five is 80% and says nothing; at 20 it fires on
+# 36 of 276. A caption that appears on a quarter of campaigns is furniture.
+CONCENTRATION_PCT = 80.0
+CONCENTRATION_MIN_SESSIONS = 20
+
+
+def concentration(kpis) -> float | None:
+    """Top address's share of this campaign's sessions, or None when it is not worth saying.
+
+    Returns None rather than a number below the threshold so every caller asks the same
+    question once - three renderers would otherwise each re-implement the gate, and the
+    PDF and the page could then disagree about whether a campaign is concentrated.
+    """
+    sessions = int(kpis["SESSIONS"] or 0)
+    top = int(kpis["TOP_IP_SESSIONS"] or 0)
+    if sessions < CONCENTRATION_MIN_SESSIONS or not sessions:
+        return None
+    share = top / sessions * 100
+    return share if share >= CONCENTRATION_PCT else None
 
 STATUS_OK = "ok"
 STATUS_NO_SESSIONS = "no_sessions"
@@ -115,6 +144,7 @@ def collect(run, campaign_id: str, start: dt.date, end: dt.date) -> dict:
     out["daily"] = run(campaign_daily_sql(), params)
     out["duration"] = run(campaign_duration_bands_sql(), params)
     out["funnel"] = run(campaign_funnel_sql(), params)
+    out["event_mix"] = run(campaign_event_mix_sql(), params)
     # No "actions" key any more: the action-reach breakdown was removed from the page, the PDF
     # and the emailed body, so fetching it would be a round trip nothing reads. That takes this
     # from eleven queries per drill-down to ten. campaign_actions_sql() is kept in queries.py -
@@ -123,6 +153,12 @@ def collect(run, campaign_id: str, start: dt.date, end: dt.date) -> dict:
     geo = run(campaign_geo_sql(), params)
     out["regions"] = geo[geo["KIND"] == "region"][["LABEL", "SESSIONS"]].rename(columns={"LABEL": "REGION"})
     out["timezones"] = geo[geo["KIND"] == "timezone"][["LABEL", "SESSIONS"]].rename(columns={"LABEL": "TIMEZONE"})
+
+    # Pages before assets, matching the order all three surfaces render them in: the page is the
+    # container, the asset is the content opened on it. Gated on the count the KPI query already
+    # returned, so a campaign whose page views carry no resolvable SEARCH_URL costs no round trip.
+    if int(kpis["PAGES"]) > 0:
+        out["pages"] = run(campaign_pages_sql(), params)
 
     if int(kpis["ASSETS"]) > 0:
         out["assets"] = run(campaign_assets_sql(), params)
@@ -258,6 +294,31 @@ def _pdf_heading(pdf, text, keep: float = 24.0) -> None:
     pdf.set_line_width(0.2)
     pdf.ln(1.6)
     pdf.set_text_color(*_PDF_INK)
+
+
+def _pdf_rule(pdf, keep: float = 30.0) -> None:
+    """A full-width divider between two sections that would otherwise run together.
+
+    Every heading already carries a hairline beneath it, which separates a heading from its
+    own table - not one section from the next. Pages and Content sit at the end of the report
+    as a pair and are the one place that distinction matters: both are "what they looked at",
+    both are tables of names and session counts, and read back to back the second looks like
+    a continuation of the first. This is heavier than the heading rule and sits in its own
+    air, so it reads as a break rather than as another underline.
+
+    `keep` reserves the space a section needs after it, so the divider cannot be the last
+    mark on a page with its section overleaf - which would separate nothing at all.
+    """
+    if pdf.get_y() + keep > pdf.h - pdf.b_margin:
+        pdf.add_page()
+        return
+    pdf.ln(5.0)
+    pdf.set_draw_color(*_PDF_RULE)
+    pdf.set_line_width(0.6)
+    y = pdf.get_y()
+    pdf.line(pdf.l_margin, y, pdf.l_margin + _PAGE_W, y)
+    pdf.set_line_width(0.2)
+    pdf.ln(1.5)
 
 
 def _pdf_note(pdf, text) -> None:
@@ -499,8 +560,43 @@ def _pdf_table(pdf, title, frame, label_col, value_col, value_head, extra=None, 
         _pdf_note(pdf, note)
 
     extra = extra or []
-    w_label, w_value, w_extra = 74.0, 24.0, 20.0
-    w_bar = _PAGE_W - w_label - w_value - (w_extra * len(extra))
+    w_label, w_value = 74.0, 24.0
+
+    def _fit(text: str, width: float) -> str:
+        """`text` trimmed to `width`, walking back through the ORIGINAL string.
+
+        Written as a helper because the label and every extra cell need it: this writer's
+        cell() neither wraps nor clips, so anything too wide silently overprints its
+        neighbour. Trimming the running result instead - label[:-2] + "..." - removes two
+        characters and appends three, so the string grows by one per pass and the loop never
+        terminates. That form was here, and any label past roughly 49 lowercase characters
+        hung PDF generation outright.
+        """
+        if pdf.get_string_width(text) <= width:
+            return text
+        keep = len(text)
+        while keep > 1 and pdf.get_string_width(text[:keep] + "...") > width:
+            keep -= 1
+        return text[:keep].rstrip() + "..."
+
+    # Extra columns are sized to their own content, not to a fixed 20mm - both the HEADING,
+    # which is derived from the column name ("VIEWS_PER_SESSION" -> "Views Per Session", which
+    # ran straight back over the "Views" column beside it), and the widest VALUE, since a host
+    # or any other string extra overflows 20mm just as readily. Both were seen in the rendered
+    # PDF and are invisible in any assertion about bytes.
+    pdf.set_font("Helvetica", "B", 7)
+    heads = [pdf.get_string_width(_safe(col.replace("_", " ").title())) for col, _ in extra]
+    pdf.set_font("Helvetica", "", 8)
+    vals = [max((pdf.get_string_width(_safe(fmt(getattr(r, col)))) for r in frame.itertuples()),
+                default=0.0) for col, fmt in extra]
+    w_extras = [min(46.0, max(20.0, max(h, v) + 4.0)) for h, v in zip(heads, vals)]
+    w_bar = _PAGE_W - w_label - w_value - sum(w_extras)
+    # Wide extras eat the bar rather than the label, but only down to a floor - past that the
+    # label column gives up the rest, because a 2mm bar is decoration and a truncated label is
+    # still a name. Several string extras is the case that reaches this.
+    if w_bar < 14.0:
+        w_label = max(40.0, w_label - (14.0 - w_bar))
+        w_bar = _PAGE_W - w_label - w_value - sum(w_extras)
 
     def _head(continued: bool = False) -> None:
         """The column strip. Redrawn after a page break, because a table that spills over
@@ -517,8 +613,8 @@ def _pdf_table(pdf, title, frame, label_col, value_col, value_head, extra=None, 
         pdf.cell(w_label, 5.4, "  " + _safe(label_col.replace("_", " ").title()), fill=True)
         pdf.cell(w_value, 5.4, _safe(value_head) + "  ", align="R", fill=True)
         pdf.cell(w_bar, 5.4, "", fill=True)
-        for col, _ in extra:
-            pdf.cell(w_extra, 5.4, _safe(col.replace("_", " ").title()) + "  ", align="R", fill=True)
+        for (col, _), w in zip(extra, w_extras):
+            pdf.cell(w, 5.4, _safe(col.replace("_", " ").title()) + "  ", align="R", fill=True)
         pdf.ln()
         pdf.set_text_color(*_PDF_INK)
         pdf.set_font("Helvetica", "", 8)
@@ -535,9 +631,9 @@ def _pdf_table(pdf, title, frame, label_col, value_col, value_head, extra=None, 
         value = float(getattr(row, value_col) or 0)
         label = _fmt_date(getattr(row, label_col)) if _as_date(getattr(row, label_col)) else _safe(getattr(row, label_col))
         # Trimmed to what the column can hold. Campaign and asset names reach 140 characters,
-        # and fpdf2 does not wrap inside a fixed cell - it overprints the next column.
-        while pdf.get_string_width(label) > w_label - 5 and len(label) > 4:
-            label = label[:-2] + "..."
+        # page paths run longer still, and the writer overprints the next column rather than
+        # wrapping. See _fit for the loop this replaced and what it did.
+        label = _fit(label, w_label - 5)
         y = pdf.get_y()
         # Alternating tint instead of a rule under every row: at eight point, a hairline every
         # 5mm turns a short table into a grid, while a band lets the eye track across a wide one.
@@ -549,8 +645,8 @@ def _pdf_table(pdf, title, frame, label_col, value_col, value_head, extra=None, 
         pdf.set_fill_color(*_PDF_TEAL)
         pdf.rect(pdf.get_x() + 1, y + 1.6, max((value / top) * (w_bar - 3), 0.4), 2.2, style="F")
         pdf.cell(w_bar, 5.4, "")
-        for col, fmt in extra:
-            pdf.cell(w_extra, 5.4, _safe(fmt(getattr(row, col))) + "  ", align="R")
+        for (col, fmt), w in zip(extra, w_extras):
+            pdf.cell(w, 5.4, _fit(_safe(fmt(getattr(row, col))), w - 3) + "  ", align="R")
         pdf.ln()
 
 
@@ -700,6 +796,12 @@ def to_pdf(data: dict) -> bytes:
         ("Converted", f"{pct(k['LEAD_SESSIONS'], s):.2f}%"),
     ])
 
+    _conc = concentration(k)
+    if _conc is not None:
+        _pdf_note(pdf, f"{_conc:.0f}% of these {s:,} sessions came from a single network address "
+                       f"({int(k['DISTINCT_IPS']):,} addresses in total). Likely one organisation or an "
+                       f"automated client rather than {s:,} separate visitors - an address is not a person.")
+
     # A chart, not a table. A single-day range degenerates to one point with nothing to
     # connect, so it falls back to the tabular form rather than drawing an empty axis.
     daily = data.get("daily")
@@ -717,14 +819,17 @@ def to_pdf(data: dict) -> bytes:
     _consent = (f" Cookie banner: {int(k['CONSENT_YES_SESSIONS']):,} accepted, "
                 f"{int(k['CONSENT_NO_SESSIONS']):,} rejected - counted as neither engagement nor "
                 f"conversion.") if (int(k["CONSENT_YES_SESSIONS"]) or int(k["CONSENT_NO_SESSIONS"])) else ""
+    # Stated, not charted: the funnel counts SESSIONS and every stage must nest inside the
+    # one above it, so a session+page figure cannot become a fourth row without the bottom
+    # row being able to exceed the row it is drawn from. Shown only when the two differ.
+    _leadpages = (f" Those {int(k['LEAD_SESSIONS']):,} converting sessions submitted across {int(k['LEAD_PAGE_SUBMITS']):,} distinct session-and-URL combinations.") if int(k["LEAD_PAGE_SUBMITS"]) > int(k["LEAD_SESSIONS"]) else ""
+    _funnel_note = ("Each stage is a subset of the one above it." + _consent + _leadpages) if (_consent or _leadpages) else None
     _pdf_table(pdf, "Engagement funnel", data.get("funnel"), "STAGE", "SESSIONS", "Sessions",
-               note=("Each stage is a subset of the one above it." + _consent) if _consent else None)
+               note=_funnel_note)
+    _pdf_table(pdf, "Events", data.get("event_mix"), "BUCKET", "EVENTS", "Events",
+               note="AI requests are excluded from this split - they are neither a page visit, a click nor a form.")
     _pdf_table(pdf, "Where they are", data.get("regions"), "REGION", "SESSIONS", "Sessions",
                note="From the browser timezone, the only location signal in the data.")
-    _pdf_table(pdf, "Content by reach", data.get("assets"), "ASSET", "SESSIONS", "Sessions",
-               extra=[("EVENTS_PER_SESSION", lambda v: f"{float(v or 0):,.1f}")])
-    _pdf_table(pdf, "PDF read depth", data.get("depth"), "ASSET", "AVG_PAGE_REACHED", "Avg page",
-               extra=[("DEEPEST_PAGE", lambda v: f"{int(v or 0):,}")])
     _pdf_table(pdf, "Accounts reached", data.get("companies"), "COMPANY", "SESSIONS", "Sessions",
                extra=[("PEOPLE", lambda v: f"{int(v or 0):,}")],
                note="Company domains only; individual addresses are never included.")
@@ -744,6 +849,31 @@ def to_pdf(data: dict) -> bytes:
     _pdf_table(pdf, "External referrers", data.get("referrers"), "REFERRER", "EVENTS", "Events")
     _pdf_table(pdf, "AI model mix", data.get("ai"), "MODEL", "REQUESTS", "Requests",
                extra=[("SESSIONS", lambda v: f"{int(v or 0):,}")])
+
+    # What they looked at, kept together at the end. Pages and Content are one question asked at
+    # two levels - the page is the container, the asset is what was opened on it - and they are
+    # also the two longest tables here, up to twelve rows each. Sitting mid-report they pushed
+    # the short, comparable sections apart; at the end the reader gets the whole shape of the
+    # campaign first and the inventory afterwards. PDF read depth follows Content because it is
+    # per-asset: it names assets, so it cannot precede the table that lists them.
+    _pdf_table(pdf, "Pages viewed", data.get("pages"), "PAGE", "SESSIONS", "Sessions",
+               extra=[("HOST", lambda v: _safe(v or "")),
+                      ("VIEWS", lambda v: f"{int(v or 0):,}"),
+                      ("VIEWS_PER_SESSION", lambda v: f"{float(v or 0):,.1f}")],
+               note=("Labelled by path, with the host alongside. Query strings are stripped; "
+                     "localhost and iframe pages are left out. One session can visit several "
+                     "pages, so the shares do not sum to 100%."))
+    # Drawn only when BOTH sides exist. A divider above an absent Content section would be a
+    # rule with nothing under it, and one below an absent Pages section would open the block
+    # with a line - _pdf_table renders nothing at all for an empty frame, so neither is visible
+    # from here without asking.
+    if data.get("pages") is not None and len(data.get("pages", [])) \
+            and data.get("assets") is not None and len(data.get("assets", [])):
+        _pdf_rule(pdf)
+    _pdf_table(pdf, "Content by reach", data.get("assets"), "ASSET", "SESSIONS", "Sessions",
+               extra=[("EVENTS_PER_SESSION", lambda v: f"{float(v or 0):,.1f}")])
+    _pdf_table(pdf, "PDF read depth", data.get("depth"), "ASSET", "AVG_PAGE_REACHED", "Avg page",
+               extra=[("DEEPEST_PAGE", lambda v: f"{int(v or 0):,}")])
 
     # No closing block. The date window and the campaign name are on every page already, in the
     # running footer, so a "Covers <window>" line at the end restated what the page it sat on was
@@ -792,13 +922,25 @@ def _esc(v) -> str:
     return html.escape("" if v is None else str(v), quote=True)
 
 
-def _bar_rows(frame, label_col, value_col, extra=None) -> str:
+def _bar_rows(frame, label_col, value_col, extra=None, link_col=None) -> str:
+    """`link_col` turns the label into an anchor pointing at that column's URL.
+
+    Only the Pages section passes it, and only because a path on its own - "/logitech/" -
+    is a label rather than an address: it reads fine and pastes nowhere. campaign_pages_sql
+    returns the absolute URL beside it for exactly this. The href is escaped with quote=True
+    like every other value here; it arrives from PARSE_URL on our own tracking data, but an
+    unescaped attribute is a habit worth not having.
+    """
     if frame is None or not len(frame):
         return ""
     top = float(max(float(v or 0) for v in frame[value_col])) or 1.0
     out = []
     for row in frame.itertuples():
         label = _esc(getattr(row, label_col))
+        if link_col:
+            href = _esc(getattr(row, link_col, "") or "")
+            if href:
+                label = f"<a href='{href}'>{label}</a>"
         value = float(getattr(row, value_col) or 0)
         width = max(value / top * 100.0, 0.0)
         cells = f"<td>{label}</td><td class='n'>{value:,.10g}</td>"
@@ -810,14 +952,14 @@ def _bar_rows(frame, label_col, value_col, extra=None) -> str:
     return "".join(out)
 
 
-def _table(title, frame, label_col, value_col, value_head, extra=None, note=None) -> str:
+def _table(title, frame, label_col, value_col, value_head, extra=None, note=None, link_col=None) -> str:
     if frame is None or not len(frame):
         return ""
     head = f"<th>{_esc(label_col.replace('_', ' ').title())}</th><th class='n'>{_esc(value_head)}</th><th></th>"
     if extra:
         for col, _ in extra:
             head += f"<th class='n'>{_esc(col.replace('_', ' ').title())}</th>"
-    body = _bar_rows(frame, label_col, value_col, extra)
+    body = _bar_rows(frame, label_col, value_col, extra, link_col)
     note_html = f"<p class='note'>{_esc(note)}</p>" if note else ""
     return f"<h2>{_esc(title)}</h2>{note_html}<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
 
@@ -869,6 +1011,12 @@ def to_html(data: dict, link: str = "") -> str:
                  + _kpi("Converted", f"{pct(k['LEAD_SESSIONS'], s):.2f}%")
                  + "</div>")
 
+    _conc = concentration(k)
+    if _conc is not None:
+        _msg = (f"{_conc:.0f}% of these {s:,} sessions came from a single network address "
+                f"({int(k['DISTINCT_IPS']):,} addresses in total). Likely one organisation or an "
+                f"automated client rather than {s:,} separate visitors - an address is not a person.")
+        parts.append(f"<p class='note'>{_esc(_msg)}</p>")
     parts.append(_table("Activity by day", data.get("daily"), "EVENT_DATE", "SESSION_COUNT", "Sessions"))
     parts.append(_table(
         "Session duration", data.get("duration"), "BAND", "SESSIONS", "Sessions",
@@ -877,10 +1025,24 @@ def to_html(data: dict, link: str = "") -> str:
     # Action reach dropped here too, so the page, the PDF and the emailed body describe the same
     # sections. Leaving it in the email alone would recreate exactly the drift this module exists
     # to prevent - and collect() no longer fetches it, so there would be nothing to render.
+    _leadpages = (f" Those {int(k['LEAD_SESSIONS']):,} converting sessions submitted across {int(k['LEAD_PAGE_SUBMITS']):,} distinct session-and-URL combinations.") if int(k["LEAD_PAGE_SUBMITS"]) > int(k["LEAD_SESSIONS"]) else ""
     parts.append(_table("Engagement funnel", data.get("funnel"), "STAGE", "SESSIONS", "Sessions",
-                        note="Each stage is a subset of the one above it."))
+                        note="Each stage is a subset of the one above it." + _leadpages))
+    parts.append(_table("Events", data.get("event_mix"), "BUCKET", "EVENTS", "Events",
+                        note="AI requests are excluded from this split - they are neither a page visit, a click nor a form."))
     parts.append(_table("Where they are", data.get("regions"), "REGION", "SESSIONS", "Sessions",
                         note="From the browser timezone, the only location signal in the data."))
+    # HOST goes through _esc, unlike every other extra here: _bar_rows interpolates a
+    # formatter's output straight into the row, unescaped, and this is the first extra
+    # carrying text rather than a number.
+    parts.append(_table("Pages viewed", data.get("pages"), "PAGE", "SESSIONS", "Sessions",
+                        extra=[("HOST", lambda v: _esc(v or "")),
+                               ("VIEWS", lambda v: f"{int(v or 0):,}"),
+                               ("VIEWS_PER_SESSION", lambda v: f"{float(v or 0):,.1f}")],
+                        link_col="URL",
+                        note=("Each page links to its own address. Query strings are stripped; "
+                              "localhost and iframe pages are left out. One session can visit several "
+                              "pages, so the shares do not sum to 100%.")))
     parts.append(_table("Content by reach", data.get("assets"), "ASSET", "SESSIONS", "Sessions",
                         extra=[("EVENTS_PER_SESSION", lambda v: f"{float(v or 0):,.1f}")]))
     parts.append(_table("PDF read depth", data.get("depth"), "ASSET", "AVG_PAGE_REACHED", "Avg page",
@@ -894,6 +1056,8 @@ def to_html(data: dict, link: str = "") -> str:
                         extra=[("SESSIONS", lambda v: f"{int(v or 0):,}")]))
 
     withheld = []
+    if int(k["PAGES"]) == 0:
+        withheld.append("no pages with a resolvable URL")
     if int(k["ASSETS"]) == 0:
         withheld.append("no tracked content")
     if int(k["PEOPLE"]) == 0:

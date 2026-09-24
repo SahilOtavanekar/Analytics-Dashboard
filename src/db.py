@@ -50,14 +50,35 @@ _VISITOR_DOMAIN = (
     'QUERY_PARAMETERS:"amp;email"::STRING, \'\')), \'@\', 2)'
 )
 
-# The two halves are named separately because Campaign Analytics keeps one and drops the
-# other - see table_fqn(keep_own_campaigns=True). Everywhere else applies both.
+# Internal traffic also arrives as a HOST: events fired from a developer's machine, where
+# the page being viewed is localhost. Measured over a 30-day window: 14,208 such rows across
+# 188 sessions, and only 6,664 of them sit on the demand_ai tenant - the other 7,544 rows,
+# 68 sessions, 34 campaigns and 24 tenants are localhost traffic recorded against CUSTOMER
+# tenants, which neither of the rules above can reach. One of them ranked "127.0.0.1/cd-6912"
+# among the real pages of a customer campaign.
+#
+# Deliberately NOT extended to a row with no host at all. PARSE_URL returns nothing for
+# about:srcdoc and for a null SEARCH_URL, and COALESCE turns both into '' - 6,101 rows in the
+# same window, 2,362 of them `track` events that are ordinary activity. Dropping those would
+# cost real data to remove an artefact, so "" is left in and only the two loopback spellings
+# are named. src/queries.py:_REAL_PAGE still excludes the hostless rows from the campaign
+# Pages section, where they are pages rather than events and a blank label is meaningless.
+# Public, and imported by src/queries.py rather than restated there. Both modules need to
+# agree on what a page's host IS: this module uses it to drop localhost rows table-wide, and
+# queries.py builds _PAGE_URL and _REAL_PAGE on the same expression. Two copies of one string
+# is exactly the drift this codebase keeps correcting - they would not fail, they would
+# quietly disagree about which rows are localhost.
+PAGE_HOST = "COALESCE(PARSE_URL(SEARCH_URL, 1):host::STRING, '')"
+_HOST_IS_EXTERNAL = f"{PAGE_HOST} NOT IN ('localhost', '127.0.0.1')"
+
+# The halves are named separately because Campaign Analytics keeps one and drops the
+# others - see table_fqn(keep_own_campaigns=True). Everywhere else applies all three.
 _TENANT_IS_EXTERNAL = f"COALESCE(PROPERTIES:tenant_id::STRING, '') <> '{INTERNAL_TENANT}'"
 _VISITOR_IS_EXTERNAL = (
     f"NOT (COALESCE({_VISITOR_DOMAIN}, '') ILIKE '%demandai%'"
     f" OR COALESCE({_VISITOR_DOMAIN}, '') ILIKE '%demand-ai%')"
 )
-_INTERNAL_PREDICATE = f"{_TENANT_IS_EXTERNAL} AND {_VISITOR_IS_EXTERNAL}"
+_INTERNAL_PREDICATE = f"{_TENANT_IS_EXTERNAL} AND {_VISITOR_IS_EXTERNAL} AND {_HOST_IS_EXTERNAL}"
 
 
 def exclude_internal() -> bool:
@@ -78,12 +99,13 @@ def exclude_internal() -> bool:
 def table_fqn(keep_own_campaigns: bool = False) -> str:
     """The table every query reads from, filtered if the reader asked for it.
 
-    `keep_own_campaigns` drops only the TENANT half of the filter, keeping the visitor half.
-    Campaign Analytics passes it, and nothing else does. The reason is that the two halves
-    answer different questions, and only one of them is unwanted there:
+    `keep_own_campaigns` drops only the TENANT rule, keeping the other two. Campaign
+    Analytics passes it, and nothing else does. The reason is that the three rules answer
+    different questions, and only one of them is unwanted there:
 
         tenant_id = 'demand_ai'   whose CONTENT this is - Demand AI's own campaigns
         demandai.co visitor       who is VISITING - Demand AI staff
+        localhost host            WHERE it was served - a developer's own machine
 
     Excluding internal traffic is about keeping staff activity out of customer figures. On
     Campaign Analytics the reader is looking at a list OF campaigns, and Demand AI's own are
@@ -95,8 +117,8 @@ def table_fqn(keep_own_campaigns: bool = False) -> str:
     campaign count and session total include the demand_ai tenant while every other page's
     exclude it. See _EXCLUDE_ACTIVE_OWN in src/components.py for the wording.
 
-    Applying the filter here rather than in each WHERE clause is deliberate. All 34
-    table references in queries.py go through this function, so one substitution
+    Applying the filter here rather than in each WHERE clause is deliberate. Every
+    table reference in queries.py goes through this function, so one substitution
     reaches every KPI, chart and table - no per-query edits, no change to any
     parameter list, and no chance of a query being missed and quietly reporting
     unfiltered numbers beside filtered ones.
@@ -113,7 +135,14 @@ def table_fqn(keep_own_campaigns: bool = False) -> str:
     """
     if not exclude_internal():
         return TABLE_FQN
-    predicate = _VISITOR_IS_EXTERNAL if keep_own_campaigns else _INTERNAL_PREDICATE
+    # keep_own_campaigns drops ONLY the tenant rule. The localhost rule applies either way,
+    # because it is about where a page was served from rather than whose campaign it is: a
+    # developer loading a customer's campaign on localhost is not that campaign's audience,
+    # and half of all localhost rows sit on customer tenants where the tenant rule cannot
+    # reach them. Keeping Demand AI's own campaigns in a list of campaigns is a different
+    # question from counting a dev machine as a visit.
+    predicate = (f"{_VISITOR_IS_EXTERNAL} AND {_HOST_IS_EXTERNAL}"
+                 if keep_own_campaigns else _INTERNAL_PREDICATE)
     return f"(SELECT * FROM {TABLE_FQN} WHERE {predicate})"
 
 

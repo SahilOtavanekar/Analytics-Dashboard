@@ -21,6 +21,12 @@ NOT_A_FUNNEL = (
 
 # Kept at module level so the branch using it stays a single indented line - the
 # Snowsight editor re-indents multi-line calls inside indented blocks and breaks them.
+LEAD_PAGE_NOTE = (
+    "Those leads came from {sessions:,} sessions across {pages:,} distinct session-and-URL "
+    "combinations. The funnel above counts sessions, so a session submitting on two URLs — "
+    "including two `?asset=` variants of one page — is one there and two here."
+)
+
 CONSENT_NOTE = (
     "{consent:,} of {total:,} form submits here ({pct:.0f}%) were consent, unsubscribe or "
     "comment submissions rather than leads. They fire the same form_submit event as a real "
@@ -76,6 +82,7 @@ else:
     total_submits = float(split["LEAD_SUBMITS"]) + float(split["CONSENT_SUBMITS"])
     consent_pct = float(split["CONSENT_SUBMITS"]) / total_submits * 100 if total_submits else 0.0
     st.caption(CONSENT_NOTE.format(consent=int(split["CONSENT_SUBMITS"]), total=int(total_submits), pct=consent_pct))
+    st.caption(LEAD_PAGE_NOTE.format(sessions=int(split["LEAD_SESSIONS"]), pages=int(split["LEAD_PAGE_SUBMITS"])))
     leads = forms[forms["FORM_KIND"] == "Lead form"]
     if leads.empty:
         st.info("No lead-form submissions in this date range.")

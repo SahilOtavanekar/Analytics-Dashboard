@@ -24,7 +24,7 @@ populated from May 2026 onward. The default 30-day window is unaffected; a range
 reaching into 2025 is not.
 """
 
-from src.db import table_fqn
+from src.db import PAGE_HOST, table_fqn
 
 # A page view is EVENT_TYPE = 'page' OR a name of "page visit". Both halves matter:
 # the ~3.4M unnamed events are all type 'page', so type catches them; and 107 events
@@ -69,13 +69,34 @@ _COOKIE_FORM = "COALESCE(PROPERTIES:form_id::STRING, '') = 'cookie-form'"
 # would roughly halve the reported rate everywhere - too large a move to make on an inference
 # about what the form is. That one needs a product answer.
 _FORM_ID = "LOWER(COALESCE(PROPERTIES:form_id::STRING, ''))"
+#
+# daiContactForm and rsrchGateForm are Demand AI's own contact and research-gate forms -
+# excluded on request. They are named ALMOST in full rather than by a short word, which is
+# a deliberate departure from the four patterns above, because a short word over-matches
+# here where it did not there. Measured across all 38 form_id spellings in the data:
+#
+#   '%contact%'  would also take contact-form - 37 events, a different form that predates
+#                daiContactForm and was not asked for
+#   '%dai%'      would also take daiCareersForm (69 events), daiDemoForm (15) and dai-form (2)
+#   '%gate%'     matches nothing else today, but is a single common word and one new
+#                "gated-content-form" would silently join the exclusion
+#
+# The trailing 'form' is left inside the pattern so ngd-user-data-form -> ngd-user-data-formss
+# style suffix drift is still caught. A HYPHENATED respelling (dai-contact-form) would not be:
+# that is the known failure mode of matching ids at all, and it is why this list is checked
+# against the data rather than trusted - see the spelling families above.
 _NOT_A_LEAD_FORM = (
     f"({_FORM_ID} LIKE '%cookie%'"
     f" OR {_FORM_ID} LIKE '%consent%'"
     f" OR {_FORM_ID} LIKE '%unsubscribe%'"
-    f" OR {_FORM_ID} LIKE '%comment%')"
+    f" OR {_FORM_ID} LIKE '%comment%'"
+    f" OR {_FORM_ID} LIKE '%daicontactform%'"
+    f" OR {_FORM_ID} LIKE '%rsrchgateform%')"
 )
 _LEAD_SUBMIT = f"({_NORM} = 'form submit' AND NOT {_NOT_A_LEAD_FORM})"
+
+# Counted at session+page grain too - see _LEAD_PAGE_KEY, defined after _PAGE_URL
+# because it depends on it and module-level f-strings resolve at import.
 
 # A consent decision, recorded TWO different ways - which is how half of it stayed hidden.
 # ACCEPTING fires form_submit with form_id='cookie-form'. REJECTING fires `clicked` on a button
@@ -107,8 +128,8 @@ _ENGAGED_EVENT = f"(NOT {_PAGE_VIEW} AND NOT {_CONSENT_EVENT})"
 # care that a click landed on a <li>.
 #
 # `visited` is mapped by its top-level asset rather than left to fall through. Untouched it
-# rendered as "Visited", the same word as the funnel's first stage but meaning something else
-# entirely - 1,127 sessions across 6 campaigns, and every one of them carries an asset and a
+# rendered as "Visited", which read as a page view rather than a click - 1,127 sessions across
+# 6 campaigns, and every one of them carries an asset and a
 # title, so it belongs with the content clicks.
 # Order matters. Every key was enumerated by flattening OBJECT_KEYS(PROPERTIES:attributes)
 # rather than guessed, after a first attempt that tested only `asset` and dropped 37 of one
@@ -143,10 +164,83 @@ _ACTION_LABEL = f"""
 # one URL column populated across the whole history, and despite its name it holds
 # the current page URL. Query strings are stripped so "?asset=..." variants of the
 # same page don't rank as separate rows.
-_PAGE_URL = (
-    "COALESCE(PARSE_URL(SEARCH_URL, 1):host::STRING, '') || '/' || "
-    "COALESCE(PARSE_URL(SEARCH_URL, 1):path::STRING, '')"
+# Imported from src.db rather than restated: that module drops localhost rows when the
+# internal-traffic filter is on, and this one decides which rows are pages. They have to
+# mean the same thing by "host".
+_PAGE_HOST = PAGE_HOST
+_PAGE_PATH = "COALESCE(PARSE_URL(SEARCH_URL, 1):path::STRING, '')"
+_PAGE_URL = f"{_PAGE_HOST} || '/' || {_PAGE_PATH}"
+
+# Kept so one campaign's report can hand back a URL that actually resolves when pasted.
+# NOT hardcoded to https, which was the tempting shortcut: measured over 30 days of campaign
+# page views, 1,538,392 are https but 13,344 are http, so a hardcoded scheme would hand out a
+# wrong address for every one of those. Taken per page with MODE rather than globally, because
+# the scheme belongs to the page, not to the dataset.
+_PAGE_SCHEME = "COALESCE(PARSE_URL(SEARCH_URL, 1):scheme::STRING, 'https')"
+
+# localhost, 127.0.0.1 and a MISSING host are development and iframe artefacts rather than
+# pages. Seen on a customer campaign in the drill-down: "127.0.0.1/cd-6912" ranked among real
+# pages, and an "about:srcdoc" iframe arrived with no host at all, rendering as a bare "/srcdoc".
+# _SOURCE_GROUP already buckets these same hosts out of referrer ranking; this is that rule
+# applied to page identity.
+#
+# Scoped to the campaign drill-down on purpose. Pages & Sources counts them, and changing what
+# that page reports is a separate decision from deciding what belongs in one campaign's report.
+_REAL_PAGE = f"({_PAGE_HOST} NOT IN ('localhost', '127.0.0.1') AND {_PAGE_HOST} <> '')"
+
+# The same lead submits, counted at SESSION + PAGE grain. Reported ALONGSIDE the
+# session-grain count, never replacing it: both funnels state a subset of the stage above
+# them, and a stage counting session-pages could exceed the sessions it is drawn from.
+#
+# A session submitting the same form twice counts once; a session submitting on two
+# different pages counts twice.
+#
+# The URL is the WHOLE SEARCH_URL, query string included, with only the email parameter
+# masked out - NOT _PAGE_URL. This reverses an earlier decision here, and the reversal was
+# settled by measurement rather than by argument, so the measurement is recorded:
+#
+#   SESSION_ID + _PAGE_URL   346     the old key
+#   SESSION_ID + SEARCH_URL  356     raw
+#   SESSION_ID + SEARCH_URL  356     with email masked, as below
+#
+# Masking the address changes the count by ZERO, which is what makes this safe. The old
+# comment argued that keying on the raw URL "would make the count depend on WHO visited
+# rather than on what they did" - true in principle, and empty in this data: not one
+# session+page pair differs only by its email value. The ten extra rows come from `asset`
+# (89 occurrences on lead submits, against 190 for email), so they are one page serving
+# different content - a genuinely distinct submit context, which is the thing being counted.
+#
+# So the privacy objection is answered by construction rather than traded away: no address
+# can enter the key, because the parameter is replaced before the key is built. Both
+# spellings are covered - `email` and the HTML-entity-mangled `amp;email` the data also
+# carries (see the _EMAIL COALESCE for the same pair).
+#
+# NOTE this key is now the one place a page is NOT identified by _PAGE_URL. Page IDENTITY
+# is still host+path with the query string stripped, everywhere - see _PAGE_URL and the
+# campaign_pages_sql docstring, both of which still hold. The difference is that those
+# produce a LABEL that is displayed, where this produces a key that is only ever counted.
+#
+# Built as ONE concatenated key rather than COUNT(DISTINCT SESSION_ID, URL). That form
+# drops any row where either expression is NULL, which would silently discard every lead
+# submit with no URL at all - the same trap the email COALESCE avoids in db.py. NULLIF
+# catches the empty string, and the COALESCE keeps those submits under one visible
+# sentinel rather than deleting them. The sentinel tested is '' and no longer '/': the
+# slash was what _PAGE_URL yielded for an absent URL, and a raw SEARCH_URL yields NULL or
+# an empty string instead, so the guard had to move with the expression.
+#
+# SESSION_ID::STRING before the COALESCE, not after. The column is NUMBER(38,0), so
+# COALESCE(SESSION_ID, '(no session)') resolves to NUMBER and Snowflake then tries to read
+# the sentinel as a number: "100038 (22018): Numeric value '(no session)' is not recognized".
+# It only fires when the fallback is actually reached - a lead submit whose SESSION_ID is
+# NULL - so a 30-day window is fine and any window crossing the Nov-2025 session-capture
+# boundary is not. That is two of the five sidebar presets, and it took out the whole
+# campaign drill-down rather than one figure.
+_LEAD_PAGE_EXPR = "REGEXP_REPLACE(SEARCH_URL, '([?&](amp;)?email=)[^&]*', '\\\\1<redacted>')"
+_LEAD_PAGE_KEY = (
+    f"(COALESCE(SESSION_ID::STRING, '(no session)') || '|'"
+    f" || COALESCE(NULLIF({_LEAD_PAGE_EXPR}, ''), '(no page)'))"
 )
+_LEAD_PAGE_SUBMITS = f"COUNT(DISTINCT IFF({_LEAD_SUBMIT}, {_LEAD_PAGE_KEY}, NULL))"
 
 _REF_HOST = "PARSE_URL(REFERER_URL, 1):host::STRING"
 
@@ -251,6 +345,7 @@ def executive_kpis_sql() -> str:
                 IFF({_ASSET} IS NOT NULL, 1, 0) AS SAW_CONTENT,
                 IFF({_AI_REQUEST}, 1, 0) AS USED_AI,
                 IFF({_LEAD_SUBMIT}, 1, 0) AS CONVERTED,
+                IFF({_LEAD_SUBMIT}, {_LEAD_PAGE_KEY}, NULL) AS LEAD_PAGE,
                 IFF({_VALID_EMAIL}, 1, 0) AS IDENTIFIED,
                 IFF({_VALID_EMAIL}, {_DOMAIN}, NULL) AS COMPANY
             FROM {table_fqn()}
@@ -276,6 +371,9 @@ def executive_kpis_sql() -> str:
             -- Counted over raw rows, matching audience_kpis_sql exactly, so the two
             -- pages cannot disagree on how many companies were reached.
             (SELECT COUNT(DISTINCT COMPANY) FROM raw) AS COMPANIES,
+            -- Counted over raw rows for the same reason COMPANIES is: the grain is
+            -- finer than one row per session, so it cannot come from `sess`.
+            (SELECT COUNT(DISTINCT LEAD_PAGE) FROM raw) AS LEAD_PAGE_SUBMITS,
             COALESCE((AVG(CONVERTED) * 100)::FLOAT, 0) AS LEAD_CONV_PCT
         FROM sess
     """
@@ -392,7 +490,8 @@ def consent_split_kpis_sql() -> str:
             COUNT(DISTINCT IFF({_LEAD_SUBMIT}, SESSION_ID, NULL)) AS LEAD_SESSIONS,
             COUNT(DISTINCT IFF({_NOT_A_LEAD_FORM}, SESSION_ID, NULL)) AS CONSENT_SESSIONS,
             COUNT(DISTINCT IFF({_LEAD_SUBMIT}, MESSAGE_ID, NULL)) AS LEAD_SUBMITS,
-            COUNT(DISTINCT IFF({_NOT_A_LEAD_FORM}, MESSAGE_ID, NULL)) AS CONSENT_SUBMITS
+            COUNT(DISTINCT IFF({_NOT_A_LEAD_FORM}, MESSAGE_ID, NULL)) AS CONSENT_SUBMITS,
+            {_LEAD_PAGE_SUBMITS} AS LEAD_PAGE_SUBMITS
         FROM {table_fqn()}
         WHERE EVENT_TS::DATE BETWEEN ? AND ?
           AND {_NORM} = 'form submit'
@@ -1376,7 +1475,7 @@ def _campaign_events_cte() -> str:
     """Every column the drill-down needs, for one campaign, read in a single scan."""
     return f"""
         SELECT
-            SESSION_ID, MESSAGE_ID, EVENT_TS, EVENT_NAME, EVENT_TYPE, TIMEZONE,
+            SESSION_ID, MESSAGE_ID, EVENT_TS, EVENT_NAME, EVENT_TYPE, TIMEZONE, REQUEST_IP,
             SEARCH_URL, REFERER_URL,
             PROPERTIES:campaign_name::STRING AS NAME,
             {_TENANT} AS TENANT,
@@ -1385,6 +1484,7 @@ def _campaign_events_cte() -> str:
             PROPERTIES:page_visited AS PAGE_VISITED,
             IFF({_AI_REQUEST}, 1, 0) AS IS_AI,
             IFF({_LEAD_SUBMIT}, 1, 0) AS IS_LEAD,
+            IFF({_LEAD_SUBMIT}, {_LEAD_PAGE_KEY}, NULL) AS LEAD_PAGE,
             IFF({_COOKIE_FORM}, 1, 0) AS IS_COOKIE,
             -- The two halves of a consent decision, kept apart because they answer different
             -- questions and were previously in two unrelated places on the page.
@@ -1429,7 +1529,10 @@ def campaign_detail_kpis_sql() -> str:
                 MAX(IFF(ASSET IS NOT NULL, 1, 0)) AS SAW_CONTENT,
                 MAX(IFF({_ADDR_VALID}, 1, 0)) AS IDENTIFIED,
                 COUNT(DISTINCT MESSAGE_ID) AS EVENTS,
-                DATEDIFF('second', MIN(EVENT_TS), MAX(EVENT_TS)) AS SECS
+                DATEDIFF('second', MIN(EVENT_TS), MAX(EVENT_TS)) AS SECS,
+                -- MODE, not MIN: 2.8% of sessions carry more than one REQUEST_IP, and the
+                -- dominant address describes the session better than an arbitrary one.
+                MODE(REQUEST_IP) AS IP
             FROM ev
             WHERE SESSION_ID IS NOT NULL
             GROUP BY SESSION_ID
@@ -1448,9 +1551,16 @@ def campaign_detail_kpis_sql() -> str:
                 COUNT(DISTINCT ASSET) AS ASSETS,
                 COUNT(DISTINCT IFF({_ADDR_VALID}, ADDR, NULL)) AS PEOPLE,
                 COUNT(DISTINCT IFF({_ADDR_VALID}, SPLIT_PART(ADDR, '@', 2), NULL)) AS COMPANIES,
+                COUNT(DISTINCT LEAD_PAGE) AS LEAD_PAGE_SUBMITS,
                 COUNT(DISTINCT IFF(IS_AI = 1, MESSAGE_ID, NULL)) AS AI_EVENTS,
                 COUNT(DISTINCT IFF(PAGE_VISITED IS NOT NULL, MESSAGE_ID, NULL)) AS PDF_EVENTS,
                 COUNT(DISTINCT IFF(COALESCE(REFERER_URL, '') <> '', REFERER_URL, NULL)) AS REFERRERS,
+                -- The gate for the Pages section, counted here rather than asked for separately:
+                -- collect() needs to know whether the section has anything in it BEFORE deciding
+                -- to query it, and the CTE already projects SEARCH_URL, EVENT_NAME and EVENT_TYPE,
+                -- so both expressions resolve against it without a second scan.
+                COUNT(DISTINCT IFF({_PAGE_VIEW} AND {_REAL_PAGE}, {_PAGE_URL}, NULL)) AS PAGES,
+                COUNT(DISTINCT IFF({_PAGE_VIEW} AND {_REAL_PAGE}, MESSAGE_ID, NULL)) AS PAGE_VIEWS,
                 COUNT(DISTINCT TIMEZONE) AS TIMEZONES
             FROM ev
         ), sess_agg AS (
@@ -1468,8 +1578,21 @@ def campaign_detail_kpis_sql() -> str:
                 COALESCE((AVG(SECS) / 60.0)::FLOAT, 0) AS MEAN_DURATION_MINUTES,
                 COALESCE(SUM(IFF(SECS = 0, 1, 0)), 0) AS INSTANT_SESSIONS
             FROM sess
+        ), ip_agg AS (
+            -- How concentrated is this campaign's traffic on one network address? Sessions
+            -- are the reach figure everything else divides by, and a session count says
+            -- nothing about how many PLACES it came from: sas-kr-ai reports 271 sessions,
+            -- of which 266 share a single address. Measured across 169 campaigns with 50+
+            -- sessions, the top address takes a median 20% but reaches 98% on a handful -
+            -- the distribution is bimodal, not a gradient, so a threshold is meaningful here.
+            --
+            -- An address is NOT a person: a corporate NAT hides a whole office behind one.
+            -- That is precisely why this is worth stating rather than charting - it bounds
+            -- how the session count may be read, and claims nothing about who.
+            SELECT COUNT(*) AS DISTINCT_IPS, COALESCE(MAX(N), 0) AS TOP_IP_SESSIONS
+            FROM (SELECT IP, COUNT(*) AS N FROM sess WHERE IP IS NOT NULL GROUP BY IP)
         )
-        SELECT * FROM ev_agg CROSS JOIN sess_agg
+        SELECT * FROM ev_agg CROSS JOIN sess_agg CROSS JOIN ip_agg
     """
 
 
@@ -1557,6 +1680,80 @@ def campaign_duration_bands_sql() -> str:
     """
 
 
+# Every EVENT on a campaign sorted into exactly one of three buckets, for the mix donut that
+# replaced the Events KPI card. Ordered CASE, first match wins, and the last arm is a
+# catch-all, so the three are exhaustive by construction - there is no "Other" to leak into.
+#
+# Counted per event, not per session. A session that viewed 40 pages contributes 40 here. The
+# DISTINCT is deduplicating the ~1.29M byte-identical duplicate rows, not sessions.
+#
+# A session-grain version was built and then reverted. It required assigning each session to
+# the FURTHEST thing it did - otherwise one session sits in several slices and they sum past
+# 100% - and that made the ring a restatement of the Engagement and conversion funnel
+# immediately below it, in a geometry that implies exclusivity where the funnel implies
+# containment. Event grain is what decomposes the card this replaced.
+#
+# Form submit is tested FIRST and holds every form: lead, cookie-consent, unsubscribe and
+# comment. A deliberate simplification for this chart; the lead/consent split Conversion
+# depends on is untouched in _LEAD_SUBMIT.
+#
+# Clicks is the catch-all, so it carries `clicked`, `button clicked`, `visited`, `download`,
+# `consent-response` and `pdf-page-visit` as well as plain clicks.
+#
+# ml_request is EXCLUDED entirely rather than folded into Clicks: ~1.27M of them against the
+# other buckets, and calling an AI request a click would have made the largest slice a
+# misnomer. The ring therefore sums to FEWER events than the EVENTS KPI, so whatever renders
+# it has to say so - see campaign_detail.
+#
+# Negating _AI_REQUEST is NULL-safe only because that predicate is itself COALESCE-guarded
+# (COALESCE(PROPERTIES:ml_request::STRING, '') = 'true'). A bare NOT over a nullable column
+# would return NULL for every unnamed page event and silently delete the Page visit bucket.
+EVENT_BUCKET_ORDER = ("Page visit", "Clicks", "Form submit")
+
+_EVENT_BUCKET = f"""
+        CASE
+            WHEN COALESCE({_NORM}, '') = 'form submit' THEN 'Form submit'
+            WHEN {_PAGE_VIEW} THEN 'Page visit'
+            ELSE 'Clicks'
+        END"""
+
+
+def campaign_event_mix_sql() -> str:
+    """One campaign's events split three exclusive ways. Covers EVERY event.
+
+    Same three binds as every other campaign query - start, end, campaign id - so it shares
+    their cache behaviour and parameter list.
+
+    This used to carry `AND NOT {_AI_REQUEST}`, and that was removed rather than tuned. Two
+    reasons, both measured:
+
+    It silently emptied the chart. PROPERTIES:ml_request is all-or-nothing per campaign - of
+    594 campaigns in a 30-day window, 114 have the flag on EVERY event and none have it on
+    some-but-not-all. So the exclusion did not trim those campaigns, it deleted them: zero
+    rows, no donut, no explanation, 445,994 events hidden. The caption that was meant to
+    cover the gap ("a further N AI requests are excluded") could never fire, because N is
+    either zero or everything.
+
+    And the flag does not mark what its name suggests. ml_request='true' sits on 26.4% of
+    plain `page visit` events, 33.5% of pdf-page-visit, 24.1% of clicked and 29.2% of
+    form_submit - an even quarter-to-a-third of every event type, which is a property of the
+    SURFACE rather than of a request. A page view does not call a model. The genuine
+    "asked a question" action is attributes:category='query' and numbers 983 events against
+    446,305 flagged. See _AI_REQUEST, which every AI figure on the dashboard still uses.
+
+    The three buckets are exclusive and exhaustive, so they now sum to the campaign's total
+    event count - which is what lets the donut put that total in its hole honestly.
+    """
+    return f"""
+        SELECT
+            {_EVENT_BUCKET} AS BUCKET,
+            COUNT(DISTINCT MESSAGE_ID) AS EVENTS
+        FROM {_campaign_table()}
+        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+        GROUP BY 1
+    """
+
+
 def campaign_funnel_sql() -> str:
     """The same three nesting stages as page 6, scoped to one campaign."""
     return f"""
@@ -1570,11 +1767,11 @@ def campaign_funnel_sql() -> str:
               AND SESSION_ID IS NOT NULL
             GROUP BY SESSION_ID
         )
-        SELECT 1 AS STAGE_ORDER, 'Visited' AS STAGE, COUNT(*) AS SESSIONS FROM sess
+        SELECT 1 AS STAGE_ORDER, 'Page visits' AS STAGE, COUNT(*) AS SESSIONS FROM sess
         UNION ALL
-        SELECT 2, 'Took an action', COALESCE(SUM(DID_ACT), 0) FROM sess
+        SELECT 2, 'Page clicks', COALESCE(SUM(DID_ACT), 0) FROM sess
         UNION ALL
-        SELECT 3, 'Submitted a lead form', COALESCE(SUM(DID_CONVERT), 0) FROM sess
+        SELECT 3, 'Submitted a form', COALESCE(SUM(DID_CONVERT), 0) FROM sess
         ORDER BY STAGE_ORDER
     """
 
@@ -1632,6 +1829,95 @@ def campaign_geo_sql(timezone_limit: int = 10) -> str:
         SELECT * FROM region
         UNION ALL SELECT * FROM tz
         ORDER BY KIND, SESSIONS DESC
+    """
+
+
+def campaign_pages_sql(limit: int = 12) -> str:
+    """Which pages this campaign's sessions actually landed on, by reach.
+
+    Sits immediately before Content on every surface, and the pair is deliberate: pages are
+    the container, assets are the content opened on them.
+
+    Page identity is {_PAGE_URL} - host and path only - exactly as Pages & Sources derives it,
+    so the two agree about what "a page" is. SEARCH_URL is the one URL column populated across
+    the whole history; PATH and TAB_URL were retired in the Mar-Apr 2026 tracking swap.
+
+    STRIPPING THE QUERY STRING IS LOAD-BEARING HERE, not tidiness. QUERY_PARAMETERS:email rides
+    in the query string on personalised links, so grouping on raw SEARCH_URL would put
+    individual email addresses into a table that is charted on screen, written into a
+    downloadable PDF and mailed as an HTML body. Every other identity figure in this module is
+    aggregated to a domain and floored at IDENTITY_FLOOR; a page list grouped on the raw URL
+    would walk straight around both. Do not "fix" this by grouping on SEARCH_URL to separate
+    "?asset=..." variants.
+
+    THE LABEL IS THE PATH, not the title and not the whole URL, and that was measured rather
+    than assumed. PROPERTIES:title looked like the obvious label and is what top_pages_sql uses,
+    but on SG0626-015 its 17 distinct page URLs carry exactly 2 distinct titles - the title is
+    set per campaign there, not per page. Labelling by it drew TWO bars, the taller one summing
+    thousands of sessions from a dozen different pages, while the caption beside it still read
+    "17 pages": a nominal y encoding sums rows that share a label, so grouping correctly on the
+    URL is necessary but not sufficient. The full URL fixes the merge but not the reading - every
+    row of a campaign shares a host, so a host-first label truncates in the axis before it
+    reaches anything that distinguishes it ("micrositesdai.s...", four times over).
+
+    The path is the part that differs, so it leads, and the host rides in the tooltip and the
+    table instead. Where two hosts genuinely share a path the label falls back to the full URL,
+    which is the group key and therefore cannot collide - the same guarantee campaign_bar gets
+    by appending an ID to the 16 shared campaign names. Done here rather than in the chart so
+    the PDF and the HTML table inherit it instead of each repeating the check.
+
+    URL is returned ALONGSIDE that label, absolute and with its own scheme, because a label is
+    for reading and an address is for following, and "/logitech/" is neither here nor there:
+    it cannot be pasted anywhere useful. The screen renders it as a link in the table and the
+    HTML report as an anchor. The PDF does not - src/minipdf.py writes no link annotations -
+    so there the host stays its own column and the address is reassembled by eye.
+
+    PCT_OF_SESSIONS divides by ALL of the campaign's sessions, matching campaign_actions_sql and
+    the Content section rather than by sessions that had a resolvable page view - one denominator
+    across the report. The consequence is that the column sums past 100%, because one session
+    visits several pages. That is the same overlap action reach has, and it is stated on the page.
+
+    The denominator comes from a scalar subquery over the same base CTE rather than a second
+    scan, which also keeps this at three parameters like every other drill-down query.
+    """
+    return f"""
+        WITH base AS (
+            SELECT SESSION_ID, MESSAGE_ID, EVENT_NAME, EVENT_TYPE, SEARCH_URL,
+                   {_PAGE_SCHEME} AS SCHEME
+            FROM {_campaign_table()}
+            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+              AND SESSION_ID IS NOT NULL
+        ), all_sessions AS (
+            SELECT COUNT(DISTINCT SESSION_ID) AS N FROM base
+        ), grouped AS (
+            SELECT
+                {_PAGE_HOST} AS HOST,
+                '/' || {_PAGE_PATH} AS PATH,
+                {_PAGE_URL} AS PAGE_URL,
+                MODE(SCHEME) AS SCHEME,
+                COUNT(DISTINCT SESSION_ID) AS SESSIONS,
+                COUNT(DISTINCT MESSAGE_ID) AS VIEWS,
+                ROUND(COUNT(DISTINCT MESSAGE_ID) * 1.0
+                      / NULLIF(COUNT(DISTINCT SESSION_ID), 0), 1) AS VIEWS_PER_SESSION,
+                COALESCE((COUNT(DISTINCT SESSION_ID) * 100.0
+                    / NULLIF((SELECT N FROM all_sessions), 0))::FLOAT, 0) AS PCT_OF_SESSIONS
+            FROM base
+            WHERE {_PAGE_VIEW}
+              AND SEARCH_URL IS NOT NULL
+              AND {_REAL_PAGE}
+            GROUP BY 1, 2, 3
+        )
+        SELECT
+            IFF(COUNT(*) OVER (PARTITION BY PATH) > 1, PAGE_URL, PATH) AS PAGE,
+            SESSIONS,
+            VIEWS,
+            VIEWS_PER_SESSION,
+            PCT_OF_SESSIONS,
+            HOST,
+            SCHEME || '://' || HOST || PATH AS URL
+        FROM grouped
+        ORDER BY SESSIONS DESC
+        LIMIT {limit}
     """
 
 

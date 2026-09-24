@@ -118,15 +118,17 @@ _EXCLUDE_STORE = EXCLUDE_INTERNAL_KEY
 _EXCLUDE_WIDGET = "exclude_internal_widget"
 _EXCLUDE_LABEL = "Exclude internal traffic"
 _EXCLUDE_HELP = (
-    "Removes Demand AI's own traffic on two counts: content under the demand_ai tenant "
-    "(the marketing site, localhost and preview builds), and visits from demandai.co "
-    "addresses - staff browsing customers' content. Applies to every page at once."
+    "Removes Demand AI's own traffic on three counts: content under the demand_ai tenant "
+    "(the marketing site and preview builds), visits from demandai.co addresses - staff "
+    "browsing customers' content - and anything served from localhost or 127.0.0.1, which "
+    "is a developer's machine rather than a visit. Applies to every page at once."
 )
 # Rendered in the page body, not the sidebar, so a screenshot of any page carries the
 # caveat with it. A filtered figure that looks unfiltered is the real risk here.
 _EXCLUDE_ACTIVE = (
     ":material/filter_alt: **Internal traffic excluded.** Figures on this page omit Demand AI's "
-    "own tenant. Turn this off in the sidebar to see all traffic."
+    "own tenant, staff visitors and anything served from localhost. Turn this off in the "
+    "sidebar to see all traffic."
 )
 # Campaign Analytics keeps Demand AI's own campaigns even with the filter on, so it must not
 # show the banner above - that one asserts the demand_ai tenant is omitted, which would be
@@ -135,10 +137,10 @@ _EXCLUDE_ACTIVE = (
 # than either alone. See db.table_fqn(keep_own_campaigns=True).
 _EXCLUDE_ACTIVE_OWN = (
     ":material/filter_alt: **Internal traffic excluded, except Demand AI's own campaigns.** "
-    "Visits from demandai.co addresses are removed from every figure, but campaigns running on "
-    "the demand_ai tenant are still ranked and openable here - so this page's campaign and "
-    "session totals include them where other pages' do not. Turn this off in the sidebar to "
-    "see all traffic."
+    "Visits from demandai.co addresses and anything served from localhost are removed from "
+    "every figure, but campaigns running on the demand_ai tenant are still ranked and openable "
+    "here - so this page's campaign and session totals include them where other pages' do not. "
+    "Turn this off in the sidebar to see all traffic."
 )
 
 # Quick ranges. Whole calendar months, not day counts: six months before 31 August is
