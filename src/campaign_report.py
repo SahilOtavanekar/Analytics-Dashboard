@@ -32,8 +32,10 @@ from __future__ import annotations
 
 import datetime as dt
 import html
+import math
 
 from src.queries import (
+    EVENT_BUCKET_ORDER,
     campaign_ai_sql,
     campaign_assets_sql,
     campaign_companies_sql,
@@ -222,6 +224,20 @@ _PDF_TEAL = (5, 110, 110)
 _PDF_RULE = (230, 236, 236)
 _PDF_BAND = (242, 247, 247)
 _PAGE_W = 180.0  # A4 width less both margins
+
+# The first three slots of theme.CATEGORICAL_LIGHT, as RGB, and deliberately a COPY rather
+# than an import: src/theme.py resolves its palette through st.context.theme, which is a
+# Streamlit call, and this module is verified Streamlit-free so a scheduled job can render a
+# report with no script run behind it. The light slots are the right ones regardless - a PDF
+# has one surface and it is white, so there is no dark variant to resolve to.
+#
+# Indexed by position in EVENT_BUCKET_ORDER, never by rank, so a campaign whose clicks
+# outnumber its page visits does not repaint both slices. Same rule as donut_chart's `order`.
+_PDF_MIX_HUES = (
+    (29, 148, 133),   # #1d9485 teal   - Page visit
+    (145, 55, 151),   # #913797 magenta - Clicks
+    (169, 136, 27),   # #a9881b olive   - Form submit
+)
 
 # fpdf2's core fonts are latin-1 only and raise outright on anything else, so text is folded
 # rather than left to blow up mid-report. The typographic characters this codebase uses in
@@ -650,6 +666,155 @@ def _pdf_table(pdf, title, frame, label_col, value_col, value_head, extra=None, 
         pdf.ln()
 
 
+def _pdf_card_at(pdf, x, y, w, h, label, value) -> None:
+    """One bordered KPI card at an absolute position, leaving the cursor where it found it.
+
+    Split out of _pdf_cards so the mix row can place cards in a column beside the ring
+    instead of in _pdf_cards' full-width grid. Both call this, so a card cannot come to look
+    different depending on which layout drew it.
+    """
+    pdf.set_fill_color(*_PDF_BAND)
+    pdf.set_draw_color(*_PDF_RULE)
+    pdf.rect(x, y, w, h, style="DF")
+    pdf.set_xy(x + 2.6, y + 1.8)
+    pdf.set_font("Helvetica", "", 6.5)
+    pdf.set_text_color(*_PDF_MUTED)
+    pdf.cell(w - 5, 3.4, _safe(str(label).upper()))
+    pdf.set_xy(x + 2.6, y + 5.6)
+    pdf.set_font("Helvetica", "B", 12.5)
+    pdf.set_text_color(*_PDF_INK)
+    pdf.cell(w - 5, 6.4, _safe(value))
+    pdf.set_text_color(*_PDF_INK)
+
+
+def _pdf_donut(pdf, cx, cy, r_out, r_in, slices) -> None:
+    """A part-to-whole ring, drawn as filled annular sectors.
+
+    minipdf has no arc primitive, so each sector is one polygon: the outer edge swept
+    clockwise from the slice's start angle, then the inner edge swept back. Tracing the two
+    edges in opposite directions is what makes the hole a hole - the `f` operator fills by
+    the nonzero winding rule, so the inner loop cancels the outer one rather than filling
+    over it. Drawing a disc and then covering its middle with a white circle would look
+    identical on screen and wrong on any non-white paper or background.
+
+    Angles start at 12 o'clock and increase clockwise, matching Vega's default theta, so the
+    ring in the PDF and the ring on the page put the same slice in the same place.
+
+    `slices` is (label, value, rgb). One object per sector keeps the seams mitred.
+    """
+    total = float(sum(v for _, v, _ in slices))
+    if total <= 0:
+        return
+    angle = 0.0
+    for _label, value, rgb in slices:
+        sweep = float(value) / total * 2.0 * math.pi
+        if sweep <= 0:
+            continue
+        # ~2 degrees per segment: below that the facets show on a 34mm ring at print size.
+        steps = max(2, int(math.ceil(sweep / 0.035)))
+        outer = [(cx + r_out * math.sin(angle + sweep * j / steps), cy - r_out * math.cos(angle + sweep * j / steps)) for j in range(steps + 1)]
+        inner = [(cx + r_in * math.sin(angle + sweep * j / steps), cy - r_in * math.cos(angle + sweep * j / steps)) for j in range(steps, -1, -1)]
+        pdf.set_fill_color(*rgb)
+        pdf.polyline(outer + inner, polygon=True, style="F")
+        angle += sweep
+
+
+def _pdf_mix_row(pdf, cards, mix, total_events) -> None:
+    """The page's top row: stat cards stacked at the left, the event-mix ring at the right.
+
+    This is the one section of the report that mirrors a page layout rather than restating a
+    chart as a table, and it is here because the page moved its Events total INTO the ring's
+    hole. Printing a table instead would have left the PDF with no total at all in the place
+    the reader now looks for one.
+
+    Falls back to the plain card grid when the mix is empty or sums to zero - a campaign with
+    no bucketed events would otherwise get a blank box where the ring should be.
+    """
+    rows = []
+    if mix is not None and len(mix) and float(mix["EVENTS"].sum()) > 0:
+        by_bucket = {str(r.BUCKET): float(r.EVENTS or 0) for r in mix.itertuples()}
+        rows = [(name, by_bucket.get(name, 0.0), _PDF_MIX_HUES[i % len(_PDF_MIX_HUES)]) for i, name in enumerate(EVENT_BUCKET_ORDER) if by_bucket.get(name, 0.0) > 0]
+    if not rows:
+        _pdf_cards(pdf, cards, per_row=max(1, len(cards)))
+        return
+
+    gap = 4.0
+    left_w = (_PAGE_W - gap) / 3.0
+    right_w = _PAGE_W - left_w - gap
+    card_h = 13.5
+    box_h = 46.0
+    if pdf.get_y() + box_h + 4.0 > pdf.h - pdf.b_margin:
+        pdf.add_page()
+    top = pdf.get_y()
+    x0 = pdf.l_margin
+    for i, (label, value) in enumerate(cards):
+        _pdf_card_at(pdf, x0, top + i * (card_h + 3.0), left_w, card_h, label, value)
+
+    bx = x0 + left_w + gap
+    pdf.set_fill_color(255, 255, 255)
+    pdf.set_draw_color(*_PDF_RULE)
+    pdf.rect(bx, top, right_w, box_h, style="D")
+
+    r_out = 16.0
+    r_in = r_out * 0.6
+    cx = bx + 9.0 + r_out
+    cy = top + box_h / 2.0
+    _pdf_donut(pdf, cx, cy, r_out, r_in, rows)
+
+    # The total goes in the hole, which is the whole reason the ring replaced a KPI card.
+    #
+    # Sized to fit rather than set at a fixed point size: the hole is 19.2mm across and a
+    # seven-figure total at 11pt is wider than that. Overflow here does not clip, it draws
+    # the number straight over its own ring, so the size is stepped down until minipdf
+    # measures it as fitting. Campaign totals in this data reach seven figures.
+    shown = float(sum(v for _, v, _ in rows))
+    centre = _safe(f"{int(round(shown)):,}")
+    hole_w = r_in * 2.0 - 2.0
+    size = 11.0
+    pdf.set_font("Helvetica", "B", size)
+    while size > 5.5 and pdf.get_string_width(centre) > hole_w:
+        size -= 0.5
+        pdf.set_font("Helvetica", "B", size)
+    pdf.set_text_color(*_PDF_INK)
+    pdf.set_xy(cx - r_out, cy - 4.6)
+    pdf.cell(r_out * 2.0, 4.6, centre, align="C")
+    pdf.set_font("Helvetica", "", 5.0)
+    pdf.set_text_color(*_PDF_MUTED)
+    pdf.set_xy(cx - r_out, cy - 0.2)
+    pdf.cell(r_out * 2.0, 3.2, _safe("TOTAL EVENTS"), align="C")
+
+    # The legend carries the count and the share. Same reasoning as the page's: an arc thin
+    # enough to be unlabellable still has a swatch here, and the PDF has no tooltip to fall
+    # back on, so anything not in this list is simply not readable anywhere.
+    lx = bx + r_out * 2.0 + 15.0
+    lw = bx + right_w - 5.0 - lx
+    ly = cy - (len(rows) * 7.0) / 2.0
+    for label, value, rgb in rows:
+        pdf.set_fill_color(*rgb)
+        pdf.rect(lx, ly + 1.6, 3.0, 3.0, style="F")
+        pdf.set_font("Helvetica", "", 7.5)
+        pdf.set_text_color(*_PDF_INK)
+        pdf.set_xy(lx + 4.6, ly)
+        pdf.cell(lw - 4.6, 6.2, _safe(label))
+        share = value / shown * 100.0 if shown else 0.0
+        # A real count must never print as "0%" - see donut_chart's _legend, same rule.
+        share_txt = f"{share:.1f}%" if share >= 0.1 else "<0.1%"
+        pdf.set_text_color(*_PDF_MUTED)
+        pdf.set_xy(lx + 4.6, ly)
+        pdf.cell(lw - 4.6, 6.2, _safe(f"{int(round(value)):,}  ({share_txt})"), align="R")
+        ly += 7.0
+
+    # Only fires if the buckets stop being exhaustive. They are today - see
+    # campaign_event_mix_sql - so this is a guard against the two totals silently drifting,
+    # not a caption the reader is expected to meet.
+    missing = int(total_events) - int(round(shown))
+    pdf.set_y(top + box_h)
+    pdf.set_text_color(*_PDF_INK)
+    pdf.ln(1.0)
+    if missing > 0:
+        _pdf_note(pdf, f"{int(round(shown)):,} of this campaign's {int(total_events):,} events fall into these three buckets; {missing:,} do not.")
+
+
 def _pdf_cards(pdf, pairs, per_row: int = 3) -> None:
     """KPIs as bordered cards rather than bare text in a grid.
 
@@ -667,17 +832,7 @@ def _pdf_cards(pdf, pairs, per_row: int = 3) -> None:
             pdf.ln(h + gap)
         x = pdf.l_margin + col * (w + gap)
         y = pdf.get_y()
-        pdf.set_fill_color(*_PDF_BAND)
-        pdf.set_draw_color(*_PDF_RULE)
-        pdf.rect(x, y, w, h, style="DF")
-        pdf.set_xy(x + 2.6, y + 1.8)
-        pdf.set_font("Helvetica", "", 6.5)
-        pdf.set_text_color(*_PDF_MUTED)
-        pdf.cell(w - 5, 3.4, _safe(label.upper()))
-        pdf.set_xy(x + 2.6, y + 5.6)
-        pdf.set_font("Helvetica", "B", 12.5)
-        pdf.set_text_color(*_PDF_INK)
-        pdf.cell(w - 5, 6.4, _safe(value))
+        _pdf_card_at(pdf, x, y, w, h, label, value)
         pdf.set_xy(pdf.l_margin, y)
     pdf.ln(h + 1)
     pdf.set_text_color(*_PDF_INK)
@@ -787,14 +942,17 @@ def to_pdf(data: dict) -> bytes:
         return bytes(pdf.output())
 
     s = int(k["SESSIONS"])
-    _pdf_cards(pdf, [
+    # Two cards and the ring, matching the page exactly. The row used to hold six cards, and
+    # four of them have since come off the page: Events moved into the ring's hole, and
+    # Median duration, Engaged and Converted were dropped because each restated a figure the
+    # report already carries with its workings - Median duration in Session duration below,
+    # Engaged and Converted as the second and third stages of the Engagement funnel, where
+    # they appear as counts nested under the sessions they are a share of rather than as two
+    # bare percentages. Nothing is lost from the PDF; it stops being said twice.
+    _pdf_mix_row(pdf, [
         ("Sessions", f"{s:,}"),
-        ("Events", f"{int(k['EVENTS']):,}"),
         ("Events / session", f"{float(k['EVENTS']) / s:,.1f}"),
-        ("Median duration", duration_label(k["MEDIAN_DURATION_MINUTES"])),
-        ("Engaged", f"{pct(k['ACTED_SESSIONS'], s):.1f}%"),
-        ("Converted", f"{pct(k['LEAD_SESSIONS'], s):.2f}%"),
-    ])
+    ], data.get("event_mix"), int(k["EVENTS"]))
 
     _conc = concentration(k)
     if _conc is not None:
@@ -826,8 +984,6 @@ def to_pdf(data: dict) -> bytes:
     _funnel_note = ("Each stage is a subset of the one above it." + _consent + _leadpages) if (_consent or _leadpages) else None
     _pdf_table(pdf, "Engagement funnel", data.get("funnel"), "STAGE", "SESSIONS", "Sessions",
                note=_funnel_note)
-    _pdf_table(pdf, "Events", data.get("event_mix"), "BUCKET", "EVENTS", "Events",
-               note="AI requests are excluded from this split - they are neither a page visit, a click nor a form.")
     _pdf_table(pdf, "Where they are", data.get("regions"), "REGION", "SESSIONS", "Sessions",
                note="From the browser timezone, the only location signal in the data.")
     _pdf_table(pdf, "Accounts reached", data.get("companies"), "COMPANY", "SESSIONS", "Sessions",
@@ -912,6 +1068,14 @@ td{padding:6px 10px;border-bottom:1px solid #eef3f3;vertical-align:middle}
 td.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
 .bar{background:#056e6e;height:11px;border-radius:2px;min-width:2px}
 .barcell{width:42%}
+.mix{display:flex;flex-wrap:wrap;align-items:center;gap:22px;border:1px solid #e6ecec;
+ border-radius:6px;padding:16px 18px;margin:10px 0 8px}
+.mix .ring{flex:0 0 auto}
+.mix .leg{flex:1 1 260px;min-width:240px}
+.mix .leg table{font-size:13px}
+.mix .leg td{border-bottom:none;padding:4px 0}
+.mix .sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:8px;
+ vertical-align:-1px}
 .note{color:#546a6a;font-size:13px;margin:8px 0 0}
 .warn{background:#fdf6e3;border:1px solid #e8d9a8;border-radius:6px;padding:14px 16px;margin:18px 0}
 footer{margin-top:34px;padding-top:12px;border-top:1px solid #e6ecec;color:#546a6a;font-size:12px}
@@ -964,6 +1128,58 @@ def _table(title, frame, label_col, value_col, value_head, extra=None, note=None
     return f"<h2>{_esc(title)}</h2>{note_html}<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
 
 
+_HTML_MIX_HUES = ("#1d9485", "#913797", "#a9881b")
+
+
+def _html_donut(mix, total_events) -> str:
+    """The event-mix ring, as inline SVG with the split repeated as a legend beside it.
+
+    The legend is not decoration and not a fallback afterthought: Gmail strips inline SVG
+    from a message body, and this function's output has to work as an email as well as a
+    download. A client that drops the ring leaves a reader with the complete split in text;
+    a client that keeps it shows the same chart the page does. Neither one loses a number.
+
+    Slices are stroked arcs on one circle rather than filled paths - stroke-dasharray gives
+    the ring its hole for free, and the -90 degree rotation starts the first slice at 12
+    o'clock so it matches both donut_chart and _pdf_donut.
+    """
+    if mix is None or not len(mix) or float(mix["EVENTS"].sum()) <= 0:
+        return ""
+    by_bucket = {str(r.BUCKET): float(r.EVENTS or 0) for r in mix.itertuples()}
+    rows = [(name, by_bucket.get(name, 0.0), _HTML_MIX_HUES[i % len(_HTML_MIX_HUES)]) for i, name in enumerate(EVENT_BUCKET_ORDER) if by_bucket.get(name, 0.0) > 0]
+    if not rows:
+        return ""
+    shown = sum(v for _, v, _ in rows)
+    r = 54.0
+    circ = 2.0 * math.pi * r
+    arcs, legend, offset = [], [], 0.0
+    for label, value, hue in rows:
+        seg = value / shown * circ
+        arcs.append(f"<circle cx='80' cy='80' r='{r:g}' fill='none' stroke='{hue}' stroke-width='28' stroke-dasharray='{seg:.3f} {circ - seg:.3f}' stroke-dashoffset='{-offset:.3f}'></circle>")
+        offset += seg
+        share = value / shown * 100.0
+        share_txt = f"{share:.1f}%" if share >= 0.1 else "&lt;0.1%"
+        legend.append(f"<tr><td><span class='sw' style='background:{hue}'></span>{_esc(label)}</td><td class='n'>{int(round(value)):,}</td><td class='n'>{share_txt}</td></tr>")
+    # Same fit-to-hole rule as the PDF. The hole is 81 user units across; Helvetica digits
+    # run .556em and a comma .278em, so a seven-figure total at 24 would overrun the ring.
+    # SVG does not clip either, so this is sized down rather than left to overlap.
+    centre_txt = f"{int(round(shown)):,}"
+    em = sum(0.278 if ch == "," else 0.556 for ch in centre_txt) or 1.0
+    centre_size = min(24.0, round(74.0 / em, 1))
+    svg = ("<svg class='ring' width='160' height='160' viewBox='0 0 160 160' role='img' "
+           f"aria-label='Event mix: {_esc(', '.join(n for n, _, _ in rows))}'>"
+           f"<g transform='rotate(-90 80 80)'>{''.join(arcs)}</g>"
+           f"<text x='80' y='80' text-anchor='middle' font-size='{centre_size:g}' font-weight='600' fill='#0b1a1a'>{int(round(shown)):,}</text>"
+           "<text x='80' y='96' text-anchor='middle' font-size='8' letter-spacing='.6' "
+           "fill='#546a6a'>TOTAL EVENTS</text></svg>")
+    # See _pdf_mix_row: the buckets are exhaustive today, so this guards a drift rather than
+    # describing a known exclusion.
+    missing = int(total_events) - int(round(shown))
+    gap = f"<p class='note'>{int(round(shown)):,} of this campaign's {int(total_events):,} events fall into these three buckets; {missing:,} do not.</p>" if missing > 0 else ""
+    return (f"<div class='mix'>{svg}<div class='leg'><table><tbody>"
+            f"{''.join(legend)}</tbody></table></div></div>{gap}")
+
+
 def _kpi(label, value) -> str:
     return f"<div class='kpi'><div class='l'>{_esc(label)}</div><div class='v'>{_esc(value)}</div></div>"
 
@@ -1002,14 +1218,13 @@ def to_html(data: dict, link: str = "") -> str:
               f" &middot; active on {int(k['ACTIVE_DAYS']):,} days")
     parts.append(f"<p class='sub'>{ident}</p>")
 
+    # Same two cards and the same ring as the page and the PDF - see the note on _pdf_mix_row
+    # for why the other four cards came off rather than being kept here alone.
     parts.append("<div class='kpis'>"
                  + _kpi("Sessions", f"{s:,}")
-                 + _kpi("Events", f"{int(k['EVENTS']):,}")
                  + _kpi("Events / session", f"{float(k['EVENTS']) / s:,.1f}")
-                 + _kpi("Median duration", duration_label(k["MEDIAN_DURATION_MINUTES"]))
-                 + _kpi("Engaged", f"{pct(k['ACTED_SESSIONS'], s):.1f}%")
-                 + _kpi("Converted", f"{pct(k['LEAD_SESSIONS'], s):.2f}%")
                  + "</div>")
+    parts.append(_html_donut(data.get("event_mix"), int(k["EVENTS"])))
 
     _conc = concentration(k)
     if _conc is not None:
@@ -1028,8 +1243,6 @@ def to_html(data: dict, link: str = "") -> str:
     _leadpages = (f" Those {int(k['LEAD_SESSIONS']):,} converting sessions submitted across {int(k['LEAD_PAGE_SUBMITS']):,} distinct session-and-URL combinations.") if int(k["LEAD_PAGE_SUBMITS"]) > int(k["LEAD_SESSIONS"]) else ""
     parts.append(_table("Engagement funnel", data.get("funnel"), "STAGE", "SESSIONS", "Sessions",
                         note="Each stage is a subset of the one above it." + _leadpages))
-    parts.append(_table("Events", data.get("event_mix"), "BUCKET", "EVENTS", "Events",
-                        note="AI requests are excluded from this split - they are neither a page visit, a click nor a form."))
     parts.append(_table("Where they are", data.get("regions"), "REGION", "SESSIONS", "Sessions",
                         note="From the browser timezone, the only location signal in the data."))
     # HOST goes through _esc, unlike every other extra here: _bar_rows interpolates a

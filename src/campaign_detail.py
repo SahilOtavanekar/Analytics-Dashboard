@@ -51,9 +51,15 @@ _IDENTITY_FLOOR = IDENTITY_FLOOR
 
 # Kept at module level so the branch using it stays a single indented line - the Snowsight
 # editor re-indents multi-line calls inside indented blocks and breaks them.
+# The three buckets are exclusive and exhaustive - see campaign_event_mix_sql - so `skipped`
+# is zero and this never renders. It is kept as a drift guard: the ring's hole and the
+# Events KPI are two counts of the same thing from two queries, and if a future predicate
+# lands on one and not the other, the reader is told rather than left to notice. The old
+# wording named AI requests as the cause, which stopped being true when the AND NOT
+# _AI_REQUEST clause came out of the query.
 _MIX_NOTE = (
-    "{shown:,} events, split three ways. A further {skipped:,} AI requests are excluded from "
-    "this split - they are neither a page visit, a click nor a form."
+    "{shown:,} of this campaign's {total:,} events fall into these three buckets; "
+    "{skipped:,} do not."
 )
 
 _ABSENT = {
@@ -160,13 +166,13 @@ def render(campaign_id: str, start: dt.date, end: dt.date, data: dict | None = N
     # Engaged and Converted are deliberately NOT cards. Both were a percentage of SESSIONS,
     # and the Engagement and conversion funnel below states the same two figures as stages,
     # with the counts they are drawn from and nested so the relationship is visible. The
-    # figures are not lost - the funnel carries them, and the PDF still prints both cards.
+    # figures are not lost - the funnel carries them, on this page and in both downloads.
     #
     # The Events card used to sit beside Sessions. It is the donut now, so the total it
     # carried moves into the hole rather than being lost, labelled so it cannot be mistaken
-    # for one of the page's other totals. AI requests are excluded from the split - see
-    # campaign_event_mix_sql - so the ring sums to fewer events than the card did, and the
-    # caption states the gap rather than leaving two numbers to disagree in silence.
+    # for one of the page's other totals. The three buckets are exhaustive, so the ring sums
+    # to the same figure the card showed - see _MIX_NOTE for the guard that says so if it
+    # ever stops being true.
     mix = data.get("event_mix")
     has_mix = mix is not None and not mix.empty and float(mix["EVENTS"].sum()) > 0
     # Two cards STACKED in the left column, ring on the right. Writing both metrics into the
@@ -190,7 +196,7 @@ def render(campaign_id: str, start: dt.date, end: dt.date, data: dict | None = N
         skipped = int(k["EVENTS"]) - shown
         with chart_col.container(border=True):
             st.altair_chart(chart, width="content")
-            if skipped > 0: st.caption(_MIX_NOTE.format(shown=shown, skipped=skipped))
+            if skipped > 0: st.caption(_MIX_NOTE.format(shown=shown, total=int(k["EVENTS"]), skipped=skipped))
             with st.expander("View as table"): st.dataframe(mix, width="stretch", hide_index=True)
 
     # Qualifies the Sessions card directly above it, so it sits here rather than in Session
