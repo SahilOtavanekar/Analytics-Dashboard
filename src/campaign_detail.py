@@ -163,10 +163,12 @@ def render(campaign_id: str, start: dt.date, end: dt.date, data: dict | None = N
     # which matters here because a hand-rolled card would need its own light and dark
     # surfaces, and this file deliberately owns no colours.
     #
-    # Engaged and Converted are deliberately NOT cards. Both were a percentage of SESSIONS,
-    # and the Engagement and conversion funnel below states the same two figures as stages,
-    # with the counts they are drawn from and nested so the relationship is visible. The
-    # figures are not lost - the funnel carries them, on this page and in both downloads.
+    # Engaged and Converted are deliberately NOT cards, and the Engagement and conversion
+    # funnel that used to state the same two figures as nested stages is gone from this page
+    # too - and now from the PDF and the HTML, so no download reports them either. Both were
+    # a percentage of SESSIONS over a single campaign, which is a narrower question than it
+    # looks: the Conversion page answers it across the whole dataset, with the prior-period
+    # comparison that makes a conversion rate mean anything.
     #
     # The Events card used to sit beside Sessions. It is the donut now, so the total it
     # carried moves into the hole rather than being lost, labelled so it cannot be mistaken
@@ -215,7 +217,7 @@ def render(campaign_id: str, start: dt.date, end: dt.date, data: dict | None = N
         st.altair_chart(trend_bar(daily, "EVENT_DATE", "SESSION_COUNT", "Sessions"), width="stretch")
 
     # ------------------------------------------------------- duration (always)
-    st.markdown("##### Session quality")
+    st.markdown("##### Session duration")
     st.caption(_DURATION_NOTE.format(median=duration_label(k["MEDIAN_DURATION_MINUTES"]), mean=duration_label(k["MEAN_DURATION_MINUTES"])))
     bands = data.get("duration")
     if bands is None or bands.empty:
@@ -224,7 +226,6 @@ def render(campaign_id: str, start: dt.date, end: dt.date, data: dict | None = N
         st.altair_chart(ordered_bar(bands, "BAND", "SESSIONS"), width="stretch")
         st.caption(f"{int(k['INSTANT_SESSIONS']):,} of {sessions:,} sessions ({pct(k['INSTANT_SESSIONS'], sessions):.0f}%) contain a single event. Median {k['MEDIAN_EVENTS']:.0f} events per session.")
 
-    # ---------------------------------------------------- engagement (always)
     # --------------------------------------------------------- geography (always)
     st.markdown("##### Where they are")
     regions = data.get("regions")

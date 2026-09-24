@@ -43,7 +43,6 @@ from src.queries import (
     campaign_detail_kpis_sql,
     campaign_duration_bands_sql,
     campaign_event_mix_sql,
-    campaign_funnel_sql,
     campaign_geo_sql,
     campaign_lookup_sql,
     campaign_pages_sql,
@@ -145,7 +144,6 @@ def collect(run, campaign_id: str, start: dt.date, end: dt.date) -> dict:
     out["status"] = STATUS_OK
     out["daily"] = run(campaign_daily_sql(), params)
     out["duration"] = run(campaign_duration_bands_sql(), params)
-    out["funnel"] = run(campaign_funnel_sql(), params)
     out["event_mix"] = run(campaign_event_mix_sql(), params)
     # No "actions" key any more: the action-reach breakdown was removed from the page, the PDF
     # and the emailed body, so fetching it would be a round trip nothing reads. That takes this
@@ -946,9 +944,10 @@ def to_pdf(data: dict) -> bytes:
     # four of them have since come off the page: Events moved into the ring's hole, and
     # Median duration, Engaged and Converted were dropped because each restated a figure the
     # report already carries with its workings - Median duration in Session duration below,
-    # Engaged and Converted as the second and third stages of the Engagement funnel, where
-    # they appear as counts nested under the sessions they are a share of rather than as two
-    # bare percentages. Nothing is lost from the PDF; it stops being said twice.
+    # Engaged and Converted are not here and not anywhere else in the report: the page does
+    # not show them, and the Engagement funnel that used to carry them has been removed from
+    # this report for the same reason. Session-level conversion for the whole dataset lives
+    # on the Conversion page, which is where that question belongs.
     _pdf_mix_row(pdf, [
         ("Sessions", f"{s:,}"),
         ("Events / session", f"{float(k['EVENTS']) / s:,.1f}"),
@@ -970,20 +969,11 @@ def to_pdf(data: dict) -> bytes:
     _pdf_table(pdf, "Session duration", data.get("duration"), "BAND", "SESSIONS", "Sessions",
                note=(f"Span between a session's first and last event, not time spent reading. "
                      f"{int(k['INSTANT_SESSIONS']):,} of {s:,} sessions hold a single event."))
-    # Action reach is gone from here as well as from the page. It was a second breakdown whose
-    # rows deliberately did NOT sum to the funnel above them, and explaining that cost more than
-    # the rows paid back. The consent figures move onto the funnel, where they belong: they are
-    # the reason its second stage is lower than a reader might expect.
-    _consent = (f" Cookie banner: {int(k['CONSENT_YES_SESSIONS']):,} accepted, "
-                f"{int(k['CONSENT_NO_SESSIONS']):,} rejected - counted as neither engagement nor "
-                f"conversion.") if (int(k["CONSENT_YES_SESSIONS"]) or int(k["CONSENT_NO_SESSIONS"])) else ""
-    # Stated, not charted: the funnel counts SESSIONS and every stage must nest inside the
-    # one above it, so a session+page figure cannot become a fourth row without the bottom
-    # row being able to exceed the row it is drawn from. Shown only when the two differ.
-    _leadpages = (f" Those {int(k['LEAD_SESSIONS']):,} converting sessions submitted across {int(k['LEAD_PAGE_SUBMITS']):,} distinct session-and-URL combinations.") if int(k["LEAD_PAGE_SUBMITS"]) > int(k["LEAD_SESSIONS"]) else ""
-    _funnel_note = ("Each stage is a subset of the one above it." + _consent + _leadpages) if (_consent or _leadpages) else None
-    _pdf_table(pdf, "Engagement funnel", data.get("funnel"), "STAGE", "SESSIONS", "Sessions",
-               note=_funnel_note)
+    # Engagement funnel is gone from here because it is gone from the page. It carried the
+    # consent figures and the lead-page sentence in its note, and both go with it rather than
+    # being re-homed: neither appears on the page either, and a download that reports figures
+    # the screen does not is the exact drift this module exists to prevent. The Conversion
+    # page still owns the funnel for the whole dataset - funnel_sql, not campaign_funnel_sql.
     _pdf_table(pdf, "Where they are", data.get("regions"), "REGION", "SESSIONS", "Sessions",
                note="From the browser timezone, the only location signal in the data.")
     _pdf_table(pdf, "Accounts reached", data.get("companies"), "COMPANY", "SESSIONS", "Sessions",
@@ -1240,9 +1230,6 @@ def to_html(data: dict, link: str = "") -> str:
     # Action reach dropped here too, so the page, the PDF and the emailed body describe the same
     # sections. Leaving it in the email alone would recreate exactly the drift this module exists
     # to prevent - and collect() no longer fetches it, so there would be nothing to render.
-    _leadpages = (f" Those {int(k['LEAD_SESSIONS']):,} converting sessions submitted across {int(k['LEAD_PAGE_SUBMITS']):,} distinct session-and-URL combinations.") if int(k["LEAD_PAGE_SUBMITS"]) > int(k["LEAD_SESSIONS"]) else ""
-    parts.append(_table("Engagement funnel", data.get("funnel"), "STAGE", "SESSIONS", "Sessions",
-                        note="Each stage is a subset of the one above it." + _leadpages))
     parts.append(_table("Where they are", data.get("regions"), "REGION", "SESSIONS", "Sessions",
                         note="From the browser timezone, the only location signal in the data."))
     # HOST goes through _esc, unlike every other extra here: _bar_rows interpolates a

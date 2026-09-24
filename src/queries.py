@@ -22,6 +22,49 @@ pseudo-session spanning the range. Those rows are historical: SESSION_ID was not
 captured at all before Nov 2025 (Aug-Oct 2025 is ~100% null) and is fully
 populated from May 2026 onward. The default 30-day window is unaffected; a range
 reaching into 2025 is not.
+
+**Finding the query behind a number on screen.** Every figure is defined here, not in the
+UI, so the fastest route from "what is this number" to "here is its SQL" is to grep this
+file for the heading you can see. The headings below are the literal strings the surfaces
+render, so they match a search either way round.
+
+Campaign drill-down (`src/campaign_report.py:collect()` fetches these; the page, the PDF
+and the HTML then all render from that one dict, which is what stops them disagreeing).
+The `key` column is the name the frame carries in that dict:
+
+    heading on screen / in the PDF          builder                       key
+    --------------------------------------  ----------------------------  ------------
+    Sessions + Events / Session cards,      campaign_detail_kpis_sql      kpis
+      and the concentration note; also
+      gates every section below
+    (campaign missing / wrong window)       campaign_lookup_sql           lookup
+    Activity over time                      campaign_daily_sql            daily
+      ("Activity by day" when a range is
+       too short to draw a line)
+    Session duration                        campaign_duration_bands_sql   duration
+    the event-mix ring - no heading of       campaign_event_mix_sql        event_mix
+      its own, it sits beside the cards
+      with the event total in its hole
+    Where they are, and its                 campaign_geo_sql              regions
+      "Individual timezones" expander                                     timezones
+    Pages  /  "Pages viewed"                campaign_pages_sql            pages
+    Content  /  "Content by reach"          campaign_assets_sql           assets
+    PDF read depth                          campaign_read_depth_sql       depth
+    Accounts reached                        campaign_companies_sql        companies
+    How they arrived                        campaign_sources_sql          sources
+    External referrers                        (one query, split by KIND)  referrers
+    AI usage  /  "AI model mix"             campaign_ai_sql               ai
+
+Two builders in that section render nothing today and are called by nobody:
+`campaign_funnel_sql` (the Engagement funnel, removed from the page and therefore from both
+downloads) and `campaign_actions_sql` (the action-reach breakdown). Both are correct and
+kept so restoring either section is one line in `collect()` - but do not go looking for
+where their output appears, because it does not.
+
+The nine pages follow the same rule, one page per prefix: `top_pages_sql` and friends serve
+`pages/7_Pages_and_Sources.py`, `funnel_sql` serves `pages/6_Conversion.py`, and so on. The
+banner comments below divide the file the same way. Note that `funnel_sql` (whole dataset,
+Conversion page) and `campaign_funnel_sql` (one campaign) are different queries.
 """
 
 from src.db import PAGE_HOST, table_fqn
@@ -1508,6 +1551,10 @@ _ADDR_VALID = "ADDR LIKE '%@%.%'"
 def campaign_detail_kpis_sql() -> str:
     """One row describing the campaign, and the gate for every conditional section.
 
+    Renders: the Sessions and Events / Session cards, plus the concentration note.
+    Also GATES every other section - collect() reads its counts to decide what to fetch,
+    so a campaign with no pages or too few identified people costs no extra round trip.
+
     Deliberately one query rather than ten small ones. The page needs to know whether a
     section has any data BEFORE it decides to render it, and asking that per section
     would mean a round trip per section just to discover an empty state. Everything here
@@ -1599,6 +1646,9 @@ def campaign_detail_kpis_sql() -> str:
 def campaign_lookup_sql() -> str:
     """Does this campaign id exist, and does it have anything in the selected window?
 
+    Renders: the fallback explanation shown when a campaign exists but recorded nothing
+    in the chosen window - not a section of its own.
+
     Three parameters like every other drill-down query: start, end, campaign id.
 
     Both halves are needed because "nothing found" has two very different causes, and a
@@ -1625,7 +1675,11 @@ def campaign_lookup_sql() -> str:
 
 
 def campaign_daily_sql() -> str:
-    """Daily sessions and events for one campaign - the shape of its run."""
+    """Daily sessions and events for one campaign - the shape of its run.
+
+    Renders: "Activity over time". Falls back to a table headed "Activity by day"
+    when the range holds fewer than two days, which is too short to draw a line through.
+    """
     return f"""
         SELECT
             EVENT_TS::DATE AS EVENT_DATE,
@@ -1640,6 +1694,9 @@ def campaign_daily_sql() -> str:
 
 def campaign_duration_bands_sql() -> str:
     """Session duration in the same seven bands Session Analytics uses.
+
+    Renders: "Session duration". The page heading read Session quality until it was
+    renamed to match the PDF, so older screenshots disagree with this file.
 
     The most discriminating section per campaign, measured: ibm-ai has 2,584 of 9,306
     sessions with any duration at all and a 0s median, while snowflake-apac-ai has 8,733
@@ -1721,6 +1778,9 @@ _EVENT_BUCKET = f"""
 def campaign_event_mix_sql() -> str:
     """One campaign's events split three exclusive ways. Covers EVERY event.
 
+    Renders: the event-mix ring beside the KPI cards - the one section with no heading
+    of its own. Its total sits in the ring's hole, which is where the old Events card went.
+
     Same three binds as every other campaign query - start, end, campaign id - so it shares
     their cache behaviour and parameter list.
 
@@ -1755,7 +1815,13 @@ def campaign_event_mix_sql() -> str:
 
 
 def campaign_funnel_sql() -> str:
-    """The same three nesting stages as page 6, scoped to one campaign."""
+    """The same three nesting stages as page 6, scoped to one campaign.
+
+    Renders: NOTHING. The Engagement funnel was removed from the page, and the PDF and
+    the HTML followed it, so collect() no longer fetches this. Kept because it is correct
+    and restoring the section is one line there. Not to be confused with funnel_sql, which
+    is the Conversion page's funnel over the whole dataset and is very much live.
+    """
     return f"""
         WITH sess AS (
             SELECT
@@ -1778,6 +1844,10 @@ def campaign_funnel_sql() -> str:
 
 def campaign_actions_sql() -> str:
     """Which actions this campaign's visitors took, as reach.
+
+    Renders: NOTHING. The action-reach breakdown was removed from all three surfaces -
+    its rows deliberately did not sum to the funnel above them and explaining that cost
+    more than the rows paid back. Kept; restoring it is one line in collect().
 
     The denominator comes from a scalar subquery over the same CTE rather than a second
     scan, which also keeps this at three parameters like every other query here - the
@@ -1809,7 +1879,11 @@ def campaign_actions_sql() -> str:
 
 
 def campaign_geo_sql(timezone_limit: int = 10) -> str:
-    """Region and timezone for one campaign, one scan, split by KIND like audience_geo_sql."""
+    """Region and timezone for one campaign, one scan, split by KIND like audience_geo_sql.
+
+    Renders: "Where they are", and the "Individual timezones" expander beneath it.
+    One scan, split by KIND into the `regions` and `timezones` frames.
+    """
     return f"""
         WITH base AS (
             SELECT SESSION_ID, TIMEZONE
@@ -1834,6 +1908,8 @@ def campaign_geo_sql(timezone_limit: int = 10) -> str:
 
 def campaign_pages_sql(limit: int = 12) -> str:
     """Which pages this campaign's sessions actually landed on, by reach.
+
+    Renders: "Pages" on the page, "Pages viewed" in the PDF and the HTML.
 
     Sits immediately before Content on every surface, and the pair is deliberate: pages are
     the container, assets are the content opened on them.
@@ -1922,7 +1998,10 @@ def campaign_pages_sql(limit: int = 12) -> str:
 
 
 def campaign_assets_sql(limit: int = 12) -> str:
-    """Content this campaign put in front of people, by reach."""
+    """Content this campaign put in front of people, by reach.
+
+    Renders: "Content" on the page, "Content by reach" in the PDF and the HTML.
+    """
     return f"""
         SELECT
             {_ASSET_LABEL} AS ASSET,
@@ -1941,7 +2020,10 @@ def campaign_assets_sql(limit: int = 12) -> str:
 
 
 def campaign_read_depth_sql(limit: int = 10) -> str:
-    """How far into this campaign's documents people got."""
+    """How far into this campaign's documents people got.
+
+    Renders: "PDF read depth".
+    """
     return f"""
         SELECT
             {_ASSET_LABEL} AS ASSET,
@@ -1961,6 +2043,8 @@ def campaign_read_depth_sql(limit: int = 10) -> str:
 
 def campaign_companies_sql(limit: int = 12) -> str:
     """Which accounts this campaign actually reached.
+
+    Renders: "Accounts reached".
 
     Consumer mailboxes are excluded, matching Top Companies on the Audience page - they
     are people, not accounts. Returns domains and headcounts only; an individual address
@@ -1983,7 +2067,11 @@ def campaign_companies_sql(limit: int = 12) -> str:
 
 
 def campaign_sources_sql(referrer_limit: int = 8) -> str:
-    """Source mix and named referrers for one campaign, one scan, split by KIND."""
+    """Source mix and named referrers for one campaign, one scan, split by KIND.
+
+    Renders: "How they arrived" and "External referrers" - one query, split by KIND
+    into the `sources` and `referrers` frames.
+    """
     return f"""
         WITH base AS (
             SELECT MESSAGE_ID, REFERER_URL
@@ -2008,7 +2096,10 @@ def campaign_sources_sql(referrer_limit: int = 8) -> str:
 
 
 def campaign_ai_sql() -> str:
-    """Model mix for one campaign. Only 19% of campaigns reach this query."""
+    """Model mix for one campaign. Only 19% of campaigns reach this query.
+
+    Renders: "AI usage" on the page, "AI model mix" in the PDF and the HTML.
+    """
     return f"""
         SELECT
             {_MODEL} AS MODEL,
