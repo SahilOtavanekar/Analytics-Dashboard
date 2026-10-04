@@ -136,8 +136,6 @@ def page_bar(df: pd.DataFrame) -> alt.Chart:
         alt.Tooltip("PAGE:N", title="Page"),
         alt.Tooltip("HOST:N", title="Host"),
         alt.Tooltip("SESSIONS:Q", title="Sessions", format=","),
-        alt.Tooltip("VIEWS:Q", title="Views", format=","),
-        alt.Tooltip("VIEWS_PER_SESSION:Q", title="Views / session", format=".1f"),
         alt.Tooltip("PCT_OF_SESSIONS:Q", title="% of campaign sessions", format=".1f"),
     ])
 
@@ -277,9 +275,17 @@ def campaign_bar(df: pd.DataFrame, window_start, window_end):
 
 
 def share_stacked_bar(
-    df: pd.DataFrame, name_col: str, value_col: str, max_segments: int = 6
+    df: pd.DataFrame, name_col: str, value_col: str, max_segments: int = 6, order=None
 ) -> alt.LayerChart:
-    """Part-to-whole: single horizontal 100% bar, categorical colors, Other fold past max_segments."""
+    """Part-to-whole: single horizontal 100% bar, categorical colors, Other fold past max_segments.
+
+    `order` pins each name to a FIXED colour slot - its position in that list - instead of to
+    its rank by size. Without it the slot is the segment's rank, so a campaign whose External
+    sessions overtake its Direct ones repaints both, and colour stops identifying anything
+    the moment two campaigns are compared. Same rule and same argument as donut_chart's
+    `order`. Names absent from `order` (the folded "Other") take the slots after it. Left None,
+    behaviour is exactly what it was, which is what Pages & Sources relies on.
+    """
     ranked = df.sort_values(value_col, ascending=False).reset_index(drop=True)
     if len(ranked) > max_segments:
         head = ranked.iloc[: max_segments - 1]
@@ -298,9 +304,12 @@ def share_stacked_bar(
     ranked["pct"] = ranked["share"].map(lambda s: f"{s * 100:.0f}%" if s * 100 >= 8 else "")
     ranked["tip"] = ranked["share"].map(lambda s: f"{s * 100:.1f}%")
 
-    order = ranked[name_col].astype(str).tolist()
+    order_present = ranked[name_col].astype(str).tolist()
     hues = categorical()
-    palette = [hues[i % len(hues)] for i in range(len(order))]
+    slots = list(order or []) + [n for n in order_present if n not in (order or [])]
+    slot_of = {name: i for i, name in enumerate(slots)} if order else {n: i for i, n in enumerate(order_present)}
+    order = order_present
+    palette = [hues[slot_of[n] % len(hues)] for n in order]
     # The share label sits on the fill, so its colour is chosen per segment rather
     # than fixed to white. The validated palette deliberately spans light and dark
     # slots - forcing every slot dark enough for white text is exactly what
@@ -512,7 +521,7 @@ def trend_line(df: pd.DataFrame, x_col: str, y_col: str, y_title: str) -> alt.Ch
     return line
 
 
-def trend_bar(df: pd.DataFrame, x_col: str, y_col: str, y_title: str) -> alt.Chart:
+def trend_bar(df: pd.DataFrame, x_col: str, y_col: str, y_title: str, partial=None) -> alt.Chart:
     """Daily totals as columns. Same data as trend_line, a different claim about it.
 
     A line interpolates: it draws a value for every instant between two days, and there is no
@@ -532,6 +541,11 @@ def trend_bar(df: pd.DataFrame, x_col: str, y_col: str, y_title: str) -> alt.Cha
     # Altair's JSON encoder rejects even though Streamlit's Arrow path accepts them.
     data = df.copy()
     data[x_col] = pd.to_datetime(data[x_col])
+    # `partial` is a date still in progress - see campaign_report.partial_day. Its column keeps
+    # the series colour, so colour still follows the entity, and drops to 40% opacity so a day
+    # nine hours old cannot be read as a collapse. Left None, the chart is exactly as before.
+    if partial is not None:
+        data["PARTIAL"] = data[x_col].dt.date == partial
 
     # Rounded caps only while the columns are wide enough to carry one. Across a year the band
     # is a couple of pixels, and a 3px radius on a 3px column renders as a lozenge - a
@@ -558,6 +572,8 @@ def trend_bar(df: pd.DataFrame, x_col: str, y_col: str, y_title: str) -> alt.Cha
     bars = base.mark_bar(color=series_color(), width=alt.RelativeBandSize(1),
                          stroke=surface(), strokeWidth=stroke_w,
                          cornerRadiusTopLeft=corner, cornerRadiusTopRight=corner)
+    if partial is not None:
+        bars = bars.encode(opacity=alt.Opacity("PARTIAL:N", scale=alt.Scale(domain=[False, True], range=[1.0, 0.4]), legend=None))
     # The figure above each column, on screen as well as in the PDF. Only while they fit: past
     # roughly forty days the labels are wider than the slot and would overprint each other, and
     # Altair has no collision-avoidance to fall back on the way the PDF's own walk does. The

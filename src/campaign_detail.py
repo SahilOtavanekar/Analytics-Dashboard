@@ -22,7 +22,11 @@ import datetime as dt
 import streamlit as st
 
 from src.campaign_report import (
+    ARRIVAL_NONE,
+    ARRIVAL_NOTE,
     IDENTITY_FLOOR,
+    internal_only_message,
+    partial_day_note,
     concentration,
     STATUS_MISSING,
     STATUS_NO_SESSIONS,
@@ -40,7 +44,7 @@ from src.charts import (
 )
 from src.components import duration_label, kpi
 from src.db import run_query
-from src.queries import EVENT_BUCKET_ORDER
+from src.queries import ARRIVAL_ORDER, EVENT_BUCKET_ORDER
 
 SELECTED_KEY = "campaign_detail_id"
 
@@ -53,34 +57,71 @@ _IDENTITY_FLOOR = IDENTITY_FLOOR
 # editor re-indents multi-line calls inside indented blocks and breaks them.
 # The three buckets are exclusive and exhaustive - see campaign_event_mix_sql - so `skipped`
 # is zero and this never renders. It is kept as a drift guard: the ring's hole and the
-# Events KPI are two counts of the same thing from two queries, and if a future predicate
+# INTERACTIONS KPI are two counts of the same thing from two queries, and if a future predicate
 # lands on one and not the other, the reader is told rather than left to notice. The old
 # wording named AI requests as the cause, which stopped being true when the AND NOT
 # _AI_REQUEST clause came out of the query.
 _MIX_NOTE = (
-    "{shown:,} of this campaign's {total:,} events fall into these three buckets; "
+    "{shown:,} of this campaign's {total:,} interactions fall into these three buckets; "
     "{skipped:,} do not."
 )
+
+# Hover text for the session card. `exact` is the unrounded figure kpi() would otherwise
+# put in the tooltip on its own; the card itself shows the compact form.
+_DISTINCT_HELP = ("{exact}. Each session counted once in the selected range, however many days it ran. "
+                  "Every per-session figure on this page, such as Interactions / Session, divides by this.")
+
+_INTERACTIONS_HELP = ("{exact}. Interactions per distinct session. A page visit counts once per page per "
+                      "session - an open tab re-fires one every 30-60 seconds, which let a handful of "
+                      "sessions own the raw event count - while every click and form submit counts each "
+                      "time. The donut beside this splits the same interactions by type.")
 
 _ABSENT = {
     "pages": "No page views carry a resolvable URL. Pages are identified from `SEARCH_URL`, the one URL column populated across the whole history — `PATH` and `TAB_URL` were retired in the March–April 2026 tracking change.",
     "content": "No tracked content. This campaign's traffic carries no `asset` parameter, so there is nothing to attribute reach to. Asset tagging began around March 2026.",
-    "depth": "No PDF page-turn events, so read depth cannot be measured for this campaign.",
+    "depth": "No PDF page turns from a tracked session, so read depth cannot be measured for this campaign.",
     "identity": "No identified visitors. Identity comes from the `email` URL parameter, which only rides on personalised links - and campaign links largely do not carry it.",
     "identity_floor": "{n} identified {noun} — too few to break down by company without describing an individual, so only the total is shown.",
-    "ai": "No AI activity. Only 19% of campaigns have any: AI events do carry a campaign ID, they are simply concentrated in a minority of campaigns.",
-    "sources": "No referrer recorded on any event, so traffic cannot be attributed to a source.",
+    "ai": "No AI-built pages. About 1 in 5 campaigns runs on pages built with an AI model (133 of 649 in a 30-day window), and this one does not.",
+    # Only reachable when every session was Internal - collect() stops earlier when there are no
+    # sessions at all - so it says that, in the downloads' own words.
+    "sources": ARRIVAL_NONE,
 }
 
-_DURATION_NOTE = "Duration is the span between a session's first and last event, not time spent reading. Median {median} against a mean of {mean} — the same skew the platform shows."
+_DURATION_NOTE = "Duration runs from a session's first event to its last interaction, so a page an open tab keeps re-firing does not stretch it. It is not time spent reading. Median {median} against a mean of {mean}."
+_DURATION_DETAIL = "{single:,} of {sessions:,} sessions ({share:.0f}%) had a single interaction. Median {median:.0f} interactions per session."
 # Module level, like every other caption here, so the branch below stays a single indented line -
 # the Snowsight editor re-indents multi-line calls inside indented blocks and breaks them.
-_PAGES_NOTE = "{views:,} page views across {pages:,} pages, labelled by path — the host is on hover, and the full address is in the table. Query strings are stripped, so `?asset=` variants of one page rank together, and localhost and iframe pages are left out. One session can visit several pages, so the shares sum past 100%."
+_PAGES_NOTE = "{visits:,} page visits across {pages:,} pages, each page counted once per session so a tab re-firing it adds nothing. Labelled by path — the host is on hover, and the full address is in the table. Query strings are stripped, so `?asset=` variants of one page rank together, and localhost and iframe pages are left out. One session can visit several pages, so the shares sum past 100%."
 # 437 of 592 campaigns in a 30-day window have exactly ONE page (median 1, p90 2), so a bar
 # chart is the exception rather than the rule here. A single bar is a rectangle whose length
 # is its own maximum - it carries no comparison, which is the only thing a bar chart is for -
 # so one page is stated instead, the way the consent figures are.
-_ONE_PAGE = "Every session landed on a single page: [{page}]({url}) — {sessions:,} sessions, {views:,} views, {per:.1f} per session."
+_ONE_PAGE = "Every session landed on a single page: [{page}]({url}) — {sessions:,} sessions."
+# Content and read depth, kept at module level for the same reason as the captions above.
+# The AI caption. It used to add "attaching to N% of content sessions", AI sessions over content
+# sessions - but AI sessions are not a subset of content sessions, and with every session on a
+# flagged campaign carrying the flag it ran past 100% on 88 of 104 campaigns, 7,200% at worst.
+_AI_NOTE = "{ai:,} of {sessions:,} sessions ({share:.0f}%) were on pages built with an AI model. Interactions count each page once per session and every click each time."
+_AI_COLUMNS = {
+    "MODEL": st.column_config.TextColumn("Model"),
+    "SESSIONS": st.column_config.NumberColumn("Sessions", format="%d"),
+    "INTERACTIONS": st.column_config.NumberColumn("Interactions", format="%d"),
+}
+_DEPTH_NOTE = "How far into each document people read: every session's deepest page, averaged, across {sessions:,} sessions that turned pages. The table adds the deepest page any one session reached."
+_ASSET_COLUMNS = {
+    "ASSET": st.column_config.TextColumn("Asset", width="large"),
+    "SESSIONS": st.column_config.NumberColumn("Sessions", format="%d"),
+    # Counted by the interactions rule - see campaign_assets_sql.
+    "INTERACTIONS": st.column_config.NumberColumn("Interactions", format="%d"),
+    "INTERACTIONS_PER_SESSION": st.column_config.NumberColumn("Interactions / session", format="%.1f"),
+}
+_DEPTH_COLUMNS = {
+    "ASSET": st.column_config.TextColumn("Asset", width="large"),
+    "SESSIONS": st.column_config.NumberColumn("Sessions", format="%d"),
+    "AVG_PAGE_REACHED": st.column_config.NumberColumn("Average deepest page", format="%.1f"),
+    "DEEPEST_PAGE": st.column_config.NumberColumn("Deepest page", format="%d"),
+}
 _PAGE_COLUMNS = {
     # The address is spelled out rather than hidden behind an "Open" label. A LinkColumn with
     # display_text renders the word and keeps the URL underneath, which is fine for clicking and
@@ -88,8 +129,6 @@ _PAGE_COLUMNS = {
     # it somewhere. Shown in full, it is selectable text AND a link.
     "URL": st.column_config.LinkColumn("Address", width="large"),
     "SESSIONS": st.column_config.NumberColumn("Sessions", format="%d"),
-    "VIEWS": st.column_config.NumberColumn("Views", format="%d"),
-    "VIEWS_PER_SESSION": st.column_config.NumberColumn("Views / session", format="%.1f"),
     "PCT_OF_SESSIONS": st.column_config.NumberColumn("% of sessions", format="%.1f"),
 }
 # Address first, and neither PAGE nor HOST shown: the URL ends with the path the bars are
@@ -98,7 +137,7 @@ _PAGE_COLUMNS = {
 # the host that the path omits. Ordering matters as much as inclusion: left in the frame's own
 # order the address landed last, off the right edge of the container, so the one column added
 # for copying was the one column not on screen.
-_PAGE_ORDER = ("URL", "SESSIONS", "VIEWS", "VIEWS_PER_SESSION", "PCT_OF_SESSIONS")
+_PAGE_ORDER = ("URL", "SESSIONS", "PCT_OF_SESSIONS")
 # Module level so the branch below stays one indented line - the Snowsight editor
 # re-indents multi-line calls inside indented blocks and breaks them.
 _CONCENTRATION_NOTE = "{share:.0f}% of these {sessions:,} sessions came from a single network address, out of {ips:,} addresses in total. Likely one organisation or an automated client rather than {sessions:,} separate visitors — an address is not a person."
@@ -129,7 +168,9 @@ def render(campaign_id: str, start: dt.date, end: dt.date, data: dict | None = N
     # of those is a statement about a campaign that is not there, and the reader had to get
     # past all of them to reach the sentence that mattered.
     if data["status"] == STATUS_MISSING:
-        if data["reason"] == "wrong_window":
+        if data["reason"] == "internal_only":
+            st.info(internal_only_message(data["lookup"], f"{start} and {end}"))
+        elif data["reason"] == "wrong_window":
             f = data["lookup"]
             named = f" (`{f['CAMPAIGN_NAME']}`)" if f["CAMPAIGN_NAME"] else ""
             st.warning(f"Campaign `{campaign_id}`{named} has no activity between {start} and {end}. It ran **{f['FIRST_EVER']} to {f['LAST_EVER']}** with {int(f['EVENTS_EVER']):,} events — widen the date range in the sidebar to see it.")
@@ -158,7 +199,7 @@ def render(campaign_id: str, start: dt.date, end: dt.date, data: dict | None = N
         st.info(f"Campaign `{campaign_id}` recorded {int(k['EVENTS']):,} events in this range but no identifiable sessions. Session IDs were not recorded on campaign rows before November 2025, so only event counts exist this far back.")
         return data
 
-    # Sessions, Events / Session and the mix donut as three cards on one row. st.metric and
+    # The session cards, Interactions / Session and the mix donut on one row. st.metric and
     # st.column both take border=True, so the cards are native Streamlit rather than CSS -
     # which matters here because a hand-rolled card would need its own light and dark
     # surfaces, and this file deliberately owns no colours.
@@ -172,13 +213,14 @@ def render(campaign_id: str, start: dt.date, end: dt.date, data: dict | None = N
     #
     # The Events card used to sit beside Sessions. It is the donut now, so the total it
     # carried moves into the hole rather than being lost, labelled so it cannot be mistaken
-    # for one of the page's other totals. The three buckets are exhaustive, so the ring sums
-    # to the same figure the card showed - see _MIX_NOTE for the guard that says so if it
-    # ever stops being true.
+    # for one of the page's other totals. Both the ring and the card count INTERACTIONS, not
+    # raw events - see _INTERACTION_KEY in queries.py for why, measured. The three buckets
+    # are exhaustive, so the ring sums to the KPI row's INTERACTIONS - see _MIX_NOTE for the
+    # guard that says so if it ever stops being true.
     mix = data.get("event_mix")
-    has_mix = mix is not None and not mix.empty and float(mix["EVENTS"].sum()) > 0
-    # Two cards STACKED in the left column, ring on the right. Writing both metrics into the
-    # same column is what stacks them - Streamlit lays a column out vertically - so this needs
+    has_mix = mix is not None and not mix.empty and float(mix["INTERACTIONS"].sum()) > 0
+    # Two cards STACKED in the left column, ring on the right: Distinct Sessions, then
+    # Interactions / Session. Writing the metrics into the same column is what stacks them - Streamlit lays a column out vertically - so this needs
     # no nested columns and stays clear of the one-level nesting limit.
     #
     # vertical_alignment="top", not "center": the ring column is the taller of the two, and
@@ -188,17 +230,17 @@ def render(campaign_id: str, start: dt.date, end: dt.date, data: dict | None = N
         stats_col, chart_col = st.columns([1, 2], gap="medium", vertical_alignment="top")
     else:
         stats_col, chart_col = st.container(), None
-    s_card = kpi("Sessions", sessions)
-    e_card = kpi("Events / Session", float(k["EVENTS"]) / sessions, decimals=1)
-    stats_col.metric(s_card[0], s_card[1], help=s_card[3], border=True)
-    stats_col.metric(e_card[0], e_card[1], help=e_card[3], border=True)
+    s_card = kpi("Distinct Sessions", sessions)
+    e_card = kpi("Interactions / Session", float(k["INTERACTIONS"]) / sessions, decimals=1)
+    stats_col.metric(s_card[0], s_card[1], help=_DISTINCT_HELP.format(exact=s_card[3]), border=True)
+    stats_col.metric(e_card[0], e_card[1], help=_INTERACTIONS_HELP.format(exact=e_card[3]), border=True)
     if has_mix:
-        shown = int(mix["EVENTS"].sum())
-        chart = donut_chart(mix, "BUCKET", "EVENTS", order=EVENT_BUCKET_ORDER, centre_label=f"{shown:,}", centre_sublabel="Total Events")
-        skipped = int(k["EVENTS"]) - shown
+        shown = int(mix["INTERACTIONS"].sum())
+        chart = donut_chart(mix, "BUCKET", "INTERACTIONS", order=EVENT_BUCKET_ORDER, centre_label=f"{shown:,}", centre_sublabel="Total Interactions")
+        skipped = int(k["INTERACTIONS"]) - shown
         with chart_col.container(border=True):
             st.altair_chart(chart, width="content")
-            if skipped > 0: st.caption(_MIX_NOTE.format(shown=shown, total=int(k["EVENTS"]), skipped=skipped))
+            if skipped > 0: st.caption(_MIX_NOTE.format(shown=shown, total=int(k["INTERACTIONS"]), skipped=skipped))
             with st.expander("View as table"): st.dataframe(mix, width="stretch", hide_index=True)
 
     # Qualifies the Sessions card directly above it, so it sits here rather than in Session
@@ -214,7 +256,8 @@ def render(campaign_id: str, start: dt.date, end: dt.date, data: dict | None = N
     if daily is None or daily.empty:
         _absent("No dated activity in this range.")
     else:
-        st.altair_chart(trend_bar(daily, "EVENT_DATE", "SESSION_COUNT", "Sessions"), width="stretch")
+        st.altair_chart(trend_bar(daily, "EVENT_DATE", "SESSION_COUNT", "Sessions", partial=data.get("partial_day")), width="stretch")
+        if data.get("partial_day"): st.caption(partial_day_note(data["partial_day"]))
 
     # ------------------------------------------------------- duration (always)
     st.markdown("##### Session duration")
@@ -224,7 +267,7 @@ def render(campaign_id: str, start: dt.date, end: dt.date, data: dict | None = N
         _absent("No sessions to measure.")
     else:
         st.altair_chart(ordered_bar(bands, "BAND", "SESSIONS"), width="stretch")
-        st.caption(f"{int(k['INSTANT_SESSIONS']):,} of {sessions:,} sessions ({pct(k['INSTANT_SESSIONS'], sessions):.0f}%) contain a single event. Median {k['MEDIAN_EVENTS']:.0f} events per session.")
+        st.caption(_DURATION_DETAIL.format(single=int(k["SINGLE_INTERACTION_SESSIONS"]), sessions=sessions, share=pct(k["SINGLE_INTERACTION_SESSIONS"], sessions), median=float(k["MEDIAN_INTERACTIONS"])))
 
     # --------------------------------------------------------- geography (always)
     st.markdown("##### Where they are")
@@ -248,11 +291,11 @@ def render(campaign_id: str, start: dt.date, end: dt.date, data: dict | None = N
         _absent(_ABSENT["pages"])
     elif len(pages) == 1:
         one = pages.iloc[0]
-        st.markdown(_ONE_PAGE.format(page=one["PAGE"], url=one["URL"], sessions=int(one["SESSIONS"]), views=int(one["VIEWS"]), per=float(one["VIEWS_PER_SESSION"])))
+        st.markdown(_ONE_PAGE.format(page=one["PAGE"], url=one["URL"], sessions=int(one["SESSIONS"])))
     else:
-        st.caption(_PAGES_NOTE.format(views=int(k["PAGE_VIEWS"]), pages=int(k["PAGES"])))
+        st.caption(_PAGES_NOTE.format(visits=int(k["PAGE_VISITS"]), pages=int(k["PAGES"])))
         st.altair_chart(page_bar(pages), width="stretch")
-        with st.expander("Full addresses and views per session"):
+        with st.expander("Full addresses"):
             st.dataframe(pages, width="stretch", hide_index=True, column_config=_PAGE_COLUMNS, column_order=_PAGE_ORDER)
 
     # ------------------------------------------------------ content (conditional)
@@ -263,16 +306,16 @@ def render(campaign_id: str, start: dt.date, end: dt.date, data: dict | None = N
     else:
         st.caption(f"{int(k['CONTENT_SESSIONS']):,} of {sessions:,} sessions ({pct(k['CONTENT_SESSIONS'], sessions):.0f}%) opened one of {int(k['ASSETS']):,} assets.")
         st.altair_chart(top_events_bar(assets, "ASSET", "SESSIONS", x_title="Sessions"), width="stretch")
-        with st.expander("With engagement depth"):
-            st.dataframe(assets, width="stretch", hide_index=True)
+        with st.expander("Interactions per asset"):
+            st.dataframe(assets, width="stretch", hide_index=True, column_config=_ASSET_COLUMNS)
         depth = data.get("depth")
         if depth is None or depth.empty:
             _absent(_ABSENT["depth"])
         else:
-            st.caption(f"Average page reached inside each document, from {int(k['PDF_EVENTS']):,} page-turn events.")
-            st.altair_chart(top_events_bar(depth, "ASSET", "AVG_PAGE_REACHED", x_title="Average page reached"), width="stretch")
+            st.caption(_DEPTH_NOTE.format(sessions=int(k["PAGE_TURN_SESSIONS"])))
+            st.altair_chart(top_events_bar(depth, "ASSET", "AVG_PAGE_REACHED", x_title="Average deepest page"), width="stretch")
             with st.expander("Deepest page reached per asset"):
-                st.dataframe(depth, width="stretch", hide_index=True)
+                st.dataframe(depth, width="stretch", hide_index=True, column_config=_DEPTH_COLUMNS)
 
     # ----------------------------------------------------- audience (conditional)
     st.markdown("##### Accounts reached")
@@ -297,11 +340,12 @@ def render(campaign_id: str, start: dt.date, end: dt.date, data: dict | None = N
     if groups is None or groups.empty:
         _absent(_ABSENT["sources"])
     else:
-        st.altair_chart(share_stacked_bar(groups, "SOURCE_GROUP", "EVENTS"), width="stretch")
+        st.altair_chart(share_stacked_bar(groups, "SOURCE_GROUP", "SESSIONS", order=ARRIVAL_ORDER), width="stretch")
+        st.caption(ARRIVAL_NOTE)
         if referrers is None or referrers.empty:
             st.caption("No external referrers — traffic arrived directly, which is normal for a personalised link opened from an email client.")
         else:
-            st.altair_chart(top_events_bar(referrers, "REFERRER", "EVENTS", x_title="Events"), width="stretch")
+            st.altair_chart(top_events_bar(referrers, "REFERRER", "SESSIONS", x_title="Sessions"), width="stretch")
 
     # ----------------------------------------------------------- AI (conditional)
     st.markdown("##### AI usage")
@@ -309,11 +353,9 @@ def render(campaign_id: str, start: dt.date, end: dt.date, data: dict | None = N
     if ai is None or ai.empty:
         _absent(_ABSENT["ai"])
     else:
-        attach = pct(k["AI_SESSIONS"], k["CONTENT_SESSIONS"]) if int(k["CONTENT_SESSIONS"]) else None
-        line = f"{int(k['AI_EVENTS']):,} AI-assisted events across {int(k['AI_SESSIONS']):,} sessions ({pct(k['AI_SESSIONS'], sessions):.0f}% of all sessions)"
-        st.caption(line + (f", attaching to {attach:.0f}% of content sessions." if attach is not None else ". No content sessions, so an attach rate is not defined."))
-        st.altair_chart(share_stacked_bar(ai, "MODEL", "REQUESTS"), width="stretch")
-        with st.expander("Requests and sessions per model"):
-            st.dataframe(ai, width="stretch", hide_index=True)
+        st.caption(_AI_NOTE.format(ai=int(k["AI_SESSIONS"]), sessions=sessions, share=pct(k["AI_SESSIONS"], sessions)))
+        st.altair_chart(share_stacked_bar(ai, "MODEL", "SESSIONS"), width="stretch")
+        with st.expander("Sessions and interactions per model"):
+            st.dataframe(ai, width="stretch", hide_index=True, column_config=_AI_COLUMNS)
 
     return data

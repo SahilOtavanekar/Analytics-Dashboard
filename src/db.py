@@ -79,6 +79,10 @@ _VISITOR_IS_EXTERNAL = (
     f" OR COALESCE({_VISITOR_DOMAIN}, '') ILIKE '%demand-ai%')"
 )
 _INTERNAL_PREDICATE = f"{_TENANT_IS_EXTERNAL} AND {_VISITOR_IS_EXTERNAL} AND {_HOST_IS_EXTERNAL}"
+# What Campaign Analytics keeps: the same rule minus the tenant half. Named so that the one query
+# which must SEE internal rows - campaign_lookup_sql, to say "all of this was internal" rather than
+# "nothing happened" - applies exactly the rule table_fqn applies, not a copy of it.
+_CAMPAIGN_KEEP = f"{_VISITOR_IS_EXTERNAL} AND {_HOST_IS_EXTERNAL}"
 
 
 def exclude_internal() -> bool:
@@ -141,9 +145,18 @@ def table_fqn(keep_own_campaigns: bool = False) -> str:
     # and half of all localhost rows sit on customer tenants where the tenant rule cannot
     # reach them. Keeping Demand AI's own campaigns in a list of campaigns is a different
     # question from counting a dev machine as a visit.
-    predicate = (f"{_VISITOR_IS_EXTERNAL} AND {_HOST_IS_EXTERNAL}"
-                 if keep_own_campaigns else _INTERNAL_PREDICATE)
+    predicate = _CAMPAIGN_KEEP if keep_own_campaigns else _INTERNAL_PREDICATE
     return f"(SELECT * FROM {TABLE_FQN} WHERE {predicate})"
+
+
+def campaign_keep_predicate() -> str:
+    """The row condition Campaign Analytics keeps, as a boolean SQL expression.
+
+    TRUE when the reader is not excluding internal traffic, so a query can carry it as a column
+    in both states. Never NULL: both halves are COALESCE-guarded, which is what makes
+    `NOT <this>` safe to use for counting the internal rows.
+    """
+    return f"({_CAMPAIGN_KEEP})" if exclude_internal() else "TRUE"
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner="Querying Snowflake...")

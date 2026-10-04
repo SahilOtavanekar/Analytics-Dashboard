@@ -34,9 +34,10 @@ The `key` column is the name the frame carries in that dict:
 
     heading on screen / in the PDF          builder                       key
     --------------------------------------  ----------------------------  ------------
-    Sessions + Events / Session cards,      campaign_detail_kpis_sql      kpis
-      and the concentration note; also
-      gates every section below
+    Distinct Sessions and Interactions /    campaign_detail_kpis_sql      kpis
+      Session cards, and the
+      concentration note; also gates every
+      section below
     (campaign missing / wrong window)       campaign_lookup_sql           lookup
     Activity over time                      campaign_daily_sql            daily
       ("Activity by day" when a range is
@@ -44,7 +45,7 @@ The `key` column is the name the frame carries in that dict:
     Session duration                        campaign_duration_bands_sql   duration
     the event-mix ring - no heading of       campaign_event_mix_sql        event_mix
       its own, it sits beside the cards
-      with the event total in its hole
+      with the interactions total in its hole
     Where they are, and its                 campaign_geo_sql              regions
       "Individual timezones" expander                                     timezones
     Pages  /  "Pages viewed"                campaign_pages_sql            pages
@@ -54,6 +55,9 @@ The `key` column is the name the frame carries in that dict:
     How they arrived                        campaign_sources_sql          sources
     External referrers                        (one query, split by KIND)  referrers
     AI usage  /  "AI model mix"             campaign_ai_sql               ai
+
+How they arrived and External referrers count SESSIONS by the referrer of each session's
+first event - not events. See campaign_sources_sql for why the event form was wrong.
 
 Two builders in that section render nothing today and are called by nobody:
 `campaign_funnel_sql` (the Engagement funnel, removed from the page and therefore from both
@@ -67,7 +71,7 @@ banner comments below divide the file the same way. Note that `funnel_sql` (whol
 Conversion page) and `campaign_funnel_sql` (one campaign) are different queries.
 """
 
-from src.db import PAGE_HOST, table_fqn
+from src.db import PAGE_HOST, TABLE_FQN, campaign_keep_predicate, table_fqn
 
 # A page view is EVENT_TYPE = 'page' OR a name of "page visit". Both halves matter:
 # the ~3.4M unnamed events are all type 'page', so type catches them; and 107 events
@@ -292,16 +296,23 @@ _REF_HOST = "PARSE_URL(REFERER_URL, 1):host::STRING"
 # localhost, Amplify preview URLs. Ranking raw referrer hosts would present
 # internal traffic as acquisition, so sources are bucketed first. Edit these lists
 # if the estate changes; everything unmatched counts as genuinely External.
-_SOURCE_GROUP = f"""
-        CASE
-            WHEN COALESCE(REFERER_URL, '') = '' THEN 'Direct / none'
-            WHEN {_REF_HOST} IN ('localhost', '127.0.0.1')
+# The hosts that mean "Demand AI's own estate" when they appear as a referrer. Named on its own
+# because two groupings read it - _SOURCE_GROUP below (Pages & Sources) and _ARRIVAL_GROUP (the
+# campaign drill-down) - and two copies of a host list is how they would drift apart. The inner
+# newlines and indentation are deliberate: they keep _SOURCE_GROUP's expanded SQL byte-identical to
+# what it was before this was extracted, which is how that page was checked to be unchanged.
+_INTERNAL_REFERRER = f"""{_REF_HOST} IN ('localhost', '127.0.0.1')
               OR {_REF_HOST} ILIKE '%amplifye.ai'
               OR {_REF_HOST} ILIKE '%demandai.net'
               OR {_REF_HOST} ILIKE '%atlassian.net'
               OR {_REF_HOST} ILIKE '%amplifyapp.com'
               OR {_REF_HOST} ILIKE '%amazonaws.com'
-              OR {_REF_HOST} ILIKE '%cloudfront.net' THEN 'Internal / dev'
+              OR {_REF_HOST} ILIKE '%cloudfront.net'"""
+
+_SOURCE_GROUP = f"""
+        CASE
+            WHEN COALESCE(REFERER_URL, '') = '' THEN 'Direct / none'
+            WHEN {_INTERNAL_REFERRER} THEN 'Internal / dev'
             WHEN {_REF_HOST} ILIKE '%officeapps.live.com'
               OR {_REF_HOST} ILIKE '%sharepoint.com'
               OR {_REF_HOST} ILIKE '%office.net'
@@ -1072,6 +1083,11 @@ def top_visitor_by_sessions_sql() -> str:
 # events where ml_request = 'false' - it records the model a surface is configured
 # with, not a request. Actual usage is ml_request = 'true' (248,960 events / 5,224
 # sessions in 30 days). Measuring llm presence would overstate AI usage ~4x.
+#
+# Read per campaign, the flag behaves as a PAGE tag rather than a per-request record: in a 30-day
+# window (31 Aug - 29 Sep) every session on all 133 flagged campaigns carried it, and 95% of the
+# flagged events were page visits - an open tab's heartbeat included. campaign_ai_sql counts it
+# by session for that reason. Unchanged here because the AI Usage page reads it too.
 _AI_REQUEST = "COALESCE(PROPERTIES:ml_request::STRING, '') = 'true'"
 
 # 'flase' appears on 26 rows - a typo in the tracking script, surfaced on the page
@@ -1175,8 +1191,9 @@ def _campaign_table() -> str:
     third by sessions and disappeared completely with the filter on - while staff activity
     stays out of every audience and identity figure. See db.table_fqn for the full reasoning.
 
-    Every campaign builder below routes through this one function, for the same reason
-    table_fqn exists: 14 call sites, one rule, and no chance of one query reporting a
+    Every campaign builder below routes through this one function - bar campaign_lookup_sql,
+    which applies the same rule as a column so it can count what was hidden - for the same
+    reason table_fqn exists: 14 call sites, one rule, and no chance of one query reporting a
     different population from the query beside it.
     """
     return table_fqn(keep_own_campaigns=True)
@@ -1551,7 +1568,8 @@ _ADDR_VALID = "ADDR LIKE '%@%.%'"
 def campaign_detail_kpis_sql() -> str:
     """One row describing the campaign, and the gate for every conditional section.
 
-    Renders: the Sessions and Events / Session cards, plus the concentration note.
+    Renders: the "Distinct Sessions" and "Interactions / Session" cards, plus the
+    concentration note.
     Also GATES every other section - collect() reads its counts to decide what to fetch,
     so a campaign with no pages or too few identified people costs no extra round trip.
 
@@ -1563,6 +1581,8 @@ def campaign_detail_kpis_sql() -> str:
     Counts, not rates. The page divides them, so a zero denominator is handled once in
     Python rather than needing a COALESCE on every ratio here.
     """
+    # Built first, not nested in the f-string: the Streamlit-in-Snowflake runtime is Python 3.11.
+    spans = _session_spans_ctes("ev WHERE SESSION_ID IS NOT NULL")
     return f"""
         WITH ev AS ({_campaign_events_cte()}
         ), sess AS (
@@ -1574,12 +1594,7 @@ def campaign_detail_kpis_sql() -> str:
                 MAX(IS_CONSENT_YES) AS SAID_YES,
                 MAX(IS_CONSENT_NO) AS SAID_NO,
                 MAX(IFF(ASSET IS NOT NULL, 1, 0)) AS SAW_CONTENT,
-                MAX(IFF({_ADDR_VALID}, 1, 0)) AS IDENTIFIED,
-                COUNT(DISTINCT MESSAGE_ID) AS EVENTS,
-                DATEDIFF('second', MIN(EVENT_TS), MAX(EVENT_TS)) AS SECS,
-                -- MODE, not MIN: 2.8% of sessions carry more than one REQUEST_IP, and the
-                -- dominant address describes the session better than an arbitrary one.
-                MODE(REQUEST_IP) AS IP
+                MAX(IFF({_ADDR_VALID}, 1, 0)) AS IDENTIFIED
             FROM ev
             WHERE SESSION_ID IS NOT NULL
             GROUP BY SESSION_ID
@@ -1592,6 +1607,10 @@ def campaign_detail_kpis_sql() -> str:
                 MODE(NAME) AS CAMPAIGN_NAME,
                 MODE(TENANT) AS TENANT,
                 COUNT(DISTINCT MESSAGE_ID) AS EVENTS,
+                -- The donut's total and the Interactions / Session numerator - see _INTERACTION_KEY.
+                -- EVENTS above stays the raw count: it gates the report and feeds the captions
+                -- that are about raw events.
+                COUNT(DISTINCT {_INTERACTION_KEY}) AS INTERACTIONS,
                 MIN(EVENT_TS)::DATE AS FIRST_SEEN,
                 MAX(EVENT_TS)::DATE AS LAST_SEEN,
                 COUNT(DISTINCT EVENT_TS::DATE) AS ACTIVE_DAYS,
@@ -1599,15 +1618,26 @@ def campaign_detail_kpis_sql() -> str:
                 COUNT(DISTINCT IFF({_ADDR_VALID}, ADDR, NULL)) AS PEOPLE,
                 COUNT(DISTINCT IFF({_ADDR_VALID}, SPLIT_PART(ADDR, '@', 2), NULL)) AS COMPANIES,
                 COUNT(DISTINCT LEAD_PAGE) AS LEAD_PAGE_SUBMITS,
-                COUNT(DISTINCT IFF(IS_AI = 1, MESSAGE_ID, NULL)) AS AI_EVENTS,
-                COUNT(DISTINCT IFF(PAGE_VISITED IS NOT NULL, MESSAGE_ID, NULL)) AS PDF_EVENTS,
+                -- The read-depth caption's count and the gate on querying that section: the sessions
+                -- campaign_read_depth_sql measures, under its own conditions (a page turn, on an
+                -- asset, in a session). It was PDF_EVENTS, every page-turn event, which a caption put
+                -- at 1,910 over a table built from 1,618 - duplicates and turns with no asset or
+                -- session were in the caption and never in the table.
+                COUNT(DISTINCT IFF(PAGE_VISITED IS NOT NULL AND ASSET IS NOT NULL, SESSION_ID, NULL)) AS PAGE_TURN_SESSIONS,
                 COUNT(DISTINCT IFF(COALESCE(REFERER_URL, '') <> '', REFERER_URL, NULL)) AS REFERRERS,
                 -- The gate for the Pages section, counted here rather than asked for separately:
                 -- collect() needs to know whether the section has anything in it BEFORE deciding
                 -- to query it, and the CTE already projects SEARCH_URL, EVENT_NAME and EVENT_TYPE,
                 -- so both expressions resolve against it without a second scan.
                 COUNT(DISTINCT IFF({_PAGE_VIEW} AND {_REAL_PAGE}, {_PAGE_URL}, NULL)) AS PAGES,
-                COUNT(DISTINCT IFF({_PAGE_VIEW} AND {_REAL_PAGE}, MESSAGE_ID, NULL)) AS PAGE_VIEWS,
+                -- The Pages caption's total, counted by the interactions rule: once per page per
+                -- session (see _INTERACTION_KEY). It was every page-visit event, and 95% of those were
+                -- an open tab re-firing - "117,863 page views" sat on the same page as a donut slice
+                -- reading "Page visit 5,979". Counted this way the two agree exactly while internal
+                -- traffic is excluded. With it included they differ by the page visits on localhost
+                -- and hostless pages (285 on that campaign): the donut counts them then, and the Pages
+                -- section never does - _REAL_PAGE applies whatever the toggle says.
+                COUNT(DISTINCT IFF({_PAGE_VIEW} AND {_REAL_PAGE}, {_INTERACTION_KEY}, NULL)) AS PAGE_VISITS,
                 COUNT(DISTINCT TIMEZONE) AS TIMEZONES
             FROM ev
         ), sess_agg AS (
@@ -1619,12 +1649,32 @@ def campaign_detail_kpis_sql() -> str:
                 COALESCE(SUM(SAID_YES), 0) AS CONSENT_YES_SESSIONS,
                 COALESCE(SUM(SAID_NO), 0) AS CONSENT_NO_SESSIONS,
                 COALESCE(SUM(SAW_CONTENT), 0) AS CONTENT_SESSIONS,
-                COALESCE(SUM(IDENTIFIED), 0) AS IDENTIFIED_SESSIONS,
-                COALESCE((APPROX_PERCENTILE(EVENTS, 0.5))::FLOAT, 0) AS MEDIAN_EVENTS,
+                COALESCE(SUM(IDENTIFIED), 0) AS IDENTIFIED_SESSIONS
+            FROM sess
+        ), {spans}, dur_agg AS (
+            -- The Session duration captions, measured exactly as the chart's bands are - see
+            -- _session_spans_ctes. Interactions per session rather than events for the same reason:
+            -- a tab re-firing one page is one interaction, not hundreds of events.
+            SELECT
                 COALESCE((APPROX_PERCENTILE(SECS, 0.5) / 60.0)::FLOAT, 0) AS MEDIAN_DURATION_MINUTES,
                 COALESCE((AVG(SECS) / 60.0)::FLOAT, 0) AS MEAN_DURATION_MINUTES,
-                COALESCE(SUM(IFF(SECS = 0, 1, 0)), 0) AS INSTANT_SESSIONS
-            FROM sess
+                COALESCE(SUM(IFF(INTERACTIONS = 1, 1, 0)), 0) AS SINGLE_INTERACTION_SESSIONS,
+                COALESCE((APPROX_PERCENTILE(INTERACTIONS, 0.5))::FLOAT, 0) AS MEDIAN_INTERACTIONS
+            FROM spans
+        ), ip_pick AS (
+            -- Each session's dominant address: the REQUEST_IP on most of its rows, a tie going to
+            -- the lower address. Dominant, not MIN, because 2.8% of sessions carry more than one
+            -- REQUEST_IP and the one most of the session came from describes it best.
+            --
+            -- This replaced MODE(REQUEST_IP), which picks the same address but breaks a tie
+            -- arbitrarily - and 38 sessions on demand_ai_internal_website_track have two
+            -- addresses level, so DISTINCT_IPS read 2,443 on one refresh and 2,444 on the next
+            -- from identical data. A figure on the page must not move unless the data does.
+            SELECT SESSION_ID, REQUEST_IP AS IP
+            FROM ev
+            WHERE SESSION_ID IS NOT NULL AND REQUEST_IP IS NOT NULL
+            GROUP BY SESSION_ID, REQUEST_IP
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY SESSION_ID ORDER BY COUNT(*) DESC, REQUEST_IP) = 1
         ), ip_agg AS (
             -- How concentrated is this campaign's traffic on one network address? Sessions
             -- are the reach figure everything else divides by, and a session count says
@@ -1637,9 +1687,9 @@ def campaign_detail_kpis_sql() -> str:
             -- That is precisely why this is worth stating rather than charting - it bounds
             -- how the session count may be read, and claims nothing about who.
             SELECT COUNT(*) AS DISTINCT_IPS, COALESCE(MAX(N), 0) AS TOP_IP_SESSIONS
-            FROM (SELECT IP, COUNT(*) AS N FROM sess WHERE IP IS NOT NULL GROUP BY IP)
+            FROM (SELECT IP, COUNT(*) AS N FROM ip_pick GROUP BY IP)
         )
-        SELECT * FROM ev_agg CROSS JOIN sess_agg CROSS JOIN ip_agg
+        SELECT * FROM ev_agg CROSS JOIN sess_agg CROSS JOIN dur_agg CROSS JOIN ip_agg
     """
 
 
@@ -1651,26 +1701,42 @@ def campaign_lookup_sql() -> str:
 
     Three parameters like every other drill-down query: start, end, campaign id.
 
-    Both halves are needed because "nothing found" has two very different causes, and a
-    reader typing an id deserves to be told which one they hit. An id that is simply wrong
-    is a typo. An id that is real but ran outside the selected dates is a date-range
-    problem, and this returns the dates it did run so the message can say so instead of
-    leaving someone to widen the range by trial and error.
+    "Nothing found" has three very different causes, and a reader typing an id deserves to be
+    told which one they hit. An id that is simply wrong is a typo. An id that is real but ran
+    outside the selected dates is a date-range problem, and this returns the dates it did run
+    so the message can say so instead of leaving someone to widen the range by trial and error.
+    And a campaign whose every event in the window is internal traffic has activity the reader
+    has chosen to hide - which needs saying, because "widen the range" would be wrong advice.
+
+    The one campaign builder that does NOT read _campaign_table(). It has to see the internal
+    rows to count them, so it reads TABLE_FQN and carries campaign_keep_predicate() - the same
+    rule _campaign_table() filters on - as a column instead. Every figure the reader is shown
+    is still over the kept rows only; the INTERNAL_ columns exist to choose the message. Found
+    measuring the toggle: vodafone-business-webinar-sg-landing-page recorded 5 events in a
+    window, all on localhost, and was reported as having run only until three days earlier.
 
     Bounded to the data floor rather than left unbounded: the table holds 205 rows stamped
     before 2020 and three in the future, and an unbounded MIN/MAX would report 1978.
     """
     return f"""
+        WITH t AS (
+            SELECT MESSAGE_ID, EVENT_TS, PROPERTIES,
+                   (EVENT_TS::DATE BETWEEN ? AND ?) AS IN_WINDOW,
+                   {campaign_keep_predicate()} AS KEPT
+            FROM {TABLE_FQN}
+            WHERE CAMPAIGN_ID = ?
+              AND EVENT_TS::DATE BETWEEN '2025-06-01' AND CURRENT_DATE()
+              AND {_NOT_TEST}
+        )
         SELECT
-            COUNT(DISTINCT IFF(EVENT_TS::DATE BETWEEN ? AND ?, MESSAGE_ID, NULL)) AS EVENTS_IN_WINDOW,
-            COUNT(DISTINCT MESSAGE_ID) AS EVENTS_EVER,
-            MIN(EVENT_TS)::DATE AS FIRST_EVER,
-            MAX(EVENT_TS)::DATE AS LAST_EVER,
+            COUNT(DISTINCT IFF(IN_WINDOW AND KEPT, MESSAGE_ID, NULL)) AS EVENTS_IN_WINDOW,
+            COUNT(DISTINCT IFF(IN_WINDOW AND NOT KEPT, MESSAGE_ID, NULL)) AS INTERNAL_EVENTS_IN_WINDOW,
+            COUNT(DISTINCT IFF(KEPT, MESSAGE_ID, NULL)) AS EVENTS_EVER,
+            COUNT(DISTINCT IFF(NOT KEPT, MESSAGE_ID, NULL)) AS INTERNAL_EVENTS_EVER,
+            MIN(IFF(KEPT, EVENT_TS, NULL))::DATE AS FIRST_EVER,
+            MAX(IFF(KEPT, EVENT_TS, NULL))::DATE AS LAST_EVER,
             MODE(PROPERTIES:campaign_name::STRING) AS CAMPAIGN_NAME
-        FROM {_campaign_table()}
-        WHERE CAMPAIGN_ID = ?
-          AND EVENT_TS::DATE BETWEEN '2025-06-01' AND CURRENT_DATE()
-          AND {_NOT_TEST}
+        FROM t
     """
 
 
@@ -1681,12 +1747,28 @@ def campaign_daily_sql() -> str:
     when the range holds fewer than two days, which is too short to draw a line through.
     """
     return f"""
+        WITH ev AS (
+            SELECT
+                SESSION_ID, MESSAGE_ID,
+                EVENT_TS::DATE AS EVENT_DATE,
+                -- The day the session STARTED, carried onto all of its rows.
+                MIN(EVENT_TS::DATE) OVER (PARTITION BY SESSION_ID) AS SESSION_START
+            FROM {_campaign_table()}
+            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+        )
         SELECT
-            EVENT_TS::DATE AS EVENT_DATE,
-            COUNT(DISTINCT SESSION_ID) AS SESSION_COUNT,
+            EVENT_DATE,
+            -- Each session counted ONCE, on the day it began, so these bars sum to the
+            -- Sessions card. A plain COUNT(DISTINCT SESSION_ID) per day counts a session on
+            -- every day it touches, so one crossing midnight lands in two bars and the chart
+            -- totals more than the card it sits beside. The gap widens with the internal
+            -- traffic filter on, because that filter is ROW-level: stripping a session's
+            -- staff-tagged rows changes which days it still has rows on.
+            COUNT(DISTINCT IFF(EVENT_DATE = SESSION_START, SESSION_ID, NULL)) AS SESSION_COUNT,
+            -- Events stay on their own date. An event happened when it happened; only the
+            -- session needed attributing to one day.
             COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT
-        FROM {_campaign_table()}
-        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+        FROM ev
         GROUP BY EVENT_DATE
         ORDER BY EVENT_DATE
     """
@@ -1701,37 +1783,36 @@ def campaign_duration_bands_sql() -> str:
     The most discriminating section per campaign, measured: ibm-ai has 2,584 of 9,306
     sessions with any duration at all and a 0s median, while snowflake-apac-ai has 8,733
     of 8,977 and a 42s median. Same order of size, entirely different reading behaviour.
-    Bands are shared with page 3 on purpose so the two are directly comparable.
+    The BANDS are shared with page 3 so the two read alike, but the MEASUREMENT is not: this one
+    runs to a session's last interaction (see _session_spans_ctes), while Session Analytics still
+    runs to its last event of any kind. The figures above were measured the old way.
     """
+    # Built first rather than nested inside the f-string below: the Streamlit-in-Snowflake runtime is
+    # Python 3.11, which predates the nested-quote f-strings that 3.12 allows.
+    spans = _session_spans_ctes(f"{_campaign_table()} {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)} AND SESSION_ID IS NOT NULL")
     return f"""
-        WITH s AS (
-            SELECT SESSION_ID, DATEDIFF('second', MIN(EVENT_TS), MAX(EVENT_TS)) AS DURATION_SECONDS
-            FROM {_campaign_table()}
-            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
-              AND SESSION_ID IS NOT NULL
-            GROUP BY SESSION_ID
-        )
+        WITH {spans}
         SELECT
             CASE
-                WHEN DURATION_SECONDS = 0 THEN '0s (instant)'
-                WHEN DURATION_SECONDS <= 10 THEN '1-10 seconds'
-                WHEN DURATION_SECONDS <= 60 THEN '10-60 seconds'
-                WHEN DURATION_SECONDS <= 300 THEN '1-5 minutes'
-                WHEN DURATION_SECONDS <= 1800 THEN '5-30 minutes'
-                WHEN DURATION_SECONDS <= 7200 THEN '30 min - 2 hours'
+                WHEN SECS = 0 THEN '0s (instant)'
+                WHEN SECS <= 10 THEN '1-10 seconds'
+                WHEN SECS <= 60 THEN '10-60 seconds'
+                WHEN SECS <= 300 THEN '1-5 minutes'
+                WHEN SECS <= 1800 THEN '5-30 minutes'
+                WHEN SECS <= 7200 THEN '30 min - 2 hours'
                 ELSE 'over 2 hours'
             END AS BAND,
             CASE
-                WHEN DURATION_SECONDS = 0 THEN 1
-                WHEN DURATION_SECONDS <= 10 THEN 2
-                WHEN DURATION_SECONDS <= 60 THEN 3
-                WHEN DURATION_SECONDS <= 300 THEN 4
-                WHEN DURATION_SECONDS <= 1800 THEN 5
-                WHEN DURATION_SECONDS <= 7200 THEN 6
+                WHEN SECS = 0 THEN 1
+                WHEN SECS <= 10 THEN 2
+                WHEN SECS <= 60 THEN 3
+                WHEN SECS <= 300 THEN 4
+                WHEN SECS <= 1800 THEN 5
+                WHEN SECS <= 7200 THEN 6
                 ELSE 7
             END AS BAND_ORDER,
             COUNT(*) AS SESSIONS
-        FROM s
+        FROM spans
         GROUP BY BAND, BAND_ORDER
         ORDER BY BAND_ORDER
     """
@@ -1775,11 +1856,75 @@ _EVENT_BUCKET = f"""
         END"""
 
 
+# What the donut and the Interactions / Session card count: a page visit once per page per
+# session, and every other event - each click, each form submit - on its own.
+#
+# Every event used to count, and a handful of sessions owned the result: on
+# demand_ai_internal_website_track over 31 Aug-29 Sep (internal traffic excluded), the top 1% of
+# sessions - 49 of them - fired 42.4% of all events, and one fired 9,442 on two pages. Those are
+# open tabs re-firing "page visit" every 30-60 seconds; 99% of the heavy sessions' events are page
+# visits. Collapsing repeat visits to the same page removes that, while a click or a form submit is
+# never a re-fire and keeps counting every time. Measured on the same window: 119,960 events became
+# 8,076 interactions (page visit 5,979, clicks 2,061, form submit 36), the heaviest session went from
+# 9,442 to 4, and the top 1% of sessions' share fell from 42.4% to 11.1%.
+#
+# Two alternatives were measured and rejected. Deduplicating every event type per page lost 43% of
+# clicks and half the form submits, because two different buttons on one page then count once. And
+# dropping only page visits repeated within 25-65s left the top 1% at 34.7%: the tabs do not all
+# beat at that interval, and one session still kept 827.
+#
+# The page key is host + path with the query string dropped (_PAGE_URL): SEARCH_URL can carry an
+# email address, and the query string barely moved the count (6,026 against 5,990 when tried).
+# Both halves of _PAGE_URL are COALESCE-guarded, so a page visit can never produce a NULL key and
+# silently drop out of the count. A page visit with no SESSION_ID cannot be deduplicated within a
+# session, so it counts on its own, keyed by MESSAGE_ID like any other event. The 'p|' and 'e|'
+# prefixes keep the two kinds of key from ever colliding.
+#
+# The bucket is tested through _EVENT_BUCKET rather than _PAGE_VIEW on purpose: a form submit can
+# also carry EVENT_TYPE 'page', and the donut files it under Form submit, so it must not be
+# collapsed as if it were a page visit.
+_INTERACTION_KEY = f"""IFF(({_EVENT_BUCKET}) = 'Page visit' AND SESSION_ID IS NOT NULL,
+            'p|' || SESSION_ID::STRING || '|' || {_PAGE_URL},
+            'e|' || MESSAGE_ID)"""
+
+
+def _session_spans_ctes(source: str) -> str:
+    """Two CTEs, `firsts` and `spans`: each session's duration and interaction count under the
+    interactions rule. `source` is a FROM clause with its WHERE, and must exclude NULL SESSION_IDs.
+
+    A session's duration runs from its first event to the FIRST time its last new interaction
+    happened - the latest moment it did something it had not done before. A page an open tab keeps
+    re-firing is the same interaction each time (_INTERACTION_KEY), so only its first firing counts
+    and the re-fires stop stretching the session. Measured on demand_ai_internal_website_track over
+    31 Aug-29 Sep with internal traffic excluded: "over 2 hours" went from 259 sessions to 34 - 225
+    of them were tabs left open - and the mean from 42.1 to 17.4 minutes.
+
+    What it still is not: reading time. A visitor who reads one page for ten minutes without
+    clicking now shows 0s, because the re-fires were the only sign they were still there. The
+    captions say so. The remaining mean is pulled up by SESSION_IDs that persist for days (seven
+    spanning over a day held 45% of all duration before this change), which is why the captions
+    lead with the median.
+
+    Written once and used by campaign_duration_bands_sql and campaign_detail_kpis_sql, so the
+    chart's bands and the caption's median can never be measured two different ways.
+    """
+    return f"""firsts AS (
+            SELECT SESSION_ID, {_INTERACTION_KEY} AS K, MIN(EVENT_TS) AS T
+            FROM {source}
+            GROUP BY 1, 2
+        ), spans AS (
+            SELECT SESSION_ID, DATEDIFF('second', MIN(T), MAX(T)) AS SECS, COUNT(*) AS INTERACTIONS
+            FROM firsts
+            GROUP BY 1
+        )"""
+
+
 def campaign_event_mix_sql() -> str:
-    """One campaign's events split three exclusive ways. Covers EVERY event.
+    """One campaign's INTERACTIONS split three exclusive ways - see _INTERACTION_KEY.
 
     Renders: the event-mix ring beside the KPI cards - the one section with no heading
-    of its own. Its total sits in the ring's hole, which is where the old Events card went.
+    of its own. Its total sits in the ring's hole, labelled "Total Interactions": a page visit
+    counts once per page per session, every click and form submit counts on its own.
 
     Same three binds as every other campaign query - start, end, campaign id - so it shares
     their cache behaviour and parameter list.
@@ -1801,13 +1946,14 @@ def campaign_event_mix_sql() -> str:
     "asked a question" action is attributes:category='query' and numbers 983 events against
     446,305 flagged. See _AI_REQUEST, which every AI figure on the dashboard still uses.
 
-    The three buckets are exclusive and exhaustive, so they now sum to the campaign's total
-    event count - which is what lets the donut put that total in its hole honestly.
+    The three buckets are exclusive and exhaustive, and every interaction key belongs to exactly
+    one of them (a page key is only ever built for a Page visit row), so the slices sum to the
+    KPI row's INTERACTIONS - which is what lets the donut put that total in its hole honestly.
     """
     return f"""
         SELECT
             {_EVENT_BUCKET} AS BUCKET,
-            COUNT(DISTINCT MESSAGE_ID) AS EVENTS
+            COUNT(DISTINCT {_INTERACTION_KEY}) AS INTERACTIONS
         FROM {_campaign_table()}
         {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
         GROUP BY 1
@@ -1955,6 +2101,12 @@ def campaign_pages_sql(limit: int = 12) -> str:
 
     The denominator comes from a scalar subquery over the same base CTE rather than a second
     scan, which also keeps this at three parameters like every other drill-down query.
+
+    No VIEWS or VIEWS_PER_SESSION columns, deliberately. They counted every page-visit event, and
+    95% of those were an open tab re-firing the page every 30-60 seconds - /meet-the-team/ showed
+    668 sessions and 30,338 views, 45.4 per session. Under the interactions rule a page counts once
+    per session, so a page's views would simply equal its SESSIONS and every per-session ratio
+    would read 1.0: columns that can only repeat another column are dropped rather than kept.
     """
     return f"""
         WITH base AS (
@@ -1972,9 +2124,6 @@ def campaign_pages_sql(limit: int = 12) -> str:
                 {_PAGE_URL} AS PAGE_URL,
                 MODE(SCHEME) AS SCHEME,
                 COUNT(DISTINCT SESSION_ID) AS SESSIONS,
-                COUNT(DISTINCT MESSAGE_ID) AS VIEWS,
-                ROUND(COUNT(DISTINCT MESSAGE_ID) * 1.0
-                      / NULLIF(COUNT(DISTINCT SESSION_ID), 0), 1) AS VIEWS_PER_SESSION,
                 COALESCE((COUNT(DISTINCT SESSION_ID) * 100.0
                     / NULLIF((SELECT N FROM all_sessions), 0))::FLOAT, 0) AS PCT_OF_SESSIONS
             FROM base
@@ -1986,8 +2135,6 @@ def campaign_pages_sql(limit: int = 12) -> str:
         SELECT
             IFF(COUNT(*) OVER (PARTITION BY PATH) > 1, PAGE_URL, PATH) AS PAGE,
             SESSIONS,
-            VIEWS,
-            VIEWS_PER_SESSION,
             PCT_OF_SESSIONS,
             HOST,
             SCHEME || '://' || HOST || PATH AS URL
@@ -2001,14 +2148,22 @@ def campaign_assets_sql(limit: int = 12) -> str:
     """Content this campaign put in front of people, by reach.
 
     Renders: "Content" on the page, "Content by reach" in the PDF and the HTML.
+
+    INTERACTIONS follows _INTERACTION_KEY, as the donut and the Interactions / Session card do: a
+    page visit counts once per page per session, and every click - a PDF page turn is one - counts
+    each time. This was EVENTS, every event, and an open tab re-firing the page owned it: on one
+    campaign (31 Aug - 29 Sep) the top asset read 754 sessions and 12,747 events, 16.9 per
+    session, against 1,586 interactions, 2.1. Across that campaign's assets 84% of the events were
+    re-fires. Within one asset the page key cannot double count, because the GROUP BY keeps two
+    assets opened on the same page apart.
     """
     return f"""
         SELECT
             {_ASSET_LABEL} AS ASSET,
             COUNT(DISTINCT SESSION_ID) AS SESSIONS,
-            COUNT(DISTINCT MESSAGE_ID) AS EVENTS,
-            ROUND(COUNT(DISTINCT MESSAGE_ID) * 1.0
-                  / NULLIF(COUNT(DISTINCT SESSION_ID), 0), 1) AS EVENTS_PER_SESSION
+            COUNT(DISTINCT {_INTERACTION_KEY}) AS INTERACTIONS,
+            ROUND(COUNT(DISTINCT {_INTERACTION_KEY}) * 1.0
+                  / NULLIF(COUNT(DISTINCT SESSION_ID), 0), 1) AS INTERACTIONS_PER_SESSION
         FROM {_campaign_table()}
         {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
           AND {_ASSET} IS NOT NULL
@@ -2023,19 +2178,41 @@ def campaign_read_depth_sql(limit: int = 10) -> str:
     """How far into this campaign's documents people got.
 
     Renders: "PDF read depth".
+
+    Measured per session first: each session's deepest page in a document is one number, and
+    AVG_PAGE_REACHED is the mean of those. DEEPEST_PAGE is the furthest any one session reached.
+    This used to average the page number over every page-turn event, which weighted a session by
+    how many turns it fired and counted every early page a reader passes on the way in - the
+    further someone read, the more their pages 1, 2 and 3 pulled the figure down. On one campaign
+    (31 Aug - 29 Sep) Warehouse Brochure read 2.2 that way against 3.2 per session, and T&L 1.9
+    against 4.7. A MAX does not move when a row repeats, so the byte-identical duplicate rows drop
+    out too; the old AVG over raw rows counted 207 duplicate page turns twice, across 9 campaigns.
+
+    The label is computed in the CTE, beside the raw slug it is grouped on, because _ASSET_LABEL
+    reads QUERY_PARAMETERS and that column does not survive into the outer SELECT. page_visited
+    measured clean: 29,151 page turns in a 30-day window, every one numeric, from 1 to 70.
     """
     return f"""
+        WITH per_session AS (
+            SELECT
+                {_ASSET} AS ASSET_KEY,
+                {_ASSET_LABEL} AS ASSET,
+                SESSION_ID,
+                MAX(TRY_TO_NUMBER(PROPERTIES:page_visited::STRING)) AS DEEPEST
+            FROM {_campaign_table()}
+            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+              AND PROPERTIES:page_visited IS NOT NULL
+              AND {_ASSET} IS NOT NULL
+              AND SESSION_ID IS NOT NULL
+            GROUP BY {_ASSET}, SESSION_ID
+        )
         SELECT
-            {_ASSET_LABEL} AS ASSET,
-            COUNT(DISTINCT SESSION_ID) AS SESSIONS,
-            ROUND(AVG(TRY_TO_NUMBER(PROPERTIES:page_visited::STRING)), 1) AS AVG_PAGE_REACHED,
-            MAX(TRY_TO_NUMBER(PROPERTIES:page_visited::STRING)) AS DEEPEST_PAGE
-        FROM {_campaign_table()}
-        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
-          AND PROPERTIES:page_visited IS NOT NULL
-          AND {_ASSET} IS NOT NULL
-          AND SESSION_ID IS NOT NULL
-        GROUP BY {_ASSET}
+            ASSET,
+            COUNT(*) AS SESSIONS,
+            ROUND(AVG(DEEPEST), 1) AS AVG_PAGE_REACHED,
+            MAX(DEEPEST) AS DEEPEST_PAGE
+        FROM per_session
+        GROUP BY ASSET_KEY, ASSET
         ORDER BY SESSIONS DESC
         LIMIT {limit}
     """
@@ -2066,48 +2243,138 @@ def campaign_companies_sql(limit: int = 12) -> str:
     """
 
 
+# What a campaign visitor's session "arrived from", in the order their colours are pinned. Exported
+# so the page can give each one a fixed colour instead of a colour by rank. Two groups are SHOWN;
+# _ARRIVAL_GROUP still classifies a third, Internal, because that is what keeps same-site and
+# Demand AI-host referrers out of External - campaign_sources_sql then leaves its row out, by request.
+ARRIVAL_ORDER = ("Direct", "External")
+
+# Internal = the first event's referrer is this site itself, or one of Demand AI's own hosts
+# (_INTERNAL_REFERRER). Everything else with a referrer is External, and no referrer is Direct.
+# Deliberately NOT _SOURCE_GROUP, for two reasons that were each decided rather than assumed:
+#
+#   - _SOURCE_GROUP has a fourth bucket, Email / Office (SharePoint, Office web viewer,
+#     microsoft.com), which this chart does not want. Such a referrer now falls through to
+#     External because nothing else matches it - 499 of 53,707 sessions (0.9%) across all
+#     campaigns over 30 days, but 44-100% of the sessions on a handful of them.
+#   - A session whose first referrer is on the SAME host as the page it landed on is folded into
+#     Internal rather than into External. It began partway through a visit on the site, so it
+#     did not arrive from anywhere outside it; left to the host list alone it would be External
+#     on a customer's own domain (cxocluster.com was charted as an outside source with 813
+#     events) and Internal only by the accident of matching %demandai.net.
+#
+# _SOURCE_GROUP itself is untouched because Pages & Sources reads it over the whole dataset, and
+# its expanded SQL was checked byte-for-byte identical after _INTERNAL_REFERRER was extracted.
+#
+# The empty-referrer test comes first so a blank referrer is Direct rather than comparing a NULL
+# host to the page's host. _REF_HOST is NULL for an unparsable referrer, and NULL = anything is
+# NULL, so those rows fall through to External. _PAGE_HOST is COALESCEd to '' though, so a page
+# with no host is excluded from the same-site test explicitly: without that, a referrer whose host
+# also parses empty would "match" it and be filed as Internal.
+_ARRIVAL_GROUP = f"""
+        CASE
+            WHEN COALESCE(REFERER_URL, '') = '' THEN 'Direct'
+            WHEN ({_REF_HOST} = {_PAGE_HOST} AND {_PAGE_HOST} <> '') OR {_INTERNAL_REFERRER} THEN 'Internal'
+            ELSE 'External'
+        END"""
+
+
 def campaign_sources_sql(referrer_limit: int = 8) -> str:
-    """Source mix and named referrers for one campaign, one scan, split by KIND.
+    """How one campaign's SESSIONS arrived - Direct or External - and which outside sites sent them.
+
+    Internal is classified and then left out of the `group` rows, by request: "How they arrived"
+    shows Direct and External only, so its bars no longer sum to Distinct Sessions - the gap is the
+    Internal sessions (970 of 4,849 on demand_ai_internal_website_track, 31 Aug - 29 Sep, internal
+    traffic excluded). It is still classified rather than dropped from the CASE, because without
+    it a same-site or Demand AI-host referrer would land in External. On 21 campaigns in that
+    window every session is Internal, so this returns no `group` rows at all; the renderers say so
+    with ARRIVAL_NONE rather than an empty section.
 
     Renders: "How they arrived" and "External referrers" - one query, split by KIND
-    into the `sources` and `referrers` frames.
+    into the `sources` and `referrers` frames. Both count SESSIONS, not events.
+
+    An arrival is a session's FIRST event, so this keeps exactly one row per session - the
+    earliest by EVENT_TS - and classifies that row's referrer. It used to classify every event,
+    and that answered a different question ("what referrer did each event carry?"), which was
+    measured to be wrong by 15-45 percentage points on the bars a reader looks at:
+
+        demand_ai_internal_website_track   Internal / dev 65.3% of events, 19.7% of arrivals
+                                           Direct / none  19.3% of events, 47.4% of arrivals
+                                           External       15.4% of events, 32.9% of arrivals
+        7ce02022-...                       External       31.1% of events, 51.5% of arrivals
+
+    Three things were wrong at once. Every click and every 30-60s heartbeat from an open tab
+    carries a referrer, so long sessions outvoted short ones. The "Internal / dev" bucket was
+    98.6% same-site navigation on the internal campaign and 100% on a customer one - a visitor
+    moving between pages, not internal traffic. And the same blind spot ran the other way: a
+    customer's own domain was charted as an External referrer. Sessions that arrived from Direct
+    had 51% of their later events labelled "Internal / dev"; sessions that arrived from Google
+    had 24% of theirs.
+
+    Why the first event and not SESSIONSTART: that column is empty (0% of sessions) on every
+    campaign checked, so it cannot mark an arrival.
+
+    What Internal hides: about 18.5% of the internal campaign's sessions START with a same-site
+    referrer, meaning the recorded session began partway through a visit and its true source is
+    unknown. Folding them into Internal is a simplification asked for, not a finding - they are
+    "not from outside" rather than "known to be internal". The earlier four-group form kept them
+    apart as "Same site (mid-visit)" and can be restored from git history if that matters.
+
+    Events with no SESSION_ID are excluded, which the old form did not do. This is unreachable
+    in practice: collect() returns STATUS_NO_SESSIONS before calling this for a campaign with
+    no session ids.
     """
     return f"""
-        WITH base AS (
-            SELECT MESSAGE_ID, REFERER_URL
+        WITH arrivals AS (
+            SELECT REFERER_URL, SEARCH_URL
             FROM {_campaign_table()}
             {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+              AND SESSION_ID IS NOT NULL
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY SESSION_ID ORDER BY EVENT_TS, MESSAGE_ID) = 1
         ), grp AS (
-            SELECT 'group' AS KIND, {_SOURCE_GROUP} AS LABEL,
-                   COUNT(DISTINCT MESSAGE_ID) AS EVENTS
-            FROM base GROUP BY 1, 2
-        ), ref AS (
-            SELECT 'referrer' AS KIND, {_REF_HOST} AS LABEL,
-                   COUNT(DISTINCT MESSAGE_ID) AS EVENTS
-            FROM base
-            WHERE {_SOURCE_GROUP} = 'External'
+            SELECT 'group' AS KIND, {_ARRIVAL_GROUP} AS LABEL, COUNT(*) AS SESSIONS
+            FROM arrivals
+            WHERE {_ARRIVAL_GROUP} <> 'Internal'
             GROUP BY 1, 2
-            QUALIFY ROW_NUMBER() OVER (ORDER BY EVENTS DESC) <= {referrer_limit}
+        ), ref AS (
+            SELECT 'referrer' AS KIND, {_REF_HOST} AS LABEL, COUNT(*) AS SESSIONS
+            FROM arrivals
+            WHERE {_ARRIVAL_GROUP} = 'External' AND {_REF_HOST} IS NOT NULL
+            GROUP BY 1, 2
+            QUALIFY ROW_NUMBER() OVER (ORDER BY SESSIONS DESC, LABEL) <= {referrer_limit}
         )
         SELECT * FROM grp
         UNION ALL SELECT * FROM ref
-        ORDER BY KIND, EVENTS DESC
+        -- LABEL breaks ties so two referrers with equal sessions keep one order. Without it the
+        -- order among them followed the query plan, and moved when this SQL's text did.
+        ORDER BY KIND, SESSIONS DESC, LABEL
     """
 
 
 def campaign_ai_sql() -> str:
-    """Model mix for one campaign. Only 19% of campaigns reach this query.
+    """Which AI model built the pages this campaign's sessions were on. About 1 in 5 campaigns
+    reaches this query (133 of 649 in a 30-day window).
 
     Renders: "AI usage" on the page, "AI model mix" in the PDF and the HTML.
+
+    Counted by SESSION, with INTERACTIONS (see _INTERACTION_KEY) beside it. This used to count
+    every flagged event as a REQUEST, but the flag is on every event of an AI-built page, so the
+    count was that page's whole event stream: on one campaign (31 Aug - 29 Sep) 53,818 "requests"
+    were all 53,818 of its events, 50,982 of them page-visit heartbeats, from 729 sessions - 3,580
+    interactions. Every session on every flagged campaign carried the flag and none saw two models,
+    so a session is the clean unit; should one ever see two, it counts once under each and the
+    rows sum past the AI_SESSIONS figure on the page. ORDER BY breaks a tie on the model name so
+    the colour each model takes, which follows its rank here, cannot flip between two runs.
     """
     return f"""
         SELECT
             {_MODEL} AS MODEL,
-            COUNT(DISTINCT MESSAGE_ID) AS REQUESTS,
-            COUNT(DISTINCT SESSION_ID) AS SESSIONS
+            COUNT(DISTINCT SESSION_ID) AS SESSIONS,
+            COUNT(DISTINCT {_INTERACTION_KEY}) AS INTERACTIONS
         FROM {_campaign_table()}
         {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
           AND {_AI_REQUEST}
+          AND SESSION_ID IS NOT NULL
         GROUP BY 1
-        ORDER BY REQUESTS DESC
+        ORDER BY SESSIONS DESC, MODEL
     """

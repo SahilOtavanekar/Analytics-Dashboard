@@ -33,6 +33,7 @@ from __future__ import annotations
 import datetime as dt
 import html
 import math
+import re
 
 from src.queries import (
     EVENT_BUCKET_ORDER,
@@ -49,6 +50,84 @@ from src.queries import (
     campaign_read_depth_sql,
     campaign_sources_sql,
 )
+
+# What the two groups in "How they arrived" mean, worded once. Public because the page imports it:
+# three renderers each writing their own sentence is how a page and its downloads end up describing
+# the same bar differently. The last sentence is there because the bars no longer sum to Distinct
+# Sessions - Internal is classified but not shown, see campaign_sources_sql.
+ARRIVAL_NOTE = ("Sessions, by where each one arrived from. Direct: no referring site - the link was typed, "
+                "bookmarked, or opened from an email or app. External: sent by another website, such as a "
+                "search engine, social network or partner site. Sessions that began partway through a "
+                "visit, or came from Demand AI's own sites, are not shown.")
+# When every session was one of those not shown, so the section has no bars. Public for the same reason.
+ARRIVAL_NONE = ("No session arrived directly or from an external site in this range: every one began partway "
+                "through a visit on the site, or came from one of Demand AI's own sites.")
+
+# Every EVENT_TS is stored in UTC - measured, one offset (+00:00) across the table - so a day on the
+# activity chart is a UTC day, and today's keeps filling until midnight UTC whatever the reader's
+# own clock says. Unmarked it reads as a collapse: at 02:05 Pacific the last bar showed 50 sessions
+# against a recent median of 175, because the day was nine hours old.
+PARTIAL_DAY_NOTE = "{day} is still in progress, so its bar is partial. Days run midnight to midnight UTC."
+
+
+def partial_day(daily, today):
+    """The activity chart's last day if it has not finished yet, else None.
+
+    `today` is the current UTC date, passed in rather than read here so the rule can be tested
+    against any clock. A day is partial while it is today or later in UTC - "later" only
+    because a source clock running ahead must not leave a still-filling day looking complete.
+    """
+    if daily is None or not len(daily):
+        return None
+    days = [d for d in (_as_date(v) for v in daily["EVENT_DATE"]) if d is not None]
+    last = max(days) if days else None
+    return last if last is not None and last >= today else None
+
+
+def partial_day_note(day) -> str:
+    """The one sentence the page, the PDF and the HTML print under a partial last day."""
+    return PARTIAL_DAY_NOTE.format(day=_fmt_date(day))
+
+
+# The Session duration note for both downloads, worded like the page's caption.
+DURATION_REPORT_NOTE = ("From a session's first event to its last interaction - a page an open tab keeps re-firing "
+                        "does not stretch it - and not time spent reading. {single:,} of {sessions:,} sessions had "
+                        "a single interaction.")
+
+# The HTML has no hover text, so what an interaction is gets said once under its ring. Short on purpose - the reasoning, with the
+# measurements, lives at _INTERACTION_KEY in queries.py. Not printed in the PDF, by request: the PDF's ring stands without it.
+INTERACTIONS_NOTE = ("Interactions count a page visit once per page per session - an open tab re-fires page "
+                     "visits every 30-60 seconds - and every click and form submit each time.")
+
+# Content and read depth, under the same rule and said under each table for the same reason. The
+# measurements behind both are at campaign_assets_sql and campaign_read_depth_sql in queries.py.
+# The PDF's Pages viewed note, hoisted so the call that draws the table stays on one line.
+PAGES_REPORT_NOTE = ("Labelled by path, with the host alongside. Each page counts once per session. Query strings are "
+                     "stripped; localhost and iframe pages are left out. One session can visit several pages, so the "
+                     "shares do not sum to 100%.")
+PAGES_HTML_NOTE = ("Each page links to its own address and counts once per session. Query strings are stripped; "
+                   "localhost and iframe pages are left out. One session can visit several pages, so the shares do "
+                   "not sum to 100%.")
+CONTENT_REACH_NOTE = ("Interactions / session counts each page once per session and every click, a PDF page turn "
+                      "included, each time.")
+READ_DEPTH_NOTE = ("Avg deepest is each session's deepest page in the document, averaged; Deepest Page is the "
+                   "furthest any one session reached.")
+AI_MIX_NOTE = ("Sessions on pages built with each AI model. Interactions count each page once per session and "
+               "every click each time.")
+
+
+# Cell formatters for the Content tables, named so both calls stay on one line each - the Snowsight
+# editor re-indents multi-line calls inside indented blocks and breaks them.
+def _fmt_tenths(v) -> str:
+    return f"{float(v or 0):,.1f}"
+
+
+def _fmt_count(v) -> str:
+    return f"{int(v or 0):,}"
+
+
+def _fmt_text(v) -> str:
+    return _safe(v or "")
 
 # An identified-people floor, not a courtesy. Across the top 25 campaigns two have exactly
 # one identified person, and "1 person at acme.com" is an individual described by a report
@@ -90,20 +169,43 @@ STATUS_MISSING = "missing"
 def classify_lookup(found) -> str:
     """Turn a campaign_lookup_sql row into one of three outcomes.
 
-    "open"          activity inside the selected window
-    "wrong_window"  a real campaign that ran on other dates - name them
-    "unknown"       no such id anywhere in the tracked data - a typo
+    "open"           activity inside the selected window
+    "internal_only"  activity exists, but every event the reader would see is internal traffic
+                     that "Exclude internal traffic" has removed - say so, rather than suggest a
+                     date change that would not help
+    "wrong_window"   a real campaign that ran on other dates - name them
+    "unknown"        no such id anywhere in the tracked data - a typo
 
     Pure, and tested directly, because the path that reaches it cannot be driven through
     Streamlit's test harness: AppTest resolves a selectbox value via options.index(), so a
     deliberately-absent value - the whole point of accepting a pasted id - raises before the
     script runs.
     """
+    # .get, not [], for the INTERNAL_ columns: a lookup row built before they existed - or by a
+    # test - has none, and must keep classifying as it always did.
     if int(found["EVENTS_IN_WINDOW"]) > 0:
         return "open"
+    if int(found.get("INTERNAL_EVENTS_IN_WINDOW", 0) or 0) > 0:
+        return "internal_only"
     if int(found["EVENTS_EVER"]) > 0:
         return "wrong_window"
+    if int(found.get("INTERNAL_EVENTS_EVER", 0) or 0) > 0:
+        return "internal_only"
     return "unknown"
+
+
+# Worded once for the page, the PDF, the HTML and the list view's id box. The second form is the
+# rare case of a campaign that has only ever been internal traffic and has none in this window.
+_INTERNAL_IN_WINDOW_MSG = ("All {n:,} events this campaign recorded between {window} are internal traffic, "
+                           "which Exclude internal traffic leaves out. Turn that filter off to see them.")
+_INTERNAL_EVER_MSG = ("This campaign has no activity between {window}, and everything it has ever recorded "
+                      "is internal traffic, which Exclude internal traffic leaves out.")
+
+
+def internal_only_message(found, window: str) -> str:
+    """The sentence for classify_lookup's "internal_only" outcome."""
+    n = int(found.get("INTERNAL_EVENTS_IN_WINDOW", 0) or 0)
+    return _INTERNAL_IN_WINDOW_MSG.format(n=n, window=window) if n else _INTERNAL_EVER_MSG.format(window=window)
 
 
 def collect(run, campaign_id: str, start: dt.date, end: dt.date) -> dict:
@@ -143,6 +245,7 @@ def collect(run, campaign_id: str, start: dt.date, end: dt.date) -> dict:
 
     out["status"] = STATUS_OK
     out["daily"] = run(campaign_daily_sql(), params)
+    out["partial_day"] = partial_day(out["daily"], dt.datetime.now(dt.timezone.utc).date())
     out["duration"] = run(campaign_duration_bands_sql(), params)
     out["event_mix"] = run(campaign_event_mix_sql(), params)
     # No "actions" key any more: the action-reach breakdown was removed from the page, the PDF
@@ -162,17 +265,17 @@ def collect(run, campaign_id: str, start: dt.date, end: dt.date) -> dict:
 
     if int(kpis["ASSETS"]) > 0:
         out["assets"] = run(campaign_assets_sql(), params)
-        if int(kpis["PDF_EVENTS"]) > 0:
+        if int(kpis["PAGE_TURN_SESSIONS"]) > 0:
             out["depth"] = run(campaign_read_depth_sql(), params)
 
     if int(kpis["PEOPLE"]) >= IDENTITY_FLOOR:
         out["companies"] = run(campaign_companies_sql(), params)
 
     sources = run(campaign_sources_sql(), params)
-    out["sources"] = sources[sources["KIND"] == "group"][["LABEL", "EVENTS"]].rename(columns={"LABEL": "SOURCE_GROUP"})
-    out["referrers"] = sources[sources["KIND"] == "referrer"][["LABEL", "EVENTS"]].rename(columns={"LABEL": "REFERRER"})
+    out["sources"] = sources[sources["KIND"] == "group"][["LABEL", "SESSIONS"]].rename(columns={"LABEL": "SOURCE_GROUP"})
+    out["referrers"] = sources[sources["KIND"] == "referrer"][["LABEL", "SESSIONS"]].rename(columns={"LABEL": "REFERRER"})
 
-    if int(kpis["AI_EVENTS"]) > 0:
+    if int(kpis["AI_SESSIONS"]) > 0:
         out["ai"] = run(campaign_ai_sql(), params)
 
     return out
@@ -221,6 +324,7 @@ _PDF_MUTED = (84, 106, 106)
 _PDF_TEAL = (5, 110, 110)
 _PDF_RULE = (230, 236, 236)
 _PDF_BAND = (242, 247, 247)
+_PDF_TEAL_PARTIAL = (155, 199, 199)  # _PDF_TEAL at ~40%: a day still in progress
 _PAGE_W = 180.0  # A4 width less both margins
 
 # The first three slots of theme.CATEGORICAL_LIGHT, as RGB, and deliberately a COPY rather
@@ -415,7 +519,7 @@ def _pdf_bar_values(pdf, points, values, emphasis, y0, bar_w) -> None:
     pdf.set_text_color(*_PDF_INK)
 
 
-def _pdf_series_chart(pdf, title, frame, x_col, y_col, y_title, kind="bar", note=None, height=46.0) -> None:
+def _pdf_series_chart(pdf, title, frame, x_col, y_col, y_title, kind="bar", note=None, height=46.0, partial=None, total=None) -> None:
     """A time series as an actual chart, drawn as vector rather than rasterised.
 
     Thirty dates in a table is a list of numbers nobody reads; the shape - which days spiked,
@@ -443,6 +547,20 @@ def _pdf_series_chart(pdf, title, frame, x_col, y_col, y_title, kind="bar", note
     labels = [str(getattr(r, x_col)) for r in frame.itertuples()]
     top, gridlines = _nice_axis(max(values))
 
+    # Each row's place on the axis, in DAYS from the first row - not its position in the list.
+    # The daily query returns only days that had activity, so placing by list position collapsed
+    # every silent stretch: a run active 1-5 Sep and 20-24 Sep drew 5 Sep -> 20 Sep exactly as far
+    # apart as 1 Sep -> 2 Sep, and 435 of 505 campaigns in a 30-day window have silent days inside
+    # their run. The page's trend_bar is temporal and always showed those gaps, so the PDF told a
+    # different story about the same numbers. A date that will not parse falls back to list order.
+    dates = [_as_date(v) for v in labels]
+    if all(d is not None for d in dates):
+        first = min(dates)
+        offsets = [(d - first).days for d in dates]
+    else:
+        offsets = list(range(len(values)))
+    span = max(offsets) + 1
+
     # Reserve the whole block up front so auto page-break cannot split the axes from the line.
     if pdf.get_y() + height + 10 > pdf.h - pdf.b_margin:
         pdf.add_page()
@@ -468,14 +586,14 @@ def _pdf_series_chart(pdf, title, frame, x_col, y_col, y_title, kind="bar", note
     # Where each day sits. Columns are centred in their own slot so the first and last are
     # fully inside the axes; a line runs edge to edge, because its points ARE the ends.
     if kind == "bar":
-        slot = plot_w / len(values)
+        slot = plot_w / span
         # Columns fill their slot, so consecutive days touch. There was a 0.6mm gap here, which
         # is what the house chart guidance prescribes for separating neighbouring bars - adjacent
         # columns were asked for instead, and the figure above each one carries the separating
         # that the air was doing. Days with NO activity are still gaps: those rows are absent
-        # from the data rather than zero, which is why this axis is drawn from dates.
+        # from the data rather than zero, which is why each column is placed by its date offset.
         bar_w = slot
-        points = [(x0 + i * slot + slot / 2, y0 + plot_h - (v / top) * plot_h) for i, v in enumerate(values)]
+        points = [(x0 + off * slot + slot / 2, y0 + plot_h - (v / top) * plot_h) for off, v in zip(offsets, values)]
         pdf.set_fill_color(*_PDF_TEAL)
         # Full-width columns in one flat colour merge into a single block, which is what the chart
         # looked like. Each now carries a hairline in the PAGE colour: where two columns meet the
@@ -486,7 +604,10 @@ def _pdf_series_chart(pdf, title, frame, x_col, y_col, y_title, kind="bar", note
         pdf.set_draw_color(255, 255, 255)
         edge = min(0.25, bar_w * 0.18)
         pdf.set_line_width(edge)
-        for px, py in points:
+        for i, (px, py) in enumerate(points):
+            # A day still in progress is drawn in a pale tint of the same teal - same series, so
+            # the same hue, but visibly not a finished measurement. See PARTIAL_DAY_NOTE.
+            pdf.set_fill_color(*(_PDF_TEAL_PARTIAL if partial is not None and dates[i] == partial else _PDF_TEAL))
             # A zero-height rect draws nothing, so a day with no sessions would silently vanish
             # rather than reading as a day that was measured and was quiet.
             h = max(y0 + plot_h - py, 0.25)
@@ -497,8 +618,8 @@ def _pdf_series_chart(pdf, title, frame, x_col, y_col, y_title, kind="bar", note
     else:
         # One polyline rather than N line() calls so the joins are mitred and the whole path is
         # a single object in the content stream.
-        step = plot_w / (len(values) - 1)
-        points = [(x0 + i * step, y0 + plot_h - (v / top) * plot_h) for i, v in enumerate(values)]
+        step = plot_w / max(span - 1, 1)
+        points = [(x0 + off * step, y0 + plot_h - (v / top) * plot_h) for off, v in zip(offsets, values)]
         pdf.set_fill_color(224, 239, 238)
         pdf.polyline(points + [(points[-1][0], y0 + plot_h), (points[0][0], y0 + plot_h)],
                      fill=True, polygon=True, style="F")
@@ -511,7 +632,12 @@ def _pdf_series_chart(pdf, title, frame, x_col, y_col, y_title, kind="bar", note
     # but a bar chart labels EVERY column and a line chart labels only those two. The difference
     # is the mark: 27 dots each carrying a number is a cloud of text with nothing to sit on,
     # while a column has a cap that holds one.
-    hi, lo = values.index(max(values)), values.index(min(values))
+    hi = values.index(max(values))
+    # The quietest day is chosen from FINISHED days. A day still in progress is low because it
+    # is not over, and naming it "Quietest" - as this did, 40 sessions on a morning-old day -
+    # is the collapse the pale bar exists to prevent. It can still be the peak: it only grows.
+    done = [i for i in range(len(values)) if partial is None or dates[i] != partial]
+    lo = min(done, key=lambda i: values[i]) if done else values.index(min(values))
     if kind == "bar":
         _pdf_bar_values(pdf, points, values, {hi, lo}, y0, bar_w)
     else:
@@ -533,7 +659,6 @@ def _pdf_series_chart(pdf, title, frame, x_col, y_col, y_title, kind="bar", note
     # label still collided on wide ranges, because "3 Sep" and "28 Sep" are not the same width;
     # walking left to right and skipping anything that would overlap the last one drawn is what
     # actually guarantees no collision at any range length.
-    dates = [_as_date(v) for v in labels]
     spans_years = bool(dates[0] and dates[-1] and dates[0].year != dates[-1].year)
     pdf.set_font("Helvetica", "", 6.5)
     pdf.set_text_color(*_PDF_MUTED)
@@ -556,23 +681,88 @@ def _pdf_series_chart(pdf, title, frame, x_col, y_col, y_title, kind="bar", note
     pdf.set_text_color(*_PDF_INK)
 
     pdf.set_y(y0 + height - 3)
-    total = sum(values)
+    # `total` is passed in wherever an authoritative figure already exists elsewhere on the
+    # page, rather than being re-derived here. Summing the bars is a SECOND computation of a
+    # number the KPI row already states, and two computations of one figure drift: daily
+    # session counts attribute a session to each day it touches unless told otherwise, so one
+    # session crossing midnight made this footer read 4,863 beside a card reading 4,856.
+    # campaign_daily_sql now attributes each session to its start day, which makes the two
+    # agree arithmetically - this makes them agree by construction.
+    total = sum(values) if total is None else total
+    # "over 18 active days of 30" when the run has gaps: the count of rows is the days that had
+    # activity, and calling it "18 days" beside an axis that spans 30 understated the run.
+    days_txt = f"{len(values)} days" if span == len(values) else f"{len(values)} active days of {span}"
     pdf.set_font("Helvetica", "", 7.5)
     pdf.set_text_color(*_PDF_MUTED)
-    pdf.cell(0, 4, _safe(f"{y_title}: {total:,.10g} over {len(values)} days      "
-                         f"Peak {max(values):,.10g} on {_fmt_date(labels[hi], year=spans_years)}      "
-                         f"Quietest {min(values):,.10g} on {_fmt_date(labels[lo], year=spans_years)}"),
+    pdf.cell(0, 4, _safe(f"{y_title}: {total:,.10g} over {days_txt}      "
+                         f"Peak {values[hi]:,.10g} on {_fmt_date(labels[hi], year=spans_years)}      "
+                         f"Quietest {values[lo]:,.10g} on {_fmt_date(labels[lo], year=spans_years)}"),
              new_x="LMARGIN", new_y="NEXT")
     pdf.set_text_color(*_PDF_INK)
 
 
-def _pdf_table(pdf, title, frame, label_col, value_col, value_head, extra=None, note=None) -> None:
+# A table row, and the line pitch inside one that wraps. One line is the 5.4mm row every table has
+# always drawn; a wrapped row holds its lines on 3.6mm (8pt type, 1.28 leading) with 0.9mm above
+# and below, so a two-line row is 9.0mm and a one-line row is still exactly 5.4mm.
+_ROW_H = 5.4
+_WRAP_LINE = 3.6
+
+# Where a page path or a host may break when it wraps: after the separators a reader already parses
+# an address by. A run with none of them in reach is split at the last character that fits.
+_WRAP_AFTER = "/-._?&=: "
+
+
+def _wrap_address(pdf, text: str, width: float) -> list:
+    """`text` as lines no wider than `width` in the current font, with every character kept.
+
+    Pages viewed wraps rather than trims, because an address with its tail cut off is a different
+    address. Measured across 60 campaigns (31 Aug - 29 Sep): 94 of 196 page paths and 68 of 196
+    hosts lost their ends to "...", on 32 of the campaigns, and the longest path - 142 characters -
+    is 186mm at 8pt, wider than the whole page, so no column width could have held it.
+
+    Each line breaks after the last separator in _WRAP_AFTER that fits, unless that would leave the
+    line less than half full, in which case it breaks at the last character that fits.
+    """
+    lines = []
+    rest = text
+    while len(rest) > 1 and pdf.get_string_width(rest) > width:
+        fit = 1
+        while fit < len(rest) and pdf.get_string_width(rest[:fit + 1]) <= width:
+            fit += 1
+        cut = max((i + 1 for i in range(fit) if rest[i] in _WRAP_AFTER), default=0)
+        cut = cut if cut * 2 > fit else fit
+        lines.append(rest[:cut])
+        rest = rest[cut:]
+    lines.append(rest)
+    return lines
+
+
+def _pdf_cell_lines(pdf, x, y, w, row_h, lines, align="") -> None:
+    """`lines` as one block at `x`, centred down a table row `row_h` tall.
+
+    A single line is drawn as the single 5.4mm cell a row always was, at the same coordinates, so a
+    table that never wraps renders byte-for-byte as it did. Several lines sit on _WRAP_LINE pitch
+    and the block is centred, which is what the HTML's vertical-align: middle does with the same row.
+    """
+    if len(lines) == 1:
+        pdf.set_xy(x, y + (row_h - _ROW_H) / 2)
+        pdf.cell(w, _ROW_H, lines[0], align=align)
+        return
+    top = y + (row_h - _WRAP_LINE * len(lines)) / 2
+    for i, line in enumerate(lines):
+        pdf.set_xy(x, top + i * _WRAP_LINE)
+        pdf.cell(w, _WRAP_LINE, line, align=align)
+
+
+def _pdf_table(pdf, title, frame, label_col, value_col, value_head, extra=None, note=None, wrap=False) -> None:
+    """A ranked table - label, value, bar, then any `extra` columns.
+
+    `wrap` lets the label and the text extras run onto as many lines as they need instead of being
+    trimmed to one, and the row grows to fit them. Only Pages viewed passes it; see _wrap_address
+    for why. Every other table keeps one line per row and trims, exactly as before.
+    """
     if frame is None or not len(frame):
         return
-    _pdf_heading(pdf, title)
-    if note:
-        _pdf_note(pdf, note)
-
     extra = extra or []
     w_label, w_value = 74.0, 24.0
 
@@ -601,8 +791,7 @@ def _pdf_table(pdf, title, frame, label_col, value_col, value_head, extra=None, 
     pdf.set_font("Helvetica", "B", 7)
     heads = [pdf.get_string_width(_safe(col.replace("_", " ").title())) for col, _ in extra]
     pdf.set_font("Helvetica", "", 8)
-    vals = [max((pdf.get_string_width(_safe(fmt(getattr(r, col)))) for r in frame.itertuples()),
-                default=0.0) for col, fmt in extra]
+    vals = [max((pdf.get_string_width(_safe(fmt(getattr(r, col)))) for r in frame.itertuples()), default=0.0) for col, fmt in extra]
     w_extras = [min(46.0, max(20.0, max(h, v) + 4.0)) for h, v in zip(heads, vals)]
     w_bar = _PAGE_W - w_label - w_value - sum(w_extras)
     # Wide extras eat the bar rather than the label, but only down to a floor - past that the
@@ -611,6 +800,34 @@ def _pdf_table(pdf, title, frame, label_col, value_col, value_head, extra=None, 
     if w_bar < 14.0:
         w_label = max(40.0, w_label - (14.0 - w_bar))
         w_bar = _PAGE_W - w_label - w_value - sum(w_extras)
+
+    # Every row's lines, settled before anything is drawn and at the row font (8pt, set just above):
+    # the heading's reserve below needs the first row's height, and a wrapped row's height is its
+    # line count. Without `wrap` each cell is one line, trimmed by _fit - campaign and asset names
+    # reach 140 characters, and this writer overprints the next column rather than clipping.
+    def _lines(text: str, width: float) -> list:
+        return _wrap_address(pdf, text, width) if wrap else [_fit(text, width)]
+
+    rows = []
+    for row in frame.itertuples():
+        label = _fmt_date(getattr(row, label_col)) if _as_date(getattr(row, label_col)) else _safe(getattr(row, label_col))
+        cells = [_lines(label, w_label - 5)] + [_lines(_safe(fmt(getattr(row, col))), w - 3) for (col, fmt), w in zip(extra, w_extras)]
+        depth = max(len(c) for c in cells)
+        rows.append((row, cells, _ROW_H if depth == 1 else _WRAP_LINE * depth + 1.8))
+
+    # The heading reserves room for ITSELF plus the table's first rows, and a note sits between
+    # the two. Measured rather than assumed: the "How they arrived" note wraps to three lines, and
+    # with the flat 24mm reserve a heading could land at the foot of a page with its note and the
+    # whole table overleaf. _pdf_note draws at 8pt on 4mm lines, so the same font sizes the gap.
+    # A wrapped first row adds what it has over a one-line row, so it cannot be the thing that
+    # leaves a heading behind.
+    keep = 24.0 + (rows[0][2] - _ROW_H)
+    if note:
+        pdf.set_font("Helvetica", "", 8)
+        keep += 4.0 * math.ceil(pdf.get_string_width(_safe(note)) / _PAGE_W)
+    _pdf_heading(pdf, title, keep=keep)
+    if note:
+        _pdf_note(pdf, note)
 
     def _head(continued: bool = False) -> None:
         """The column strip. Redrawn after a page break, because a table that spills over
@@ -636,32 +853,35 @@ def _pdf_table(pdf, title, frame, label_col, value_col, value_head, extra=None, 
     _head()
 
     top = float(max(float(getattr(r, value_col) or 0) for r in frame.itertuples())) or 1.0
-    for n, row in enumerate(frame.itertuples()):
+    for n, (row, cells, row_h) in enumerate(rows):
         # Rows are struck one at a time so a long table can break across pages mid-body, and
-        # the header follows it over so the continuation is readable on its own.
-        if pdf.get_y() + 6 > pdf.h - pdf.b_margin:
+        # the header follows it over so the continuation is readable on its own. The row's own
+        # height decides the break - 6mm for a one-line row, as it always was.
+        if pdf.get_y() + (row_h + 0.6) > pdf.h - pdf.b_margin:
             pdf.add_page()
             _head(continued=True)
         value = float(getattr(row, value_col) or 0)
-        label = _fmt_date(getattr(row, label_col)) if _as_date(getattr(row, label_col)) else _safe(getattr(row, label_col))
-        # Trimmed to what the column can hold. Campaign and asset names reach 140 characters,
-        # page paths run longer still, and the writer overprints the next column rather than
-        # wrapping. See _fit for the loop this replaced and what it did.
-        label = _fit(label, w_label - 5)
         y = pdf.get_y()
         # Alternating tint instead of a rule under every row: at eight point, a hairline every
         # 5mm turns a short table into a grid, while a band lets the eye track across a wide one.
         if n % 2:
             pdf.set_fill_color(250, 252, 252)
-            pdf.rect(pdf.l_margin, y, _PAGE_W, 5.4, style="F")
-        pdf.cell(w_label, 5.4, "  " + label)
-        pdf.cell(w_value, 5.4, f"{value:,.10g}" + "  ", align="R")
+            pdf.rect(pdf.l_margin, y, _PAGE_W, row_h, style="F")
+        # Each cell is placed rather than chained, because a wrapped cell spans several lines and the
+        # next column starts back at the row's top. The x sums run in the order the chained cells
+        # used, so a one-line row lands on exactly the coordinates it always did.
+        x = pdf.l_margin
+        _pdf_cell_lines(pdf, x, y, w_label, row_h, ["  " + s for s in cells[0]])
+        x += w_label
+        _pdf_cell_lines(pdf, x, y, w_value, row_h, [f"{value:,.10g}" + "  "], align="R")
+        x += w_value
         pdf.set_fill_color(*_PDF_TEAL)
-        pdf.rect(pdf.get_x() + 1, y + 1.6, max((value / top) * (w_bar - 3), 0.4), 2.2, style="F")
-        pdf.cell(w_bar, 5.4, "")
-        for (col, fmt), w in zip(extra, w_extras):
-            pdf.cell(w, 5.4, _fit(_safe(fmt(getattr(row, col))), w - 3) + "  ", align="R")
-        pdf.ln()
+        pdf.rect(x + 1, y + (row_h - _ROW_H) / 2 + 1.6, max((value / top) * (w_bar - 3), 0.4), 2.2, style="F")
+        x += w_bar
+        for lines, w in zip(cells[1:], w_extras):
+            _pdf_cell_lines(pdf, x, y, w, row_h, [s + "  " for s in lines], align="R")
+            x += w
+        pdf.set_xy(pdf.l_margin, y + row_h)
 
 
 def _pdf_card_at(pdf, x, y, w, h, label, value) -> None:
@@ -717,7 +937,7 @@ def _pdf_donut(pdf, cx, cy, r_out, r_in, slices) -> None:
         angle += sweep
 
 
-def _pdf_mix_row(pdf, cards, mix, total_events) -> None:
+def _pdf_mix_row(pdf, cards, mix, total_interactions) -> None:
     """The page's top row: stat cards stacked at the left, the event-mix ring at the right.
 
     This is the one section of the report that mirrors a page layout rather than restating a
@@ -729,8 +949,8 @@ def _pdf_mix_row(pdf, cards, mix, total_events) -> None:
     no bucketed events would otherwise get a blank box where the ring should be.
     """
     rows = []
-    if mix is not None and len(mix) and float(mix["EVENTS"].sum()) > 0:
-        by_bucket = {str(r.BUCKET): float(r.EVENTS or 0) for r in mix.itertuples()}
+    if mix is not None and len(mix) and float(mix["INTERACTIONS"].sum()) > 0:
+        by_bucket = {str(r.BUCKET): float(r.INTERACTIONS or 0) for r in mix.itertuples()}
         rows = [(name, by_bucket.get(name, 0.0), _PDF_MIX_HUES[i % len(_PDF_MIX_HUES)]) for i, name in enumerate(EVENT_BUCKET_ORDER) if by_bucket.get(name, 0.0) > 0]
     if not rows:
         _pdf_cards(pdf, cards, per_row=max(1, len(cards)))
@@ -740,7 +960,9 @@ def _pdf_mix_row(pdf, cards, mix, total_events) -> None:
     left_w = (_PAGE_W - gap) / 3.0
     right_w = _PAGE_W - left_w - gap
     card_h = 13.5
-    box_h = 46.0
+    # The ring box grows with the card stack rather than being fixed at 46mm: three cards are
+    # 46.5mm tall, and a fixed box let the third card hang half a millimetre below it.
+    box_h = max(46.0, len(cards) * card_h + (len(cards) - 1) * 3.0)
     if pdf.get_y() + box_h + 4.0 > pdf.h - pdf.b_margin:
         pdf.add_page()
     top = pdf.get_y()
@@ -776,10 +998,18 @@ def _pdf_mix_row(pdf, cards, mix, total_events) -> None:
     pdf.set_text_color(*_PDF_INK)
     pdf.set_xy(cx - r_out, cy - 4.6)
     pdf.cell(r_out * 2.0, 4.6, centre, align="C")
-    pdf.set_font("Helvetica", "", 5.0)
+    # "INTERACTIONS", not "TOTAL INTERACTIONS" as on the page: in this 17mm hole the longer label
+    # only fits at 4.25pt, too small to read in print, and the figure above it is plainly the
+    # total. Still fitted like that figure, so a longer label later cannot overrun the ring.
+    sub_label = _safe("INTERACTIONS")
+    sub_size = 5.0
+    pdf.set_font("Helvetica", "", sub_size)
+    while sub_size > 3.5 and pdf.get_string_width(sub_label) > hole_w:
+        sub_size -= 0.25
+        pdf.set_font("Helvetica", "", sub_size)
     pdf.set_text_color(*_PDF_MUTED)
     pdf.set_xy(cx - r_out, cy - 0.2)
-    pdf.cell(r_out * 2.0, 3.2, _safe("TOTAL EVENTS"), align="C")
+    pdf.cell(r_out * 2.0, 3.2, sub_label, align="C")
 
     # The legend carries the count and the share. Same reasoning as the page's: an arc thin
     # enough to be unlabellable still has a swatch here, and the PDF has no tooltip to fall
@@ -805,12 +1035,12 @@ def _pdf_mix_row(pdf, cards, mix, total_events) -> None:
     # Only fires if the buckets stop being exhaustive. They are today - see
     # campaign_event_mix_sql - so this is a guard against the two totals silently drifting,
     # not a caption the reader is expected to meet.
-    missing = int(total_events) - int(round(shown))
+    missing = int(total_interactions) - int(round(shown))
     pdf.set_y(top + box_h)
     pdf.set_text_color(*_PDF_INK)
     pdf.ln(1.0)
     if missing > 0:
-        _pdf_note(pdf, f"{int(round(shown)):,} of this campaign's {int(total_events):,} events fall into these three buckets; {missing:,} do not.")
+        _pdf_note(pdf, f"{int(round(shown)):,} of this campaign's {int(total_interactions):,} interactions fall into these three buckets; {missing:,} do not.")
 
 
 def _pdf_cards(pdf, pairs, per_row: int = 3) -> None:
@@ -924,7 +1154,9 @@ def to_pdf(data: dict) -> bytes:
     _pdf_title_block(pdf, data)
 
     if data["status"] == STATUS_MISSING:
-        if data.get("reason") == "wrong_window":
+        if data.get("reason") == "internal_only":
+            msg = internal_only_message(data["lookup"], window)
+        elif data.get("reason") == "wrong_window":
             f = data["lookup"]
             msg = (f"This campaign recorded nothing between {window}. It ran "
                    f"{_fmt_range(f['FIRST_EVER'], f['LAST_EVER'])} with {int(f['EVENTS_EVER']):,} events - "
@@ -940,7 +1172,7 @@ def to_pdf(data: dict) -> bytes:
         return bytes(pdf.output())
 
     s = int(k["SESSIONS"])
-    # Two cards and the ring, matching the page exactly. The row used to hold six cards, and
+    # Two cards and the ring, matching the page exactly. The row once held six cards, and
     # four of them have since come off the page: Events moved into the ring's hole, and
     # Median duration, Engaged and Converted were dropped because each restated a figure the
     # report already carries with its workings - Median duration in Session duration below,
@@ -949,9 +1181,9 @@ def to_pdf(data: dict) -> bytes:
     # this report for the same reason. Session-level conversion for the whole dataset lives
     # on the Conversion page, which is where that question belongs.
     _pdf_mix_row(pdf, [
-        ("Sessions", f"{s:,}"),
-        ("Events / session", f"{float(k['EVENTS']) / s:,.1f}"),
-    ], data.get("event_mix"), int(k["EVENTS"]))
+        ("Distinct sessions", f"{s:,}"),
+        ("Interactions / session", f"{float(k['INTERACTIONS']) / s:,.1f}"),
+    ], data.get("event_mix"), int(k["INTERACTIONS"]))
 
     _conc = concentration(k)
     if _conc is not None:
@@ -962,13 +1194,14 @@ def to_pdf(data: dict) -> bytes:
     # A chart, not a table. A single-day range degenerates to one point with nothing to
     # connect, so it falls back to the tabular form rather than drawing an empty axis.
     daily = data.get("daily")
+    part = data.get("partial_day")
+    part_note = partial_day_note(part) if part else None
     if daily is not None and len(daily) >= 2:
-        _pdf_series_chart(pdf, "Activity over time", daily, "EVENT_DATE", "SESSION_COUNT", "Sessions", kind="bar")
+        _pdf_series_chart(pdf, "Activity over time", daily, "EVENT_DATE", "SESSION_COUNT", "Sessions", kind="bar", note=part_note, partial=part, total=int(k["SESSIONS"]))
     else:
-        _pdf_table(pdf, "Activity by day", daily, "EVENT_DATE", "SESSION_COUNT", "Sessions")
+        _pdf_table(pdf, "Activity by day", daily, "EVENT_DATE", "SESSION_COUNT", "Sessions", note=part_note)
     _pdf_table(pdf, "Session duration", data.get("duration"), "BAND", "SESSIONS", "Sessions",
-               note=(f"Span between a session's first and last event, not time spent reading. "
-                     f"{int(k['INSTANT_SESSIONS']):,} of {s:,} sessions hold a single event."))
+               note=DURATION_REPORT_NOTE.format(single=int(k["SINGLE_INTERACTION_SESSIONS"]), sessions=s))
     # Engagement funnel is gone from here because it is gone from the page. It carried the
     # consent figures and the lead-page sentence in its note, and both go with it rather than
     # being re-homed: neither appears on the page either, and a download that reports figures
@@ -991,10 +1224,14 @@ def to_pdf(data: dict) -> bytes:
         _pdf_note(pdf, f"Company breakdown withheld: only {people} identified "
                        f"{'person' if people == 1 else 'people'} in this range, too few to name a "
                        f"company without describing an individual.")
-    _pdf_table(pdf, "How they arrived", data.get("sources"), "SOURCE_GROUP", "EVENTS", "Events")
-    _pdf_table(pdf, "External referrers", data.get("referrers"), "REFERRER", "EVENTS", "Events")
-    _pdf_table(pdf, "AI model mix", data.get("ai"), "MODEL", "REQUESTS", "Requests",
-               extra=[("SESSIONS", lambda v: f"{int(v or 0):,}")])
+    _pdf_table(pdf, "How they arrived", data.get("sources"), "SOURCE_GROUP", "SESSIONS", "Sessions", note=ARRIVAL_NOTE)
+    # _pdf_table draws nothing for an empty frame, so a campaign whose every session was Internal
+    # would lose the section without a word. Said instead, as Accounts reached does above.
+    if data.get("sources") is not None and not len(data["sources"]):
+        _pdf_heading(pdf, "How they arrived")
+        _pdf_note(pdf, ARRIVAL_NONE)
+    _pdf_table(pdf, "External referrers", data.get("referrers"), "REFERRER", "SESSIONS", "Sessions")
+    _pdf_table(pdf, "AI model mix", data.get("ai"), "MODEL", "SESSIONS", "Sessions", extra=[("INTERACTIONS", _fmt_count)], note=AI_MIX_NOTE)
 
     # What they looked at, kept together at the end. Pages and Content are one question asked at
     # two levels - the page is the container, the asset is what was opened on it - and they are
@@ -1002,13 +1239,7 @@ def to_pdf(data: dict) -> bytes:
     # the short, comparable sections apart; at the end the reader gets the whole shape of the
     # campaign first and the inventory afterwards. PDF read depth follows Content because it is
     # per-asset: it names assets, so it cannot precede the table that lists them.
-    _pdf_table(pdf, "Pages viewed", data.get("pages"), "PAGE", "SESSIONS", "Sessions",
-               extra=[("HOST", lambda v: _safe(v or "")),
-                      ("VIEWS", lambda v: f"{int(v or 0):,}"),
-                      ("VIEWS_PER_SESSION", lambda v: f"{float(v or 0):,.1f}")],
-               note=("Labelled by path, with the host alongside. Query strings are stripped; "
-                     "localhost and iframe pages are left out. One session can visit several "
-                     "pages, so the shares do not sum to 100%."))
+    _pdf_table(pdf, "Pages viewed", data.get("pages"), "PAGE", "SESSIONS", "Sessions", extra=[("HOST", _fmt_text)], note=PAGES_REPORT_NOTE, wrap=True)
     # Drawn only when BOTH sides exist. A divider above an absent Content section would be a
     # rule with nothing under it, and one below an absent Pages section would open the block
     # with a line - _pdf_table renders nothing at all for an empty frame, so neither is visible
@@ -1016,10 +1247,8 @@ def to_pdf(data: dict) -> bytes:
     if data.get("pages") is not None and len(data.get("pages", [])) \
             and data.get("assets") is not None and len(data.get("assets", [])):
         _pdf_rule(pdf)
-    _pdf_table(pdf, "Content by reach", data.get("assets"), "ASSET", "SESSIONS", "Sessions",
-               extra=[("EVENTS_PER_SESSION", lambda v: f"{float(v or 0):,.1f}")])
-    _pdf_table(pdf, "PDF read depth", data.get("depth"), "ASSET", "AVG_PAGE_REACHED", "Avg page",
-               extra=[("DEEPEST_PAGE", lambda v: f"{int(v or 0):,}")])
+    _pdf_table(pdf, "Content by reach", data.get("assets"), "ASSET", "SESSIONS", "Sessions", extra=[("INTERACTIONS_PER_SESSION", _fmt_tenths)], note=CONTENT_REACH_NOTE)
+    _pdf_table(pdf, "PDF read depth", data.get("depth"), "ASSET", "AVG_PAGE_REACHED", "Avg deepest", extra=[("DEEPEST_PAGE", _fmt_count)], note=READ_DEPTH_NOTE)
 
     # No closing block. The date window and the campaign name are on every page already, in the
     # running footer, so a "Covers <window>" line at the end restated what the page it sat on was
@@ -1056,6 +1285,7 @@ th{text-align:left;font-size:11px;letter-spacing:.08em;text-transform:uppercase;
  color:#546a6a;font-weight:500;padding:6px 10px;background:#f2f7f7}
 td{padding:6px 10px;border-bottom:1px solid #eef3f3;vertical-align:middle}
 td.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+td.n.w{white-space:normal}
 .bar{background:#056e6e;height:11px;border-radius:2px;min-width:2px}
 .barcell{width:42%}
 .mix{display:flex;flex-wrap:wrap;align-items:center;gap:22px;border:1px solid #e6ecec;
@@ -1076,7 +1306,19 @@ def _esc(v) -> str:
     return html.escape("" if v is None else str(v), quote=True)
 
 
-def _bar_rows(frame, label_col, value_col, extra=None, link_col=None) -> str:
+def _html_address(v) -> str:
+    """A page path or host, escaped, with a <wbr> break opportunity after each separator.
+
+    A browser breaks a long address only after a hyphen, so a host such as
+    dairun-34-deploying-demand-ai-website-on-aws.d1uv1s456dj2y7.amplifyapp.com never wrapped: it
+    pushed the Pages table to 917px inside an 852px column and ran off the right of the window. The
+    text is split BEFORE escaping and each piece escaped on its own, so a break can never land
+    inside an entity such as &amp;.
+    """
+    return "<wbr>".join(_esc(part) for part in re.split("(?<=[/.?&=-])", "" if v is None else str(v)))
+
+
+def _bar_rows(frame, label_col, value_col, extra=None, link_col=None, wrap=False) -> str:
     """`link_col` turns the label into an anchor pointing at that column's URL.
 
     Only the Pages section passes it, and only because a path on its own - "/logitech/" -
@@ -1089,8 +1331,11 @@ def _bar_rows(frame, label_col, value_col, extra=None, link_col=None) -> str:
         return ""
     top = float(max(float(v or 0) for v in frame[value_col])) or 1.0
     out = []
+    # `wrap` is the HTML half of the PDF's wrapped Pages viewed: the label and the text extras may
+    # break after a separator (see _html_address), and the extras drop the nowrap numbers keep.
+    extra_class = "n w" if wrap else "n"
     for row in frame.itertuples():
-        label = _esc(getattr(row, label_col))
+        label = _html_address(getattr(row, label_col)) if wrap else _esc(getattr(row, label_col))
         if link_col:
             href = _esc(getattr(row, link_col, "") or "")
             if href:
@@ -1101,27 +1346,30 @@ def _bar_rows(frame, label_col, value_col, extra=None, link_col=None) -> str:
         cells += f"<td class='barcell'><div class='bar' style='width:{width:.1f}%'></div></td>"
         if extra:
             for col, fmt in extra:
-                cells += f"<td class='n'>{fmt(getattr(row, col))}</td>"
+                cells += f"<td class='{extra_class}'>{fmt(getattr(row, col))}</td>"
         out.append(f"<tr>{cells}</tr>")
     return "".join(out)
 
 
-def _table(title, frame, label_col, value_col, value_head, extra=None, note=None, link_col=None) -> str:
+def _table(title, frame, label_col, value_col, value_head, extra=None, note=None, link_col=None, wrap=False) -> str:
     if frame is None or not len(frame):
         return ""
     head = f"<th>{_esc(label_col.replace('_', ' ').title())}</th><th class='n'>{_esc(value_head)}</th><th></th>"
     if extra:
         for col, _ in extra:
             head += f"<th class='n'>{_esc(col.replace('_', ' ').title())}</th>"
-    body = _bar_rows(frame, label_col, value_col, extra, link_col)
+    body = _bar_rows(frame, label_col, value_col, extra, link_col, wrap)
     note_html = f"<p class='note'>{_esc(note)}</p>" if note else ""
     return f"<h2>{_esc(title)}</h2>{note_html}<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
 
 
 _HTML_MIX_HUES = ("#1d9485", "#913797", "#a9881b")
 
+# "How they arrived" with no bars to draw - see ARRIVAL_NONE.
+_ARRIVAL_NONE_HTML = "<h2>How they arrived</h2><p class='note'>{note}</p>"
 
-def _html_donut(mix, total_events) -> str:
+
+def _html_donut(mix, total_interactions) -> str:
     """The event-mix ring, as inline SVG with the split repeated as a legend beside it.
 
     The legend is not decoration and not a fallback afterthought: Gmail strips inline SVG
@@ -1133,9 +1381,9 @@ def _html_donut(mix, total_events) -> str:
     the ring its hole for free, and the -90 degree rotation starts the first slice at 12
     o'clock so it matches both donut_chart and _pdf_donut.
     """
-    if mix is None or not len(mix) or float(mix["EVENTS"].sum()) <= 0:
+    if mix is None or not len(mix) or float(mix["INTERACTIONS"].sum()) <= 0:
         return ""
-    by_bucket = {str(r.BUCKET): float(r.EVENTS or 0) for r in mix.itertuples()}
+    by_bucket = {str(r.BUCKET): float(r.INTERACTIONS or 0) for r in mix.itertuples()}
     rows = [(name, by_bucket.get(name, 0.0), _HTML_MIX_HUES[i % len(_HTML_MIX_HUES)]) for i, name in enumerate(EVENT_BUCKET_ORDER) if by_bucket.get(name, 0.0) > 0]
     if not rows:
         return ""
@@ -1156,16 +1404,21 @@ def _html_donut(mix, total_events) -> str:
     centre_txt = f"{int(round(shown)):,}"
     em = sum(0.278 if ch == "," else 0.556 for ch in centre_txt) or 1.0
     centre_size = min(24.0, round(74.0 / em, 1))
+    # The sublabel gets the same treatment, and the same short form as the PDF: uppercase
+    # Helvetica runs about .68em a letter, and "TOTAL INTERACTIONS" would have to shrink to
+    # 5.6 to clear the 81-unit hole. "INTERACTIONS" fits at the 8 "TOTAL EVENTS" used.
+    sub_label = "INTERACTIONS"
+    sub_size = min(8.0, round(68.0 / (len(sub_label) * 0.68), 1))
     svg = ("<svg class='ring' width='160' height='160' viewBox='0 0 160 160' role='img' "
            f"aria-label='Event mix: {_esc(', '.join(n for n, _, _ in rows))}'>"
            f"<g transform='rotate(-90 80 80)'>{''.join(arcs)}</g>"
            f"<text x='80' y='80' text-anchor='middle' font-size='{centre_size:g}' font-weight='600' fill='#0b1a1a'>{int(round(shown)):,}</text>"
-           "<text x='80' y='96' text-anchor='middle' font-size='8' letter-spacing='.6' "
-           "fill='#546a6a'>TOTAL EVENTS</text></svg>")
+           f"<text x='80' y='96' text-anchor='middle' font-size='{sub_size:g}' letter-spacing='.3' "
+           f"fill='#546a6a'>{sub_label}</text></svg>")
     # See _pdf_mix_row: the buckets are exhaustive today, so this guards a drift rather than
     # describing a known exclusion.
-    missing = int(total_events) - int(round(shown))
-    gap = f"<p class='note'>{int(round(shown)):,} of this campaign's {int(total_events):,} events fall into these three buckets; {missing:,} do not.</p>" if missing > 0 else ""
+    missing = int(total_interactions) - int(round(shown))
+    gap = f"<p class='note'>{int(round(shown)):,} of this campaign's {int(total_interactions):,} interactions fall into these three buckets; {missing:,} do not.</p>" if missing > 0 else ""
     return (f"<div class='mix'>{svg}<div class='leg'><table><tbody>"
             f"{''.join(legend)}</tbody></table></div></div>{gap}")
 
@@ -1182,7 +1435,9 @@ def to_html(data: dict, link: str = "") -> str:
     window = f"{data['start']} to {data['end']}"
 
     if data["status"] == STATUS_MISSING:
-        if data.get("reason") == "wrong_window":
+        if data.get("reason") == "internal_only":
+            msg = _esc(internal_only_message(data["lookup"], f"{data['start']} and {data['end']}"))
+        elif data.get("reason") == "wrong_window":
             f = data["lookup"]
             msg = (f"Campaign <code>{cid}</code> has no activity between {window}. "
                    f"It ran <b>{_esc(f['FIRST_EVER'])} to {_esc(f['LAST_EVER'])}</b> "
@@ -1211,10 +1466,11 @@ def to_html(data: dict, link: str = "") -> str:
     # Same two cards and the same ring as the page and the PDF - see the note on _pdf_mix_row
     # for why the other four cards came off rather than being kept here alone.
     parts.append("<div class='kpis'>"
-                 + _kpi("Sessions", f"{s:,}")
-                 + _kpi("Events / session", f"{float(k['EVENTS']) / s:,.1f}")
+                 + _kpi("Distinct sessions", f"{s:,}")
+                 + _kpi("Interactions / session", f"{float(k['INTERACTIONS']) / s:,.1f}")
                  + "</div>")
-    parts.append(_html_donut(data.get("event_mix"), int(k["EVENTS"])))
+    parts.append(_html_donut(data.get("event_mix"), int(k["INTERACTIONS"])))
+    parts.append(f"<p class='note'>{_esc(INTERACTIONS_NOTE)}</p>")
 
     _conc = concentration(k)
     if _conc is not None:
@@ -1222,11 +1478,11 @@ def to_html(data: dict, link: str = "") -> str:
                 f"({int(k['DISTINCT_IPS']):,} addresses in total). Likely one organisation or an "
                 f"automated client rather than {s:,} separate visitors - an address is not a person.")
         parts.append(f"<p class='note'>{_esc(_msg)}</p>")
-    parts.append(_table("Activity by day", data.get("daily"), "EVENT_DATE", "SESSION_COUNT", "Sessions"))
+    part = data.get("partial_day")
+    parts.append(_table("Activity by day", data.get("daily"), "EVENT_DATE", "SESSION_COUNT", "Sessions", note=partial_day_note(part) if part else None))
     parts.append(_table(
         "Session duration", data.get("duration"), "BAND", "SESSIONS", "Sessions",
-        note=(f"Span between a session's first and last event, not time spent reading. "
-              f"{int(k['INSTANT_SESSIONS']):,} of {s:,} sessions hold a single event.")))
+        note=DURATION_REPORT_NOTE.format(single=int(k["SINGLE_INTERACTION_SESSIONS"]), sessions=s)))
     # Action reach dropped here too, so the page, the PDF and the emailed body describe the same
     # sections. Leaving it in the email alone would recreate exactly the drift this module exists
     # to prevent - and collect() no longer fetches it, so there would be nothing to render.
@@ -1235,25 +1491,17 @@ def to_html(data: dict, link: str = "") -> str:
     # HOST goes through _esc, unlike every other extra here: _bar_rows interpolates a
     # formatter's output straight into the row, unescaped, and this is the first extra
     # carrying text rather than a number.
-    parts.append(_table("Pages viewed", data.get("pages"), "PAGE", "SESSIONS", "Sessions",
-                        extra=[("HOST", lambda v: _esc(v or "")),
-                               ("VIEWS", lambda v: f"{int(v or 0):,}"),
-                               ("VIEWS_PER_SESSION", lambda v: f"{float(v or 0):,.1f}")],
-                        link_col="URL",
-                        note=("Each page links to its own address. Query strings are stripped; "
-                              "localhost and iframe pages are left out. One session can visit several "
-                              "pages, so the shares do not sum to 100%.")))
-    parts.append(_table("Content by reach", data.get("assets"), "ASSET", "SESSIONS", "Sessions",
-                        extra=[("EVENTS_PER_SESSION", lambda v: f"{float(v or 0):,.1f}")]))
-    parts.append(_table("PDF read depth", data.get("depth"), "ASSET", "AVG_PAGE_REACHED", "Avg page",
-                        extra=[("DEEPEST_PAGE", lambda v: f"{int(v or 0):,}")]))
+    parts.append(_table("Pages viewed", data.get("pages"), "PAGE", "SESSIONS", "Sessions", extra=[("HOST", _html_address)], link_col="URL", note=PAGES_HTML_NOTE, wrap=True))
+    parts.append(_table("Content by reach", data.get("assets"), "ASSET", "SESSIONS", "Sessions", extra=[("INTERACTIONS_PER_SESSION", _fmt_tenths)], note=CONTENT_REACH_NOTE))
+    parts.append(_table("PDF read depth", data.get("depth"), "ASSET", "AVG_PAGE_REACHED", "Avg deepest", extra=[("DEEPEST_PAGE", _fmt_count)], note=READ_DEPTH_NOTE))
     parts.append(_table("Accounts reached", data.get("companies"), "COMPANY", "SESSIONS", "Sessions",
                         extra=[("PEOPLE", lambda v: f"{int(v or 0):,}")],
                         note="Company domains only; individual addresses are never included."))
-    parts.append(_table("How they arrived", data.get("sources"), "SOURCE_GROUP", "EVENTS", "Events"))
-    parts.append(_table("External referrers", data.get("referrers"), "REFERRER", "EVENTS", "Events"))
-    parts.append(_table("AI model mix", data.get("ai"), "MODEL", "REQUESTS", "Requests",
-                        extra=[("SESSIONS", lambda v: f"{int(v or 0):,}")]))
+    parts.append(_table("How they arrived", data.get("sources"), "SOURCE_GROUP", "SESSIONS", "Sessions", note=ARRIVAL_NOTE))
+    if data.get("sources") is not None and not len(data["sources"]):
+        parts.append(_ARRIVAL_NONE_HTML.format(note=_esc(ARRIVAL_NONE)))
+    parts.append(_table("External referrers", data.get("referrers"), "REFERRER", "SESSIONS", "Sessions"))
+    parts.append(_table("AI model mix", data.get("ai"), "MODEL", "SESSIONS", "Sessions", extra=[("INTERACTIONS", _fmt_count)], note=AI_MIX_NOTE))
 
     withheld = []
     if int(k["PAGES"]) == 0:
@@ -1265,8 +1513,8 @@ def to_html(data: dict, link: str = "") -> str:
     elif int(k["PEOPLE"]) < IDENTITY_FLOOR:
         withheld.append(f"company breakdown withheld — only {int(k['PEOPLE'])} identified "
                         f"{'person' if int(k['PEOPLE']) == 1 else 'people'}, too few to break down")
-    if int(k["AI_EVENTS"]) == 0:
-        withheld.append("no AI activity")
+    if int(k["AI_SESSIONS"]) == 0:
+        withheld.append("no AI-built pages")
     if withheld:
         parts.append(f"<p class='note'>Sections not shown: {_esc('; '.join(withheld))}.</p>")
 
