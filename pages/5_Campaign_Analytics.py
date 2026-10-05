@@ -7,7 +7,7 @@ import streamlit as st
 
 from src.campaign_detail import SELECTED_KEY
 from src.campaign_detail import render as detail_render
-from src.campaign_report import STATUS_MISSING, classify_lookup, collect, filename, to_pdf
+from src.campaign_report import STATUS_MISSING, classify_lookup, collect, filename, internal_only_message, to_pdf
 from src.charts import CAMPAIGN_PICK, campaign_bar
 from src.components import AUTO_UNSUPPORTED, auto_download, date_range_filter, kpi, kpi_row, previous_window
 from src.db import run_query
@@ -310,6 +310,8 @@ else:
         outcome = classify_lookup(found)
         if outcome == "open":
             open_campaign(typed)
+        elif outcome == "internal_only":
+            st.info(internal_only_message(found, f"{start_date} and {end_date}"))
         elif outcome == "wrong_window":
             # Real id, wrong window. Naming the dates it did run turns a dead end into one
             # adjustment, instead of leaving someone widening the range by trial and error.
