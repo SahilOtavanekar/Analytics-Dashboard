@@ -1,0 +1,1475 @@
+-- =====================================================================================
+-- CAMPAIGN_ANALYTICS_REPORT_DAILY - v17, regenerated from the project source on 2026-10-04.
+--
+-- Sends to all four recipients (ALL_RECIPIENTS in run_report()). For a test send to one inbox,
+-- set recipients = TEST_RECIPIENTS there and re-run this file; the subject then starts [TEST].
+--
+-- What changed from v16, all to match the dashboard and its PDF as they stand now:
+--   * Internal traffic also excludes events on localhost / 127.0.0.1 pages (src/db.py).
+--   * Top row laid out as the PDF's: Distinct sessions and Interactions / session stacked on
+--     the left, the interactions ring (Page visit / Clicks / Form submit) with its legend in a
+--     box on the right, the total over "INTERACTIONS" in the hole. A page visit counts once per
+--     page per session; every click and form submit counts each time. Events, Events / session,
+--     Median duration, Engaged and Converted are gone, as on the page and the PDF.
+--   * Mail clients strip SVG, so the ring is a PNG drawn with matplotlib (added to PACKAGES)
+--     and attached inline; the email is sent as raw MIME. Without matplotlib it falls back to
+--     a plain ring, then to a stacked bar.
+--   * Number column headers are right-aligned over their numbers.
+--   * Engagement funnel removed (and the cookie-banner sentence with it).
+--   * Activity over time: days with no activity keep their place on the axis, today's
+--     still-filling bar is drawn lighter with a note, and Quietest ignores it.
+--   * Session duration: first event to last interaction, not to the last re-fired page.
+--   * How they arrived: sessions by first event, Direct and External only, with a note
+--     saying what each means; External referrers count sessions.
+--   * Pages viewed: each page once per session, full path and host as plain text (no Views columns).
+--   * Content by reach: Interactions / session. PDF read depth: each session's deepest page,
+--     averaged.
+--   * AI model mix: sessions and interactions per model, not raw events.
+--   * Campaigns whose every event is internal traffic now say so.
+--   * Section order follows the PDF.
+--
+-- The body is dollar-quoted ($$ ... $$) rather than '...': nothing inside needs its quotes
+-- or backslashes doubled. The SQL layer (section 2) is copied verbatim from src/queries.py.
+--
+-- HOW TO RUN: as with the present procedure - paste this file into a Snowsight worksheet and run
+-- it with the role you normally use. It only replaces the procedure; it sends no email.
+-- =====================================================================================
+CREATE OR REPLACE PROCEDURE CIT_DATA_CORE.TRACKING.CAMPAIGN_ANALYTICS_REPORT_DAILY("CAMPAIGN_ID" VARCHAR DEFAULT 'demand_ai_internal_website_track', "WINDOW_DAYS" NUMBER(38,0) DEFAULT 30, "EXCLUDE_INTERNAL" BOOLEAN DEFAULT TRUE)
+RETURNS VARCHAR
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.11'
+PACKAGES = ('snowflake-snowpark-python','boto3','pandas','tzdata','matplotlib')
+HANDLER = 'run_report'
+EXTERNAL_ACCESS_INTEGRATIONS = (SES_INTEGRATION_MDLH_DAILY_REPORT)
+SECRETS = ('aws_cred'=DEV_MDLH.TARGET.SES_SECRET_MDLH_DAILY_REPORT)
+EXECUTE AS OWNER
+AS $$
+import calendar
+import datetime as dt
+import html
+import math
+import re
+import struct
+import zlib
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+import boto3
+from snowflake.snowpark import Session
+import _snowflake
+
+
+# ============================================================================
+# 1. Internal-traffic filter - constants copied verbatim from src/db.py.
+#    Streamlit's session-state toggle does not exist here: run_report() sets
+#    _EXCLUDE_INTERNAL_FLAG from the EXCLUDE_INTERNAL argument instead.
+# ============================================================================
+
+TABLE_FQN = "CIT_DATA_CORE.TRACKING.INSYTE_TRAKING_EVENTS"
+
+INTERNAL_TENANT = "demand_ai"
+
+_VISITOR_DOMAIN = (
+    "SPLIT_PART(LOWER(COALESCE(QUERY_PARAMETERS:email::STRING, "
+    'QUERY_PARAMETERS:"amp;email"::STRING, \'\')), \'@\', 2)'
+)
+
+PAGE_HOST = "COALESCE(PARSE_URL(SEARCH_URL, 1):host::STRING, '')"
+
+_HOST_IS_EXTERNAL = f"{PAGE_HOST} NOT IN ('localhost', '127.0.0.1')"
+
+_TENANT_IS_EXTERNAL = f"COALESCE(PROPERTIES:tenant_id::STRING, '') <> '{INTERNAL_TENANT}'"
+
+_VISITOR_IS_EXTERNAL = (
+    f"NOT (COALESCE({_VISITOR_DOMAIN}, '') ILIKE '%demandai%'"
+    f" OR COALESCE({_VISITOR_DOMAIN}, '') ILIKE '%demand-ai%')"
+)
+
+_INTERNAL_PREDICATE = f"{_TENANT_IS_EXTERNAL} AND {_VISITOR_IS_EXTERNAL} AND {_HOST_IS_EXTERNAL}"
+
+_CAMPAIGN_KEEP = f"{_VISITOR_IS_EXTERNAL} AND {_HOST_IS_EXTERNAL}"
+
+
+_EXCLUDE_INTERNAL_FLAG = False
+
+
+def exclude_internal() -> bool:
+    return _EXCLUDE_INTERNAL_FLAG
+
+
+def table_fqn(keep_own_campaigns: bool = False) -> str:
+    """Same rule as src/db.py. Every query in this procedure is campaign-scoped and passes
+    keep_own_campaigns=True: demand_ai's own campaigns stay, while staff visitors and
+    localhost pages are dropped row by row."""
+    if not exclude_internal():
+        return TABLE_FQN
+    predicate = _CAMPAIGN_KEEP if keep_own_campaigns else _INTERNAL_PREDICATE
+    return f"(SELECT * FROM {TABLE_FQN} WHERE {predicate})"
+
+
+def campaign_keep_predicate() -> str:
+    """The row condition the campaign queries keep, as a boolean - TRUE when nothing is
+    excluded. The lookup query uses it to tell "all internal" apart from "nothing at all"."""
+    return f"({_CAMPAIGN_KEEP})" if exclude_internal() else "TRUE"
+
+
+# ============================================================================
+# 2. SQL - copied verbatim from src/queries.py: every builder collect() calls,
+#    and the constants and helpers they depend on, in file order.
+# ============================================================================
+
+_PAGE_VIEW = "(COALESCE(EVENT_TYPE, '') = 'page' OR COALESCE(LOWER(EVENT_NAME), '') = 'page visit')"
+
+
+_NOT_TEST = "(EVENT_NAME IS NULL OR LOWER(EVENT_NAME) NOT IN ('test event', 'test download event'))"
+
+
+_NORM = "LOWER(REPLACE(EVENT_NAME, '_', ' '))"
+
+
+_COOKIE_FORM = "COALESCE(PROPERTIES:form_id::STRING, '') = 'cookie-form'"
+
+
+_FORM_ID = "LOWER(COALESCE(PROPERTIES:form_id::STRING, ''))"
+
+
+_NOT_A_LEAD_FORM = (
+    f"({_FORM_ID} LIKE '%cookie%'"
+    f" OR {_FORM_ID} LIKE '%consent%'"
+    f" OR {_FORM_ID} LIKE '%unsubscribe%'"
+    f" OR {_FORM_ID} LIKE '%comment%'"
+    f" OR {_FORM_ID} LIKE '%daicontactform%'"
+    f" OR {_FORM_ID} LIKE '%rsrchgateform%')"
+)
+
+
+_LEAD_SUBMIT = f"({_NORM} = 'form submit' AND NOT {_NOT_A_LEAD_FORM})"
+
+
+_CONSENT_EVENT = (
+    f"({_COOKIE_FORM}"
+    f" OR PROPERTIES:attributes:consent IS NOT NULL"
+    f" OR LOWER(COALESCE(EVENT_NAME, '')) = 'consent-response')"
+)
+
+
+_ENGAGED_EVENT = f"(NOT {_PAGE_VIEW} AND NOT {_CONSENT_EVENT})"
+
+
+_ACTION_LABEL = f"""
+        CASE
+            WHEN PROPERTIES:attributes:asset IS NOT NULL
+              OR PROPERTIES:attributes:file IS NOT NULL THEN 'Opened content'
+            WHEN LOWER(COALESCE(EVENT_NAME, '')) = 'visited'
+                 AND PROPERTIES:asset IS NOT NULL THEN 'Opened content'
+            WHEN PROPERTIES:attributes:category::STRING = 'query' THEN 'Asked a question'
+            WHEN LOWER(COALESCE(EVENT_NAME, '')) = 'pdf-page-visit' THEN 'Read a document'
+            WHEN {_NORM} = 'form submit' THEN 'Submitted a form'
+            WHEN PROPERTIES:attributes:title IS NOT NULL
+              OR PROPERTIES:attributes:click IS NOT NULL THEN 'Opened a link'
+            WHEN PROPERTIES:attributes:dismiss IS NOT NULL THEN 'Dismissed a prompt'
+            WHEN LOWER(COALESCE(EVENT_NAME, '')) IN ('clicked', 'button clicked') THEN 'Other click'
+            ELSE INITCAP(LOWER(REPLACE(EVENT_NAME, '_', ' ')))
+        END"""
+
+
+_PAGE_HOST = PAGE_HOST
+
+
+_PAGE_PATH = "COALESCE(PARSE_URL(SEARCH_URL, 1):path::STRING, '')"
+
+
+_PAGE_URL = f"{_PAGE_HOST} || '/' || {_PAGE_PATH}"
+
+
+_PAGE_SCHEME = "COALESCE(PARSE_URL(SEARCH_URL, 1):scheme::STRING, 'https')"
+
+
+_REAL_PAGE = f"({_PAGE_HOST} NOT IN ('localhost', '127.0.0.1') AND {_PAGE_HOST} <> '')"
+
+
+_LEAD_PAGE_EXPR = "REGEXP_REPLACE(SEARCH_URL, '([?&](amp;)?email=)[^&]*', '\\\\1<redacted>')"
+
+
+_LEAD_PAGE_KEY = (
+    f"(COALESCE(SESSION_ID::STRING, '(no session)') || '|'"
+    f" || COALESCE(NULLIF({_LEAD_PAGE_EXPR}, ''), '(no page)'))"
+)
+
+
+_REF_HOST = "PARSE_URL(REFERER_URL, 1):host::STRING"
+
+
+_INTERNAL_REFERRER = f"""{_REF_HOST} IN ('localhost', '127.0.0.1')
+              OR {_REF_HOST} ILIKE '%amplifye.ai'
+              OR {_REF_HOST} ILIKE '%demandai.net'
+              OR {_REF_HOST} ILIKE '%atlassian.net'
+              OR {_REF_HOST} ILIKE '%amplifyapp.com'
+              OR {_REF_HOST} ILIKE '%amazonaws.com'
+              OR {_REF_HOST} ILIKE '%cloudfront.net'"""
+
+
+_ASSET = "QUERY_PARAMETERS:asset::STRING"
+
+
+_ASSET_LABEL = f"""
+        INITCAP(REPLACE(REGEXP_REPLACE({_ASSET}, '\\\\.(pdf|htm|html)$', '', 1, 0, 'i'), '-', ' '))"""
+
+
+_EMAIL = (
+    'LOWER(NULLIF(TRIM(COALESCE(QUERY_PARAMETERS:email::STRING, '
+    'QUERY_PARAMETERS:"amp;email"::STRING)), \'\'))'
+)
+
+
+_VALID_EMAIL = f"({_EMAIL} LIKE '%@%.%')"
+
+
+_DOMAIN = f"SPLIT_PART({_EMAIL}, '@', 2)"
+
+
+_FREE_MAIL = (
+    "('gmail.com','yahoo.com','hotmail.com','outlook.com','live.com','aol.com',"
+    "'icloud.com','protonmail.com','gmx.com','mail.com','yandex.com','qq.com',"
+    "'naver.com','163.com','yahoo.co.uk','googlemail.com')"
+)
+
+
+_REGION = """
+        CASE
+            WHEN TIMEZONE IS NULL OR TRIM(TIMEZONE) = '' THEN 'Unknown'
+            WHEN TIMEZONE IN ('UTC', 'GMT') OR TIMEZONE ILIKE 'Etc/%' THEN 'Unknown / UTC'
+            WHEN POSITION('/' IN TIMEZONE) > 0 THEN SPLIT_PART(TIMEZONE, '/', 1)
+            ELSE 'Unknown / UTC'
+        END"""
+
+
+_AI_REQUEST = "COALESCE(PROPERTIES:ml_request::STRING, '') = 'true'"
+
+
+_MODEL = """
+        CASE
+            WHEN PROPERTIES:llm::STRING ILIKE '%opus-4-6%'   THEN 'Claude Opus 4.6'
+            WHEN PROPERTIES:llm::STRING ILIKE '%sonnet-4-6%' THEN 'Claude Sonnet 4.6'
+            WHEN PROPERTIES:llm::STRING ILIKE '%3-5-sonnet%' THEN 'Claude 3.5 Sonnet'
+            WHEN PROPERTIES:llm IS NULL
+              OR LOWER(PROPERTIES:llm::STRING) IN ('undefined', 'null', '') THEN 'Unrecorded'
+            ELSE REGEXP_REPLACE(PROPERTIES:llm::STRING, '^[a-z]{2}\\\\.', '')
+        END"""
+
+
+def _campaign_table() -> str:
+    return table_fqn(keep_own_campaigns=True)
+
+
+_TENANT = "COALESCE(PROPERTIES:tenant_id::STRING, '(untagged)')"
+
+
+_CAMPAIGN_SCOPE = """
+        WHERE EVENT_TS::DATE BETWEEN ? AND ?
+          AND CAMPAIGN_ID = ?
+          AND {not_test}"""
+
+
+def _campaign_events_cte() -> str:
+    return f"""
+        SELECT
+            SESSION_ID, MESSAGE_ID, EVENT_TS, EVENT_NAME, EVENT_TYPE, TIMEZONE, REQUEST_IP,
+            SEARCH_URL, REFERER_URL,
+            PROPERTIES:campaign_name::STRING AS NAME,
+            {_TENANT} AS TENANT,
+            {_EMAIL} AS ADDR,
+            {_ASSET} AS ASSET,
+            PROPERTIES:page_visited AS PAGE_VISITED,
+            IFF({_AI_REQUEST}, 1, 0) AS IS_AI,
+            IFF({_LEAD_SUBMIT}, 1, 0) AS IS_LEAD,
+            IFF({_LEAD_SUBMIT}, {_LEAD_PAGE_KEY}, NULL) AS LEAD_PAGE,
+            IFF({_COOKIE_FORM}, 1, 0) AS IS_COOKIE,
+            -- The two halves of a consent decision, kept apart because they answer different
+            -- questions and were previously in two unrelated places on the page.
+            IFF({_COOKIE_FORM}, 1, 0) AS IS_CONSENT_YES,
+            IFF(PROPERTIES:attributes:consent IS NOT NULL, 1, 0) AS IS_CONSENT_NO,
+            -- Projected here so the action chart can group on meaning rather than on EVENT_NAME;
+            -- the label needs PROPERTIES, which does not survive this CTE's column list.
+            {_ACTION_LABEL} AS ACTION_LABEL,
+            IFF({_ENGAGED_EVENT}, 1, 0) AS IS_ACTION
+        FROM {_campaign_table()}
+        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+    """
+
+
+_ADDR_VALID = "ADDR LIKE '%@%.%'"
+
+
+def campaign_detail_kpis_sql() -> str:
+    spans = _session_spans_ctes("ev WHERE SESSION_ID IS NOT NULL")
+    return f"""
+        WITH ev AS ({_campaign_events_cte()}
+        ), sess AS (
+            SELECT
+                SESSION_ID,
+                MAX(IS_AI) AS USED_AI,
+                MAX(IS_LEAD) AS CONVERTED,
+                MAX(IS_ACTION) AS ACTED,
+                MAX(IS_CONSENT_YES) AS SAID_YES,
+                MAX(IS_CONSENT_NO) AS SAID_NO,
+                MAX(IFF(ASSET IS NOT NULL, 1, 0)) AS SAW_CONTENT,
+                MAX(IFF({_ADDR_VALID}, 1, 0)) AS IDENTIFIED
+            FROM ev
+            WHERE SESSION_ID IS NOT NULL
+            GROUP BY SESSION_ID
+        ), ev_agg AS (
+            -- One pass over the events, not one pass per column. Written as 13 scalar
+            -- subqueries first, which measured 4-6s because each re-scanned the CTE;
+            -- folded into a single aggregate row it lands near a second. This query is on
+            -- the critical path of every drill-in, so it is the one worth flattening.
+            SELECT
+                MODE(NAME) AS CAMPAIGN_NAME,
+                MODE(TENANT) AS TENANT,
+                COUNT(DISTINCT MESSAGE_ID) AS EVENTS,
+                -- The donut's total and the Interactions / Session numerator - see _INTERACTION_KEY.
+                -- EVENTS above stays the raw count: it gates the report and feeds the captions
+                -- that are about raw events.
+                COUNT(DISTINCT {_INTERACTION_KEY}) AS INTERACTIONS,
+                MIN(EVENT_TS)::DATE AS FIRST_SEEN,
+                MAX(EVENT_TS)::DATE AS LAST_SEEN,
+                COUNT(DISTINCT EVENT_TS::DATE) AS ACTIVE_DAYS,
+                COUNT(DISTINCT ASSET) AS ASSETS,
+                COUNT(DISTINCT IFF({_ADDR_VALID}, ADDR, NULL)) AS PEOPLE,
+                COUNT(DISTINCT IFF({_ADDR_VALID}, SPLIT_PART(ADDR, '@', 2), NULL)) AS COMPANIES,
+                COUNT(DISTINCT LEAD_PAGE) AS LEAD_PAGE_SUBMITS,
+                -- The read-depth caption's count and the gate on querying that section: the sessions
+                -- campaign_read_depth_sql measures, under its own conditions (a page turn, on an
+                -- asset, in a session). It was PDF_EVENTS, every page-turn event, which a caption put
+                -- at 1,910 over a table built from 1,618 - duplicates and turns with no asset or
+                -- session were in the caption and never in the table.
+                COUNT(DISTINCT IFF(PAGE_VISITED IS NOT NULL AND ASSET IS NOT NULL, SESSION_ID, NULL)) AS PAGE_TURN_SESSIONS,
+                COUNT(DISTINCT IFF(COALESCE(REFERER_URL, '') <> '', REFERER_URL, NULL)) AS REFERRERS,
+                -- The gate for the Pages section, counted here rather than asked for separately:
+                -- collect() needs to know whether the section has anything in it BEFORE deciding
+                -- to query it, and the CTE already projects SEARCH_URL, EVENT_NAME and EVENT_TYPE,
+                -- so both expressions resolve against it without a second scan.
+                COUNT(DISTINCT IFF({_PAGE_VIEW} AND {_REAL_PAGE}, {_PAGE_URL}, NULL)) AS PAGES,
+                -- The Pages caption's total, counted by the interactions rule: once per page per
+                -- session (see _INTERACTION_KEY). It was every page-visit event, and 95% of those were
+                -- an open tab re-firing - "117,863 page views" sat on the same page as a donut slice
+                -- reading "Page visit 5,979". Counted this way the two agree exactly while internal
+                -- traffic is excluded. With it included they differ by the page visits on localhost
+                -- and hostless pages (285 on that campaign): the donut counts them then, and the Pages
+                -- section never does - _REAL_PAGE applies whatever the toggle says.
+                COUNT(DISTINCT IFF({_PAGE_VIEW} AND {_REAL_PAGE}, {_INTERACTION_KEY}, NULL)) AS PAGE_VISITS,
+                COUNT(DISTINCT TIMEZONE) AS TIMEZONES
+            FROM ev
+        ), sess_agg AS (
+            SELECT
+                COUNT(*) AS SESSIONS,
+                COALESCE(SUM(USED_AI), 0) AS AI_SESSIONS,
+                COALESCE(SUM(CONVERTED), 0) AS LEAD_SESSIONS,
+                COALESCE(SUM(ACTED), 0) AS ACTED_SESSIONS,
+                COALESCE(SUM(SAID_YES), 0) AS CONSENT_YES_SESSIONS,
+                COALESCE(SUM(SAID_NO), 0) AS CONSENT_NO_SESSIONS,
+                COALESCE(SUM(SAW_CONTENT), 0) AS CONTENT_SESSIONS,
+                COALESCE(SUM(IDENTIFIED), 0) AS IDENTIFIED_SESSIONS
+            FROM sess
+        ), {spans}, dur_agg AS (
+            -- The Session duration captions, measured exactly as the chart's bands are - see
+            -- _session_spans_ctes. Interactions per session rather than events for the same reason:
+            -- a tab re-firing one page is one interaction, not hundreds of events.
+            SELECT
+                COALESCE((APPROX_PERCENTILE(SECS, 0.5) / 60.0)::FLOAT, 0) AS MEDIAN_DURATION_MINUTES,
+                COALESCE((AVG(SECS) / 60.0)::FLOAT, 0) AS MEAN_DURATION_MINUTES,
+                COALESCE(SUM(IFF(INTERACTIONS = 1, 1, 0)), 0) AS SINGLE_INTERACTION_SESSIONS,
+                COALESCE((APPROX_PERCENTILE(INTERACTIONS, 0.5))::FLOAT, 0) AS MEDIAN_INTERACTIONS
+            FROM spans
+        ), ip_pick AS (
+            -- Each session's dominant address: the REQUEST_IP on most of its rows, a tie going to
+            -- the lower address. Dominant, not MIN, because 2.8% of sessions carry more than one
+            -- REQUEST_IP and the one most of the session came from describes it best.
+            --
+            -- This replaced MODE(REQUEST_IP), which picks the same address but breaks a tie
+            -- arbitrarily - and 38 sessions on demand_ai_internal_website_track have two
+            -- addresses level, so DISTINCT_IPS read 2,443 on one refresh and 2,444 on the next
+            -- from identical data. A figure on the page must not move unless the data does.
+            SELECT SESSION_ID, REQUEST_IP AS IP
+            FROM ev
+            WHERE SESSION_ID IS NOT NULL AND REQUEST_IP IS NOT NULL
+            GROUP BY SESSION_ID, REQUEST_IP
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY SESSION_ID ORDER BY COUNT(*) DESC, REQUEST_IP) = 1
+        ), ip_agg AS (
+            -- How concentrated is this campaign's traffic on one network address? Sessions
+            -- are the reach figure everything else divides by, and a session count says
+            -- nothing about how many PLACES it came from: sas-kr-ai reports 271 sessions,
+            -- of which 266 share a single address. Measured across 169 campaigns with 50+
+            -- sessions, the top address takes a median 20% but reaches 98% on a handful -
+            -- the distribution is bimodal, not a gradient, so a threshold is meaningful here.
+            --
+            -- An address is NOT a person: a corporate NAT hides a whole office behind one.
+            -- That is precisely why this is worth stating rather than charting - it bounds
+            -- how the session count may be read, and claims nothing about who.
+            SELECT COUNT(*) AS DISTINCT_IPS, COALESCE(MAX(N), 0) AS TOP_IP_SESSIONS
+            FROM (SELECT IP, COUNT(*) AS N FROM ip_pick GROUP BY IP)
+        )
+        SELECT * FROM ev_agg CROSS JOIN sess_agg CROSS JOIN dur_agg CROSS JOIN ip_agg
+    """
+
+
+def campaign_lookup_sql() -> str:
+    return f"""
+        WITH t AS (
+            SELECT MESSAGE_ID, EVENT_TS, PROPERTIES,
+                   (EVENT_TS::DATE BETWEEN ? AND ?) AS IN_WINDOW,
+                   {campaign_keep_predicate()} AS KEPT
+            FROM {TABLE_FQN}
+            WHERE CAMPAIGN_ID = ?
+              AND EVENT_TS::DATE BETWEEN '2025-06-01' AND CURRENT_DATE()
+              AND {_NOT_TEST}
+        )
+        SELECT
+            COUNT(DISTINCT IFF(IN_WINDOW AND KEPT, MESSAGE_ID, NULL)) AS EVENTS_IN_WINDOW,
+            COUNT(DISTINCT IFF(IN_WINDOW AND NOT KEPT, MESSAGE_ID, NULL)) AS INTERNAL_EVENTS_IN_WINDOW,
+            COUNT(DISTINCT IFF(KEPT, MESSAGE_ID, NULL)) AS EVENTS_EVER,
+            COUNT(DISTINCT IFF(NOT KEPT, MESSAGE_ID, NULL)) AS INTERNAL_EVENTS_EVER,
+            MIN(IFF(KEPT, EVENT_TS, NULL))::DATE AS FIRST_EVER,
+            MAX(IFF(KEPT, EVENT_TS, NULL))::DATE AS LAST_EVER,
+            MODE(PROPERTIES:campaign_name::STRING) AS CAMPAIGN_NAME
+        FROM t
+    """
+
+
+def campaign_daily_sql() -> str:
+    return f"""
+        WITH ev AS (
+            SELECT
+                SESSION_ID, MESSAGE_ID,
+                EVENT_TS::DATE AS EVENT_DATE,
+                -- The day the session STARTED, carried onto all of its rows.
+                MIN(EVENT_TS::DATE) OVER (PARTITION BY SESSION_ID) AS SESSION_START
+            FROM {_campaign_table()}
+            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+        )
+        SELECT
+            EVENT_DATE,
+            -- Each session counted ONCE, on the day it began, so these bars sum to the
+            -- Sessions card. A plain COUNT(DISTINCT SESSION_ID) per day counts a session on
+            -- every day it touches, so one crossing midnight lands in two bars and the chart
+            -- totals more than the card it sits beside. The gap widens with the internal
+            -- traffic filter on, because that filter is ROW-level: stripping a session's
+            -- staff-tagged rows changes which days it still has rows on.
+            COUNT(DISTINCT IFF(EVENT_DATE = SESSION_START, SESSION_ID, NULL)) AS SESSION_COUNT,
+            -- Events stay on their own date. An event happened when it happened; only the
+            -- session needed attributing to one day.
+            COUNT(DISTINCT MESSAGE_ID) AS EVENT_COUNT
+        FROM ev
+        GROUP BY EVENT_DATE
+        ORDER BY EVENT_DATE
+    """
+
+
+def campaign_duration_bands_sql() -> str:
+    spans = _session_spans_ctes(f"{_campaign_table()} {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)} AND SESSION_ID IS NOT NULL")
+    return f"""
+        WITH {spans}
+        SELECT
+            CASE
+                WHEN SECS = 0 THEN '0s (instant)'
+                WHEN SECS <= 10 THEN '1-10 seconds'
+                WHEN SECS <= 60 THEN '10-60 seconds'
+                WHEN SECS <= 300 THEN '1-5 minutes'
+                WHEN SECS <= 1800 THEN '5-30 minutes'
+                WHEN SECS <= 7200 THEN '30 min - 2 hours'
+                ELSE 'over 2 hours'
+            END AS BAND,
+            CASE
+                WHEN SECS = 0 THEN 1
+                WHEN SECS <= 10 THEN 2
+                WHEN SECS <= 60 THEN 3
+                WHEN SECS <= 300 THEN 4
+                WHEN SECS <= 1800 THEN 5
+                WHEN SECS <= 7200 THEN 6
+                ELSE 7
+            END AS BAND_ORDER,
+            COUNT(*) AS SESSIONS
+        FROM spans
+        GROUP BY BAND, BAND_ORDER
+        ORDER BY BAND_ORDER
+    """
+
+
+EVENT_BUCKET_ORDER = ("Page visit", "Clicks", "Form submit")
+
+
+_EVENT_BUCKET = f"""
+        CASE
+            WHEN COALESCE({_NORM}, '') = 'form submit' THEN 'Form submit'
+            WHEN {_PAGE_VIEW} THEN 'Page visit'
+            ELSE 'Clicks'
+        END"""
+
+
+_INTERACTION_KEY = f"""IFF(({_EVENT_BUCKET}) = 'Page visit' AND SESSION_ID IS NOT NULL,
+            'p|' || SESSION_ID::STRING || '|' || {_PAGE_URL},
+            'e|' || MESSAGE_ID)"""
+
+
+def _session_spans_ctes(source: str) -> str:
+    return f"""firsts AS (
+            SELECT SESSION_ID, {_INTERACTION_KEY} AS K, MIN(EVENT_TS) AS T
+            FROM {source}
+            GROUP BY 1, 2
+        ), spans AS (
+            SELECT SESSION_ID, DATEDIFF('second', MIN(T), MAX(T)) AS SECS, COUNT(*) AS INTERACTIONS
+            FROM firsts
+            GROUP BY 1
+        )"""
+
+
+def campaign_event_mix_sql() -> str:
+    return f"""
+        SELECT
+            {_EVENT_BUCKET} AS BUCKET,
+            COUNT(DISTINCT {_INTERACTION_KEY}) AS INTERACTIONS
+        FROM {_campaign_table()}
+        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+        GROUP BY 1
+    """
+
+
+def campaign_geo_sql(timezone_limit: int = 10) -> str:
+    return f"""
+        WITH base AS (
+            SELECT SESSION_ID, TIMEZONE
+            FROM {_campaign_table()}
+            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+              AND SESSION_ID IS NOT NULL
+        ), region AS (
+            SELECT 'region' AS KIND, {_REGION} AS LABEL, COUNT(DISTINCT SESSION_ID) AS SESSIONS
+            FROM base GROUP BY 1, 2
+        ), tz AS (
+            SELECT 'timezone' AS KIND, TIMEZONE AS LABEL, COUNT(DISTINCT SESSION_ID) AS SESSIONS
+            FROM base
+            WHERE TIMEZONE IS NOT NULL AND TRIM(TIMEZONE) <> ''
+            GROUP BY 1, 2
+            QUALIFY ROW_NUMBER() OVER (ORDER BY SESSIONS DESC) <= {timezone_limit}
+        )
+        SELECT * FROM region
+        UNION ALL SELECT * FROM tz
+        ORDER BY KIND, SESSIONS DESC
+    """
+
+
+def campaign_pages_sql(limit: int = 12) -> str:
+    return f"""
+        WITH base AS (
+            SELECT SESSION_ID, MESSAGE_ID, EVENT_NAME, EVENT_TYPE, SEARCH_URL,
+                   {_PAGE_SCHEME} AS SCHEME
+            FROM {_campaign_table()}
+            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+              AND SESSION_ID IS NOT NULL
+        ), all_sessions AS (
+            SELECT COUNT(DISTINCT SESSION_ID) AS N FROM base
+        ), grouped AS (
+            SELECT
+                {_PAGE_HOST} AS HOST,
+                '/' || {_PAGE_PATH} AS PATH,
+                {_PAGE_URL} AS PAGE_URL,
+                MODE(SCHEME) AS SCHEME,
+                COUNT(DISTINCT SESSION_ID) AS SESSIONS,
+                COALESCE((COUNT(DISTINCT SESSION_ID) * 100.0
+                    / NULLIF((SELECT N FROM all_sessions), 0))::FLOAT, 0) AS PCT_OF_SESSIONS
+            FROM base
+            WHERE {_PAGE_VIEW}
+              AND SEARCH_URL IS NOT NULL
+              AND {_REAL_PAGE}
+            GROUP BY 1, 2, 3
+        )
+        SELECT
+            IFF(COUNT(*) OVER (PARTITION BY PATH) > 1, PAGE_URL, PATH) AS PAGE,
+            SESSIONS,
+            PCT_OF_SESSIONS,
+            HOST,
+            SCHEME || '://' || HOST || PATH AS URL
+        FROM grouped
+        ORDER BY SESSIONS DESC
+        LIMIT {limit}
+    """
+
+
+def campaign_assets_sql(limit: int = 12) -> str:
+    return f"""
+        SELECT
+            {_ASSET_LABEL} AS ASSET,
+            COUNT(DISTINCT SESSION_ID) AS SESSIONS,
+            COUNT(DISTINCT {_INTERACTION_KEY}) AS INTERACTIONS,
+            ROUND(COUNT(DISTINCT {_INTERACTION_KEY}) * 1.0
+                  / NULLIF(COUNT(DISTINCT SESSION_ID), 0), 1) AS INTERACTIONS_PER_SESSION
+        FROM {_campaign_table()}
+        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+          AND {_ASSET} IS NOT NULL
+          AND SESSION_ID IS NOT NULL
+        GROUP BY {_ASSET}
+        ORDER BY SESSIONS DESC
+        LIMIT {limit}
+    """
+
+
+def campaign_read_depth_sql(limit: int = 10) -> str:
+    return f"""
+        WITH per_session AS (
+            SELECT
+                {_ASSET} AS ASSET_KEY,
+                {_ASSET_LABEL} AS ASSET,
+                SESSION_ID,
+                MAX(TRY_TO_NUMBER(PROPERTIES:page_visited::STRING)) AS DEEPEST
+            FROM {_campaign_table()}
+            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+              AND PROPERTIES:page_visited IS NOT NULL
+              AND {_ASSET} IS NOT NULL
+              AND SESSION_ID IS NOT NULL
+            GROUP BY {_ASSET}, SESSION_ID
+        )
+        SELECT
+            ASSET,
+            COUNT(*) AS SESSIONS,
+            ROUND(AVG(DEEPEST), 1) AS AVG_PAGE_REACHED,
+            MAX(DEEPEST) AS DEEPEST_PAGE
+        FROM per_session
+        GROUP BY ASSET_KEY, ASSET
+        ORDER BY SESSIONS DESC
+        LIMIT {limit}
+    """
+
+
+def campaign_companies_sql(limit: int = 12) -> str:
+    return f"""
+        SELECT
+            {_DOMAIN} AS COMPANY,
+            COUNT(DISTINCT {_EMAIL}) AS PEOPLE,
+            COUNT(DISTINCT SESSION_ID) AS SESSIONS
+        FROM {_campaign_table()}
+        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+          AND {_VALID_EMAIL}
+          AND {_DOMAIN} NOT IN {_FREE_MAIL}
+          AND SESSION_ID IS NOT NULL
+        GROUP BY 1
+        ORDER BY SESSIONS DESC
+        LIMIT {limit}
+    """
+
+
+_ARRIVAL_GROUP = f"""
+        CASE
+            WHEN COALESCE(REFERER_URL, '') = '' THEN 'Direct'
+            WHEN ({_REF_HOST} = {_PAGE_HOST} AND {_PAGE_HOST} <> '') OR {_INTERNAL_REFERRER} THEN 'Internal'
+            ELSE 'External'
+        END"""
+
+
+def campaign_sources_sql(referrer_limit: int = 8) -> str:
+    return f"""
+        WITH arrivals AS (
+            SELECT REFERER_URL, SEARCH_URL
+            FROM {_campaign_table()}
+            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+              AND SESSION_ID IS NOT NULL
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY SESSION_ID ORDER BY EVENT_TS, MESSAGE_ID) = 1
+        ), grp AS (
+            SELECT 'group' AS KIND, {_ARRIVAL_GROUP} AS LABEL, COUNT(*) AS SESSIONS
+            FROM arrivals
+            WHERE {_ARRIVAL_GROUP} <> 'Internal'
+            GROUP BY 1, 2
+        ), ref AS (
+            SELECT 'referrer' AS KIND, {_REF_HOST} AS LABEL, COUNT(*) AS SESSIONS
+            FROM arrivals
+            WHERE {_ARRIVAL_GROUP} = 'External' AND {_REF_HOST} IS NOT NULL
+            GROUP BY 1, 2
+            QUALIFY ROW_NUMBER() OVER (ORDER BY SESSIONS DESC, LABEL) <= {referrer_limit}
+        )
+        SELECT * FROM grp
+        UNION ALL SELECT * FROM ref
+        -- LABEL breaks ties so two referrers with equal sessions keep one order. Without it the
+        -- order among them followed the query plan, and moved when this SQL's text did.
+        ORDER BY KIND, SESSIONS DESC, LABEL
+    """
+
+
+def campaign_ai_sql() -> str:
+    return f"""
+        SELECT
+            {_MODEL} AS MODEL,
+            COUNT(DISTINCT SESSION_ID) AS SESSIONS,
+            COUNT(DISTINCT {_INTERACTION_KEY}) AS INTERACTIONS
+        FROM {_campaign_table()}
+        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+          AND {_AI_REQUEST}
+          AND SESSION_ID IS NOT NULL
+        GROUP BY 1
+        ORDER BY SESSIONS DESC, MODEL
+    """
+
+
+# ============================================================================
+# 3. Report logic - ported from src/campaign_report.py.
+# ============================================================================
+
+IDENTITY_FLOOR = 5
+
+STATUS_OK = "ok"
+STATUS_NO_SESSIONS = "no_sessions"
+STATUS_MISSING = "missing"
+
+# The deployed app's own address - the "open the live dashboard" link.
+APP_URL = ("https://app.snowflake.com/streamlit/rtewwsa/myb70405/#/apps/"
+           "CIT_DATA_CORE.TRACKING.ANALYTICS_DASHBOARD_DEPLOY/Campaign_Analytics")
+
+ARRIVAL_NOTE = ("Sessions, by where each one arrived from. Direct: no referring site - the link was typed, "
+                "bookmarked, or opened from an email or app. External: sent by another website, such as a "
+                "search engine, social network or partner site. Sessions that began partway through a "
+                "visit, or came from Demand AI's own sites, are not shown.")
+ARRIVAL_NONE = ("No session arrived directly or from an external site in this range: every one began partway "
+                "through a visit on the site, or came from one of Demand AI's own sites.")
+PARTIAL_DAY_NOTE = "{day} is still in progress, so its bar is partial. Days run midnight to midnight UTC."
+DURATION_REPORT_NOTE = ("From a session's first event to its last interaction - a page an open tab keeps re-firing "
+                        "does not stretch it - and not time spent reading. {single:,} of {sessions:,} sessions had "
+                        "a single interaction.")
+INTERACTIONS_NOTE = ("Interactions count a page visit once per page per session - an open tab re-fires page "
+                     "visits every 30-60 seconds - and every click and form submit each time.")
+PAGES_HTML_NOTE = ("Labelled by path, with the host alongside. Each page counts once per session. Query strings are "
+                   "stripped; localhost and iframe pages are left out. One session can visit several pages, so the "
+                   "shares do not sum to 100%.")
+CONTENT_REACH_NOTE = ("Interactions / session counts each page once per session and every click, a PDF page turn "
+                      "included, each time.")
+READ_DEPTH_NOTE = ("Avg deepest is each session's deepest page in the document, averaged; Deepest Page is the "
+                   "furthest any one session reached.")
+AI_MIX_NOTE = ("Sessions on pages built with each AI model. Interactions count each page once per session and "
+               "every click each time.")
+COMPANIES_NOTE = "Company domains only; individual addresses are never included."
+REGIONS_NOTE = "From the browser timezone, the only location signal in the data."
+
+_INTERNAL_IN_WINDOW_MSG = ("All {n:,} events this campaign recorded between {window} are internal traffic, "
+                           "which Exclude internal traffic leaves out. Turn that filter off to see them.")
+_INTERNAL_EVER_MSG = ("This campaign has no activity between {window}, and everything it has ever recorded "
+                      "is internal traffic, which Exclude internal traffic leaves out.")
+
+# When one network address holds this share of the sessions, the count describes one place
+# rather than reach (measured thresholds - see src/campaign_report.py).
+CONCENTRATION_PCT = 80.0
+CONCENTRATION_MIN_SESSIONS = 20
+
+_MONTH = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _as_date(value):
+    if hasattr(value, "year") and hasattr(value, "month"):
+        return value
+    try:
+        return dt.date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def _fmt_date(value, year: bool = False) -> str:
+    d = _as_date(value)
+    if d is None:
+        return str(value)
+    return f"{d.day} {_MONTH[d.month - 1]}" + (f" {d.year}" if year else "")
+
+
+def _fmt_range(start, end) -> str:
+    a, b = _as_date(start), _as_date(end)
+    if a is None or b is None:
+        return f"{start} to {end}"
+    if a.year != b.year:
+        return f"{_fmt_date(a, year=True)} - {_fmt_date(b, year=True)}"
+    return f"{_fmt_date(a)} - {_fmt_date(b)} {b.year}"
+
+
+def classify_lookup(found) -> str:
+    """open / internal_only (everything left is internal traffic the filter removed) /
+    wrong_window (a real campaign on other dates) / unknown (no such id)."""
+    if int(found["EVENTS_IN_WINDOW"]) > 0:
+        return "open"
+    if int(found.get("INTERNAL_EVENTS_IN_WINDOW", 0) or 0) > 0:
+        return "internal_only"
+    if int(found["EVENTS_EVER"]) > 0:
+        return "wrong_window"
+    if int(found.get("INTERNAL_EVENTS_EVER", 0) or 0) > 0:
+        return "internal_only"
+    return "unknown"
+
+
+def internal_only_message(found, window: str) -> str:
+    n = int(found.get("INTERNAL_EVENTS_IN_WINDOW", 0) or 0)
+    return _INTERNAL_IN_WINDOW_MSG.format(n=n, window=window) if n else _INTERNAL_EVER_MSG.format(window=window)
+
+
+def partial_day(daily, today):
+    """The activity chart's last day if it has not finished yet (UTC), else None."""
+    if daily is None or not len(daily):
+        return None
+    days = [d for d in (_as_date(v) for v in daily["EVENT_DATE"]) if d is not None]
+    last = max(days) if days else None
+    return last if last is not None and last >= today else None
+
+
+def partial_day_note(day) -> str:
+    return PARTIAL_DAY_NOTE.format(day=_fmt_date(day))
+
+
+def concentration(kpis):
+    sessions = int(kpis["SESSIONS"] or 0)
+    top = int(kpis["TOP_IP_SESSIONS"] or 0)
+    if sessions < CONCENTRATION_MIN_SESSIONS or not sessions:
+        return None
+    share = top / sessions * 100
+    return share if share >= CONCENTRATION_PCT else None
+
+
+def pct(part, whole) -> float:
+    part, whole = float(part or 0), float(whole or 0)
+    return part / whole * 100 if whole else 0.0
+
+
+def collect(run, campaign_id: str, start: dt.date, end: dt.date) -> dict:
+    """Every section of one campaign's report, gated - identical to src/campaign_report.py.
+    `run` is (sql, params) -> DataFrame."""
+    params = [start, end, campaign_id]
+    kpis = run(campaign_detail_kpis_sql(), params).iloc[0]
+    out: dict = {
+        "campaign_id": campaign_id,
+        "start": start,
+        "end": end,
+        "kpis": kpis,
+        "label": kpis["CAMPAIGN_NAME"] or campaign_id,
+        "named": bool(kpis["CAMPAIGN_NAME"]),
+    }
+
+    if int(kpis["EVENTS"]) == 0:
+        found = run(campaign_lookup_sql(), params).iloc[0]
+        out["status"] = STATUS_MISSING
+        out["reason"] = classify_lookup(found)
+        out["lookup"] = found
+        return out
+
+    if int(kpis["SESSIONS"]) == 0:
+        out["status"] = STATUS_NO_SESSIONS
+        return out
+
+    out["status"] = STATUS_OK
+    out["daily"] = run(campaign_daily_sql(), params)
+    out["partial_day"] = partial_day(out["daily"], dt.datetime.now(dt.timezone.utc).date())
+    out["duration"] = run(campaign_duration_bands_sql(), params)
+    out["event_mix"] = run(campaign_event_mix_sql(), params)
+
+    geo = run(campaign_geo_sql(), params)
+    out["regions"] = geo[geo["KIND"] == "region"][["LABEL", "SESSIONS"]].rename(columns={"LABEL": "REGION"})
+    out["timezones"] = geo[geo["KIND"] == "timezone"][["LABEL", "SESSIONS"]].rename(columns={"LABEL": "TIMEZONE"})
+
+    if int(kpis["PAGES"]) > 0:
+        out["pages"] = run(campaign_pages_sql(), params)
+
+    if int(kpis["ASSETS"]) > 0:
+        out["assets"] = run(campaign_assets_sql(), params)
+        if int(kpis["PAGE_TURN_SESSIONS"]) > 0:
+            out["depth"] = run(campaign_read_depth_sql(), params)
+
+    if int(kpis["PEOPLE"]) >= IDENTITY_FLOOR:
+        out["companies"] = run(campaign_companies_sql(), params)
+
+    sources = run(campaign_sources_sql(), params)
+    out["sources"] = sources[sources["KIND"] == "group"][["LABEL", "SESSIONS"]].rename(columns={"LABEL": "SOURCE_GROUP"})
+    out["referrers"] = sources[sources["KIND"] == "referrer"][["LABEL", "SESSIONS"]].rename(columns={"LABEL": "REFERRER"})
+
+    if int(kpis["AI_SESSIONS"]) > 0:
+        out["ai"] = run(campaign_ai_sql(), params)
+
+    return out
+
+
+# ============================================================================
+# 4. The email body - ported from src/campaign_report.py's to_html(), with the
+#    email-only decisions this procedure has always made: the KPI cards and the
+#    ring sit in plain tables (Outlook ignores flexbox), Activity over time is an
+#    Outlook-safe column chart built from nested tables, there is no footer and
+#    no "Sections not shown" line (both removed by request in v13), and the
+#    sections follow the PDF's order.
+# ============================================================================
+
+_CSS = """
+body{margin:0;padding:24px;background:#fff;color:#0b1a1a;
+ font:15px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}
+.wrap{max-width:860px;margin:0 auto}
+h1{font-size:26px;margin:0 0 4px;letter-spacing:-.01em}
+h2{font-size:17px;margin:34px 0 10px;padding-bottom:6px;border-bottom:1px solid #e6ecec}
+.sub{color:#546a6a;margin:0 0 22px;font-size:14px}
+.kpis{width:100%;margin:0 0 8px}
+.kpi{border:1px solid #e6ecec;border-radius:6px;padding:10px 14px;width:50%;background:#f7fafa;vertical-align:top}
+.kpi .l{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#546a6a}
+.kpi .v{font-size:21px;font-weight:600;font-variant-numeric:tabular-nums}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th{text-align:left;font-size:11px;letter-spacing:.08em;text-transform:uppercase;
+ color:#546a6a;font-weight:500;padding:6px 10px;background:#f2f7f7}
+td{padding:6px 10px;border-bottom:1px solid #eef3f3;vertical-align:middle}
+th.n{text-align:right}
+td.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+td.n.w{white-space:normal}
+.bar{background:#056e6e;height:11px;border-radius:2px;min-width:2px}
+.barcell{width:42%}
+.mix{border:1px solid #e3ecec;margin:0}
+.mix td{border-bottom:none}
+.leg td{padding:4px 0;font-size:13px}
+.sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:8px;vertical-align:-1px}
+.note{color:#546a6a;font-size:13px;margin:8px 0 0}
+.warn{background:#fdf6e3;border:1px solid #e8d9a8;border-radius:6px;padding:14px 16px;margin:18px 0}
+"""
+
+_TEAL = "#056e6e"
+_TEAL_PARTIAL = "#9bc7c7"  # the PDF's partial-day colour: today's bar, still filling
+_MIX_HUES = ("#1d9485", "#913797", "#a9881b")
+
+
+def _blank(v) -> bool:
+    """None, or pandas' NaN for a missing value - NaN is truthy and prints as "nan"."""
+    return v is None or (isinstance(v, float) and v != v)
+
+
+def _esc(v) -> str:
+    return html.escape("" if _blank(v) else str(v), quote=True)
+
+
+def _html_address(v) -> str:
+    """A path or host, escaped, with a <wbr> break after each separator. A browser breaks a
+    long address only after a hyphen, so without these a long host runs off the right edge.
+    Split before escaping so a break never lands inside an entity such as &amp;."""
+    return "<wbr>".join(_esc(part) for part in re.split("(?<=[/.?&=-])", "" if _blank(v) else str(v)))
+
+
+def _fmt_tenths(v) -> str:
+    return f"{float(v or 0):,.1f}"
+
+
+def _fmt_count(v) -> str:
+    return f"{int(v or 0):,}"
+
+
+def _bar_rows(frame, label_col, value_col, extra=None, link_col=None, wrap=False) -> str:
+    if frame is None or not len(frame):
+        return ""
+    top = float(max(float(v or 0) for v in frame[value_col])) or 1.0
+    out = []
+    extra_class = "n w" if wrap else "n"
+    for row in frame.itertuples():
+        label = _html_address(getattr(row, label_col)) if wrap else _esc(getattr(row, label_col))
+        if link_col:
+            href = _esc(getattr(row, link_col, ""))
+            if href:
+                label = f"<a href='{href}'>{label}</a>"
+        value = float(getattr(row, value_col) or 0)
+        width = max(value / top * 100.0, 0.0)
+        cells = f"<td>{label}</td><td class='n'>{value:,.10g}</td>"
+        cells += f"<td class='barcell'><div class='bar' style='width:{width:.1f}%'></div></td>"
+        if extra:
+            for col, fmt in extra:
+                cells += f"<td class='{extra_class}'>{fmt(getattr(row, col))}</td>"
+        out.append(f"<tr>{cells}</tr>")
+    return "".join(out)
+
+
+_TH_NUM = "<th class='n' align='right' style='text-align:right'>{text}</th>"
+
+
+def _table(title, frame, label_col, value_col, value_head, extra=None, note=None, link_col=None, wrap=False) -> str:
+    if frame is None or not len(frame):
+        return ""
+    # Number headers are right-aligned like the numbers under them - by attribute and inline style as
+    # well as the class, because some mail clients drop the <style> block. Left-aligned, "Sessions"
+    # sat over the gap to the left of its column rather than over its values.
+    head = f"<th>{_esc(label_col.replace('_', ' ').title())}</th>" + _TH_NUM.format(text=_esc(value_head)) + "<th></th>"
+    if extra:
+        for col, _ in extra:
+            head += _TH_NUM.format(text=_esc(col.replace("_", " ").title()))
+    body = _bar_rows(frame, label_col, value_col, extra, link_col, wrap)
+    note_html = f"<p class='note'>{_esc(note)}</p>" if note else ""
+    return f"<h2>{_esc(title)}</h2>{note_html}<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
+
+
+def _section_note(title, note) -> str:
+    """A heading with only a sentence under it - for a section that has nothing to draw."""
+    return f"<h2>{_esc(title)}</h2><p class='note'>{_esc(note)}</p>"
+
+
+def _kpi(label, value) -> str:
+    return f"<td class='kpi'><div class='l'>{_esc(label)}</div><div class='v'>{_esc(value)}</div></td>"
+
+
+# The top row, laid out as the PDF's: a narrow column of two stacked cards, then the ring box taking
+# the rest of the width. Tables throughout, with bgcolor= beside the CSS, because Outlook ignores
+# flexbox and some clients drop the <style> block.
+_CARD = ("<table cellpadding='0' cellspacing='0' border='0' bgcolor='#f2f7f7' "
+         "style='width:100%;border:1px solid #e3ecec;background-color:#f2f7f7;border-collapse:separate'><tr>"
+         "<td style='padding:14px 22px 16px;border:0'>"
+         "<div style='font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:#3f5656'>{label}</div>"
+         "<div style='font-size:26px;font-weight:700;line-height:1.3;color:#0b1a1a;"
+         "font-variant-numeric:tabular-nums'>{value}</div></td></tr></table>")
+_CARD_GAP = "<div style='height:18px;line-height:18px;font-size:1px'>&nbsp;</div>"
+_TOP_ROW = ("<table cellpadding='0' cellspacing='0' border='0' style='width:100%;border-collapse:collapse;margin:0 0 8px'><tr>"
+            "<td style='width:32%;vertical-align:top;padding:0 24px 0 0;border:0'>{cards}</td>"
+            "<td style='vertical-align:top;padding:0;border:0'>{mix}</td></tr></table>")
+
+
+_MIX_TOTAL = ("<td style='width:150px;padding:16px;vertical-align:middle'>"
+              "<div style='font-size:26px;font-weight:600;line-height:1.2;color:#0b1a1a'>{total}</div>"
+              "<div style='font-size:11px;letter-spacing:.08em;color:#546a6a'>INTERACTIONS</div></td>")
+_MIX_SEGMENT = ("<td width='{w}%' height='14' bgcolor='{hue}' style='width:{w}%;height:14px;background-color:{hue};"
+                "padding:0;border:0;font-size:1px;line-height:1px;'>&nbsp;</td>")
+
+
+_MIX_RING = ("<td style='width:160px;padding:16px 8px 16px 16px;vertical-align:middle'>"
+             "<img src='cid:{cid}' width='160' height='160' alt='Interactions ring: {alt}' "
+             "style='display:block;width:160px;height:160px;border:0'></td>")
+_RING_CID = "interactions-ring"
+
+
+def _png(width: int, height: int, rows) -> bytes:
+    """An RGBA PNG from rows of bytes, written with zlib alone - no imaging package to install."""
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    raw = b"".join(bytes([0]) + bytes(row) for row in rows)
+    header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    return bytes([137, 80, 78, 71, 13, 10, 26, 10]) + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b"")
+
+
+def _ring_png(slices, size=320, r_out=150.0, r_in=94.0, gap=2.5) -> bytes:
+    """The interactions ring as a PNG: slices clockwise from 12 o'clock, as on the dashboard and
+    the PDF. Drawn at twice its 160px display size and anti-aliased with 3x3 sub-samples per pixel;
+    the background is transparent. `slices` is [(fraction, "#rrggbb")]."""
+    bounds, acc = [], 0.0
+    for frac, hue in slices:
+        rgb = tuple(int(hue[i:i + 2], 16) for i in (1, 3, 5))
+        bounds.append((acc, acc + frac, rgb))
+        acc += frac
+    edges = [a for a, _, _ in bounds] if len(bounds) > 1 else []
+    c = size / 2.0
+    offsets = (-1 / 3, 0.0, 1 / 3)
+    rows = []
+    for y in range(size):
+        row = bytearray(size * 4)
+        for x in range(size):
+            dx0, dy0 = x + 0.5 - c, y + 0.5 - c
+            d = math.hypot(dx0, dy0)
+            if d < r_in - 1 or d > r_out + 1:
+                continue
+            red = green = blue = hits = 0
+            for oy in offsets:
+                for ox in offsets:
+                    dx, dy = dx0 + ox, dy0 + oy
+                    r = math.hypot(dx, dy)
+                    if r < r_in or r > r_out:
+                        continue
+                    t = (math.atan2(dx, -dy) / (2 * math.pi)) % 1.0
+                    if any(min(abs(t - e), 1 - abs(t - e)) * 2 * math.pi * r < gap / 2 for e in edges):
+                        continue
+                    rgb = next((col for a, b, col in bounds if a <= t < b), bounds[-1][2])
+                    red, green, blue, hits = red + rgb[0], green + rgb[1], blue + rgb[2], hits + 1
+            if hits:
+                i = x * 4
+                row[i:i + 4] = bytes((red // hits, green // hits, blue // hits, round(255 * hits / 9)))
+        rows.append(row)
+    return _png(size, size, rows)
+
+
+_INK = "#0b1a1a"
+_MUTED = "#546a6a"
+
+
+def _readable_on(hue: str) -> str:
+    """Ink or white, whichever has the higher contrast against `hue` (WCAG relative luminance) -
+    the dashboard's rule for text on a slice: dark on the teal, white on the purple."""
+    def lum(h):
+        chans = [int(h[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+        lin = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in chans]
+        return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+    bg = lum(hue)
+    on_white = 1.05 / (bg + 0.05)
+    on_ink = (bg + 0.05) / (lum(_INK) + 0.05)
+    return "#ffffff" if on_white >= on_ink else _INK
+
+
+def _ring_png_styled(rows, total_txt) -> bytes:
+    """The PDF's ring as a PNG: slices clockwise from 12 o'clock with a thin white gap between them,
+    and the total over "INTERACTIONS" in the hole. Shares are in the legend beside it, as in the PDF.
+    Drawn with matplotlib's non-interactive Agg backend at 400px, shown at 200px so it stays sharp."""
+    import io
+    import os
+    os.environ.setdefault("MPLCONFIGDIR", "/tmp")  # the procedure's home directory is read-only
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    values = [v for _, v, _ in rows]
+    fig = plt.figure(figsize=(2.0, 2.0), dpi=200)
+    ax = fig.add_axes([0, 0, 1, 1])  # the axes fill the canvas, so the PNG is exactly 400 x 400
+    ax.pie(values, colors=[h for _, _, h in rows], startangle=90, counterclock=False,
+           wedgeprops={"width": 0.4, "edgecolor": "white", "linewidth": 1.2})
+    ax.text(0, 0.08, total_txt, ha="center", va="center", fontsize=14, fontweight="bold", color=_INK)
+    ax.text(0, -0.15, "INTERACTIONS", ha="center", va="center", fontsize=5.5, color=_MUTED)
+    ax.set_xlim(-1.03, 1.03)
+    ax.set_ylim(-1.03, 1.03)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", transparent=True)
+    plt.close(fig)
+    return buf.getvalue()
+
+
+_MIX_RING_STYLED = ("<td style='width:200px;padding:16px 8px 16px 16px;vertical-align:middle'>"
+                    "<img src='cid:{cid}' width='200' height='200' alt='Interactions ring: {alt}' "
+                    "style='display:block;width:200px;height:200px;border:0'></td>")
+
+
+# The legend beside the ring, laid out as the PDF's: a square colour key, the bucket name, and
+# "240  (65.0%)" right-aligned in muted grey. It sits in the right-hand box beside the cards, so
+# right-aligning keeps the figures close to their names rather than at the far edge of the email.
+_LEG_ROW = ("<tr><td style='padding:9px 0;font-size:15px;color:#0b1a1a;white-space:nowrap'>"
+            "<span style='display:inline-block;width:16px;height:16px;background:{hue};background-color:{hue};"
+            "vertical-align:-3px;margin-right:14px'>&nbsp;</span>{label}</td>"
+            "<td align='right' style='padding:9px 0 9px 24px;font-size:15px;text-align:right;color:#546a6a;"
+            "font-variant-numeric:tabular-nums;white-space:nowrap'>{count}&nbsp;&nbsp;({share})</td></tr>")
+_LEG_CELL = ("<td class='leg' style='padding:16px 28px 16px 20px;vertical-align:middle'>"
+             "<table cellpadding='0' cellspacing='0' border='0' style='width:100%;border-collapse:collapse'>"
+             "<tbody>{rows}</tbody></table></td>")
+
+
+def _html_mix(mix, total_interactions, images=None) -> str:
+    """The interactions split - Page visit / Clicks / Form submit - as the dashboard's ring.
+
+    The ring used to be inline SVG, which mail clients strip: a real test email showed only its two
+    text labels, run together as "7,928INTERACTIONS". It is now a PNG drawn here and attached to the
+    email inline (cid:), which Outlook and Gmail both display; the total stands beside it as text
+    and the legend carries every count and share. `images` collects the PNG for run_report() to
+    attach. If drawing fails, or no `images` dict is passed, the split falls back to a stacked bar
+    built from table cells, so the email still goes out with the numbers.
+    """
+    if mix is None or not len(mix) or float(mix["INTERACTIONS"].sum()) <= 0:
+        return ""
+    by_bucket = {str(r.BUCKET): float(r.INTERACTIONS or 0) for r in mix.itertuples()}
+    rows = [(name, by_bucket.get(name, 0.0), _MIX_HUES[i % len(_MIX_HUES)]) for i, name in enumerate(EVENT_BUCKET_ORDER) if by_bucket.get(name, 0.0) > 0]
+    if not rows:
+        return ""
+    shown = sum(v for _, v, _ in rows)
+    legend, segments = [], []
+    for label, value, hue in rows:
+        share = value / shown * 100.0
+        share_txt = f"{share:.1f}%" if share >= 0.1 else "&lt;0.1%"
+        legend.append(_LEG_ROW.format(hue=hue, label=_esc(label), count=f"{int(round(value)):,}", share=share_txt))
+        # A sliver still gets half a percent so it stays visible; the legend has the exact share.
+        segments.append(_MIX_SEGMENT.format(w=f"{max(share, 0.5):.1f}", hue=hue))
+    total_txt = f"{int(round(shown)):,}"
+    missing = int(total_interactions) - int(round(shown))
+    gap = f"<p class='note'>{total_txt} of this campaign's {int(total_interactions):,} interactions fall into these three buckets; {missing:,} do not.</p>" if missing > 0 else ""
+    legend_cell = _LEG_CELL.format(rows="".join(legend))
+
+    if images is not None:
+        try:
+            styled = _ring_png_styled(rows, total_txt)
+        except Exception:
+            styled = None
+        if styled is not None:
+            images[_RING_CID] = styled
+            alt = _esc(", ".join(f"{n} {int(round(v)):,}" for n, v, _ in rows))
+            return ("<table class='mix' cellpadding='0' cellspacing='0' border='0'><tr>"
+                    + _MIX_RING_STYLED.format(cid=_RING_CID, alt=alt)
+                    + legend_cell + f"</tr></table>{gap}")
+
+    # Fallbacks: a plain ring with the total beside it, then the stacked bar.
+    ring = None
+    if images is not None:
+        try:
+            # A sliver keeps at least 1% of the circle so it stays visible; the legend has the exact share.
+            fracs = [max(v / shown, 0.01) for _, v, _ in rows]
+            scale = sum(fracs)
+            ring = _ring_png([(f / scale, hue) for f, (_, _, hue) in zip(fracs, rows)])
+        except Exception:
+            ring = None
+    if ring is not None:
+        images[_RING_CID] = ring
+        alt = _esc(", ".join(f"{n} {int(round(v)):,}" for n, v, _ in rows))
+        return ("<table class='mix' cellpadding='0' cellspacing='0' border='0'><tr>"
+                + _MIX_RING.format(cid=_RING_CID, alt=alt)
+                + _MIX_TOTAL.format(total=total_txt)
+                + legend_cell + f"</tr></table>{gap}")
+
+    bar = ("<table cellpadding='0' cellspacing='0' border='0' style='width:100%;border-collapse:collapse;table-layout:fixed'>"
+           f"<tr>{''.join(segments)}</tr></table>")
+    return ("<table class='mix' cellpadding='0' cellspacing='0' border='0'><tr>"
+            + _MIX_TOTAL.format(total=total_txt)
+            + legend_cell + "</tr>"
+            + f"<tr><td colspan='2' style='padding:0 16px 16px'>{bar}</td></tr></table>{gap}")
+
+
+def _short_date(v) -> str:
+    d = _as_date(v)
+    return _esc(v) if d is None else f"{d.day} {_MONTH[d.month - 1]}"
+
+
+_DAY_VALUE = "<td style='text-align:center;font-size:9px;{weight}color:#0b1a1a;padding:0 1px;white-space:nowrap;'>{text}</td>"
+_DAY_EMPTY = ("<td style='padding:0 1px;vertical-align:bottom;'><table cellpadding='0' cellspacing='0' border='0' "
+              "style='width:100%;border-collapse:collapse'><tr><td height='{h}' style='height:{h}px;line-height:1px;"
+              "font-size:1px;'>&nbsp;</td></tr></table></td>")
+_DAY_BAR = ("<td style='padding:0 1px;vertical-align:bottom;'><table cellpadding='0' cellspacing='0' border='0' "
+            "style='width:100%;border-collapse:collapse'><tr><td height='{spacer}' style='height:{spacer}px;"
+            "line-height:1px;font-size:1px;'>&nbsp;</td></tr><tr><td height='{bar}' bgcolor='{hue}' "
+            "style='height:{bar}px;line-height:1px;font-size:1px;background-color:{hue};'>&nbsp;</td></tr></table></td>")
+_DAY_LABEL = "<td style='text-align:center;font-size:8px;color:#546a6a;padding:2px 1px 0;white-space:nowrap;'>{text}</td>"
+
+
+def _daily_chart(frame, label_col, value_col, partial=None) -> str:
+    """Activity over time as an Outlook-safe column chart: nested tables with the height=
+    and bgcolor= attributes, the two things Outlook's Word engine actually renders.
+
+    Matches the PDF's chart rules: every calendar day from the first to the last keeps its
+    slot, so a quiet gap shows as a gap rather than closing up; today's bar, still filling
+    (UTC), is drawn lighter and noted; Quietest is chosen from finished days only.
+    """
+    if frame is None or not len(frame):
+        return ""
+    by_day = {}
+    for row in frame.itertuples():
+        d = _as_date(getattr(row, label_col))
+        if d is not None:
+            by_day[d] = float(getattr(row, value_col) or 0)
+    if not by_day:
+        return ""
+    first, last = min(by_day), max(by_day)
+    days = [first + dt.timedelta(days=i) for i in range((last - first).days + 1)]
+    active = [d for d in days if d in by_day]
+    top = max(by_day.values()) or 1.0
+    peak = max(active, key=lambda d: by_day[d])
+    finished = [d for d in active if partial is None or d < partial]
+    quiet = min(finished, key=lambda d: by_day[d]) if finished else None
+    max_px = 110
+    label_every = max(1, round(len(days) / 15))
+
+    val_cells, bar_cells, date_cells = [], [], []
+    for i, d in enumerate(days):
+        v = by_day.get(d)
+        weight = "font-weight:700;" if d in (peak, quiet) else ""
+        val_cells.append(_DAY_VALUE.format(weight=weight, text="" if v is None else f"{v:,.0f}"))
+        if v is None:
+            bar_cells.append(_DAY_EMPTY.format(h=max_px))
+        else:
+            bar_px = max(round(v / top * max_px), 1)
+            hue = _TEAL_PARTIAL if d == partial else _TEAL
+            bar_cells.append(_DAY_BAR.format(spacer=max_px - bar_px, bar=bar_px, hue=hue))
+        show = (i % label_every == 0) or i == len(days) - 1
+        date_cells.append(_DAY_LABEL.format(text=_short_date(d) if show else ""))
+
+    chart = ("<table cellpadding='0' cellspacing='0' border='0' style='width:100%;table-layout:fixed;border-collapse:collapse'>"
+             f"<tr>{''.join(val_cells)}</tr><tr>{''.join(bar_cells)}</tr><tr>{''.join(date_cells)}</tr></table>")
+    total = sum(by_day.values())
+    days_txt = f"{len(days):,} days" if len(active) == len(days) else f"{len(active):,} active days of {len(days):,}"
+    quiet_txt = f" &middot; Quietest {by_day[quiet]:,.0f} on {_short_date(quiet)}" if quiet is not None else ""
+    caption = f"<p class='note'>Sessions: {total:,.0f} over {days_txt} &middot; Peak {by_day[peak]:,.0f} on {_short_date(peak)}{quiet_txt}</p>"
+    note = f"<p class='note'>{_esc(partial_day_note(partial))}</p>" if partial is not None and partial in by_day else ""
+    return f"<h2>Activity over time</h2>{note}{chart}{caption}"
+
+
+def _ident(data) -> str:
+    """The identity line under the title, as the PDF writes it."""
+    k = data["kpis"]
+    facts = [f"Campaign ID <code>{_esc(data['campaign_id'])}</code>"]
+    if not _blank(k["TENANT"]) and k["TENANT"]:
+        facts.append(f"Tenant <code>{_esc(k['TENANT'])}</code>")
+    facts.append(f"Reporting on {_esc(_fmt_range(data['start'], data['end']))}")
+    window_days = (_as_date(data["end"]) - _as_date(data["start"])).days + 1
+    active = f"active on {int(k['ACTIVE_DAYS']):,} of {window_days:,} days"
+    if _as_date(k["FIRST_SEEN"]) != _as_date(data["start"]) or _as_date(k["LAST_SEEN"]) != _as_date(data["end"]):
+        active = f"ran {_esc(_fmt_range(k['FIRST_SEEN'], k['LAST_SEEN']))}, {active}"
+    facts.append(active[0].upper() + active[1:])
+    return " &middot; ".join(facts)
+
+
+def _document(title, body, window, link) -> str:
+    # No footer (removed in v13, by request). window and link stay as parameters so the
+    # call sites read the same as src/campaign_report.py's.
+    return (
+        "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"<title>{_esc(title)} - campaign report</title><style>{_CSS}</style></head>"
+        f"<body><div class='wrap'>{body}</div></body></html>"
+    )
+
+
+def to_html(data: dict, link: str = "", images=None) -> str:
+    """The email body. Pass a dict as `images` to collect inline pictures (the ring) by
+    Content-ID; run_report() attaches whatever ends up in it."""
+    k = data["kpis"]
+    label, cid = _esc(data["label"]), _esc(data["campaign_id"])
+    window = f"{data['start']} to {data['end']}"
+
+    if data["status"] == STATUS_MISSING:
+        if data.get("reason") == "internal_only":
+            msg = _esc(internal_only_message(data["lookup"], f"{data['start']} and {data['end']}"))
+        elif data.get("reason") == "wrong_window":
+            f = data["lookup"]
+            msg = (f"Campaign <code>{cid}</code> has no activity between {window}. "
+                   f"It ran <b>{_esc(f['FIRST_EVER'])} to {_esc(f['LAST_EVER'])}</b> "
+                   f"with {int(f['EVENTS_EVER']):,} events.")
+        else:
+            msg = f"No campaign <code>{cid}</code> exists in the tracked data."
+        return _document(label, f"<h1>{label}</h1><div class='warn'>{msg}</div>", window, link)
+
+    if data["status"] == STATUS_NO_SESSIONS:
+        body = (f"<h1>{label}</h1><p class='sub'>Campaign ID {cid}</p><div class='warn'>"
+                f"{int(k['EVENTS']):,} events recorded between {window}, but no identifiable "
+                f"sessions: session IDs were not captured on campaign rows before November 2025, "
+                f"so only event counts exist this far back.</div>")
+        return _document(label, body, window, link)
+
+    s = int(k["SESSIONS"])
+    parts = [f"<h1>{label}</h1>", f"<p class='sub'>{_ident(data)}</p>"]
+
+    # The PDF's top row: the two cards stacked on the left, the ring and its legend in a box on the right.
+    cards = _CARD.format(label="Distinct sessions", value=f"{s:,}") + _CARD_GAP + _CARD.format(label="Interactions / session", value=f"{float(k['INTERACTIONS']) / s:,.1f}")
+    mix_html = _html_mix(data.get("event_mix"), int(k["INTERACTIONS"]), images)
+    parts.append(_TOP_ROW.format(cards=cards, mix=mix_html))
+    parts.append(f"<p class='note'>{_esc(INTERACTIONS_NOTE)}</p>")
+
+    conc = concentration(k)
+    if conc is not None:
+        msg = (f"{conc:.0f}% of these {s:,} sessions came from a single network address "
+               f"({int(k['DISTINCT_IPS']):,} addresses in total). Likely one organisation or an "
+               f"automated client rather than {s:,} separate visitors - an address is not a person.")
+        parts.append(f"<p class='note'>{_esc(msg)}</p>")
+
+    parts.append(_daily_chart(data.get("daily"), "EVENT_DATE", "SESSION_COUNT", data.get("partial_day")))
+    parts.append(_table("Session duration", data.get("duration"), "BAND", "SESSIONS", "Sessions",
+                        note=DURATION_REPORT_NOTE.format(single=int(k["SINGLE_INTERACTION_SESSIONS"]), sessions=s)))
+    parts.append(_table("Where they are", data.get("regions"), "REGION", "SESSIONS", "Sessions", note=REGIONS_NOTE))
+
+    parts.append(_table("Accounts reached", data.get("companies"), "COMPANY", "SESSIONS", "Sessions",
+                        extra=[("PEOPLE", _fmt_count)], note=COMPANIES_NOTE))
+    people = int(k["PEOPLE"])
+    if data.get("companies") is None and 0 < people < IDENTITY_FLOOR:
+        noun = "person" if people == 1 else "people"
+        parts.append(_section_note("Accounts reached", f"Company breakdown withheld: only {people} identified {noun} in this range, too few to name a company without describing an individual."))
+
+    parts.append(_table("How they arrived", data.get("sources"), "SOURCE_GROUP", "SESSIONS", "Sessions", note=ARRIVAL_NOTE))
+    if data.get("sources") is not None and not len(data["sources"]):
+        parts.append(_section_note("How they arrived", ARRIVAL_NONE))
+    parts.append(_table("External referrers", data.get("referrers"), "REFERRER", "SESSIONS", "Sessions"))
+    parts.append(_table("AI model mix", data.get("ai"), "MODEL", "SESSIONS", "Sessions",
+                        extra=[("INTERACTIONS", _fmt_count)], note=AI_MIX_NOTE))
+
+    parts.append(_table("Pages viewed", data.get("pages"), "PAGE", "SESSIONS", "Sessions",
+                        extra=[("HOST", _html_address)], note=PAGES_HTML_NOTE, wrap=True))
+    parts.append(_table("Content by reach", data.get("assets"), "ASSET", "SESSIONS", "Sessions",
+                        extra=[("INTERACTIONS_PER_SESSION", _fmt_tenths)], note=CONTENT_REACH_NOTE))
+    parts.append(_table("PDF read depth", data.get("depth"), "ASSET", "AVG_PAGE_REACHED", "Avg deepest",
+                        extra=[("DEEPEST_PAGE", _fmt_count)], note=READ_DEPTH_NOTE))
+
+    return _document(label, "".join(parts), window, link)
+
+
+# ============================================================================
+# 5. The reporting window - verbatim from src/components.py's date_range_filter():
+#    the window a fresh dashboard session opens with, so the email and the
+#    dashboard opened the same day show the same dates.
+# ============================================================================
+
+_DATA_STARTS = dt.date(2025, 6, 1)
+_PRESET_MONTHS = (1, 3, 6, 12, 24)
+
+
+def _months_before(day: dt.date, months: int) -> dt.date:
+    total = day.year * 12 + day.month - 1 - months
+    year, month = divmod(total, 12)
+    return dt.date(year, month + 1, min(day.day, calendar.monthrange(year, month + 1)[1]))
+
+
+def _preset_range(today: dt.date, months: int) -> tuple:
+    return (max(_months_before(today, months) + dt.timedelta(days=1), _DATA_STARTS), today)
+
+
+def _dashboard_window(today: dt.date, default_days: int) -> tuple:
+    """"30 days" snaps to the nearest whole-month preset when that preset starts within two
+    days of the target - which is why the window is 28 to 31 days long depending on the month."""
+    target = (today - dt.timedelta(days=default_days), today)
+    gap, months = min((abs((_preset_range(today, m)[0] - target[0]).days), m) for m in _PRESET_MONTHS)
+    chosen = _preset_range(today, months) if gap <= 2 else target
+    latest = today + dt.timedelta(days=1)
+    return (min(max(chosen[0], _DATA_STARTS), latest), min(max(chosen[1], _DATA_STARTS), latest))
+
+
+# ============================================================================
+# 6. Glue: Snowpark run() adapter and the SES send.
+# ============================================================================
+
+TEST_RECIPIENTS = ["sahil.otavanekar@demandai.co"]
+ALL_RECIPIENTS = ["sunil.chandrabhankadam@demandai.co", "sahil.otavanekar@demandai.co", "makarand.prabhu@demandai.co", "prashant.chaudhari@demandai.co"]
+
+
+def run_report(session: Session, campaign_id: str, window_days: int, exclude_internal_flag: bool) -> str:
+    global _EXCLUDE_INTERNAL_FLAG
+    _EXCLUDE_INTERNAL_FLAG = bool(exclude_internal_flag)
+
+    # Everyone. To test a change on your own inbox first, set this to TEST_RECIPIENTS: the email then
+    # goes to that list only, with [TEST] in front of the subject. If an address does not receive the
+    # email, check the AWS SES console (sending statistics, suppression list, sandbox mode) first.
+    recipients = ALL_RECIPIENTS
+    ccrecipients = []
+    sender = "report@amplifye.org"
+    region = "us-east-1"
+
+    today = dt.date.today()
+    start_date, end_date = _dashboard_window(today, window_days)
+
+    def run(sql, params):
+        return session.sql(sql, params=params).to_pandas()
+
+    data = collect(run, campaign_id, start_date, end_date)
+
+    # The link carries only the campaign id, so it opens on the dashboard's own window as of
+    # the click - the same dates as this email when opened the same day.
+    share_link = f"{APP_URL}?campaign_id={campaign_id}"
+    images = {}
+    email_html = to_html(data, link=share_link, images=images)
+    subject = f"Campaign Analytics Daily Report: {data['label']}"
+    if recipients == TEST_RECIPIENTS:
+        subject = "[TEST] " + subject
+
+    creds = _snowflake.get_username_password("aws_cred")
+    access_key = creds.username
+    secret_key = creds.password
+    if not access_key or not secret_key:
+        raise RuntimeError("AWS creds not found; ensure SECRETS=('aws_cred'=DEV_MDLH.TARGET.SES_SECRET_MDLH_DAILY_REPORT).")
+
+    # A raw MIME message rather than SES "Simple" content, because the ring is a PNG attached inline:
+    # multipart/related holds the HTML and each image, and the HTML points at an image by its
+    # Content-ID (src='cid:...'), which is how Outlook and Gmail show a picture inside the body.
+    msg = MIMEMultipart("related")
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = ", ".join(recipients)
+    if ccrecipients:
+        msg["Cc"] = ", ".join(ccrecipients)
+    msg.attach(MIMEText(email_html, "html", "utf-8"))
+    for cid, png in images.items():
+        part = MIMEImage(png, "png")
+        part.add_header("Content-ID", f"<{cid}>")
+        part.add_header("Content-Disposition", "inline", filename=f"{cid}.png")
+        msg.attach(part)
+
+    ses = boto3.client("sesv2", region_name=region, aws_access_key_id=access_key, aws_secret_access_key=secret_key)
+    ses.send_email(
+        FromEmailAddress=sender,
+        Destination={"ToAddresses": recipients, "CcAddresses": ccrecipients},
+        Content={"Raw": {"Data": msg.as_bytes()}},
+    )
+
+    return (f"SES email sent to: {', '.join(recipients)} | campaign={campaign_id} "
+            f"status={data['status']} exclude_internal={exclude_internal_flag} "
+            f"window={start_date} to {end_date}")
+
+$$;
