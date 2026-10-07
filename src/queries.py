@@ -1525,10 +1525,53 @@ def tenant_movement_sql(limit: int = 12) -> str:
 # claimed ml_request events carry no campaign ID; that was wrong - 1,265,377 of 1,265,649
 # of them do. AI is simply concentrated in 138 of 1,023 campaigns, none of which are the
 # largest by sessions.
+#
+# A campaign's date range holds the sessions that STARTED in it, each with every event it had -
+# including events after the range's last midnight. It used to hold every event dated inside the
+# range, and a session crossing midnight then belonged to two ranges at once: on
+# demand_ai_internal_website_track a one-day range read 231 sessions while the same day's bar in a
+# week-long chart read 229, and the week read 1,271 against 1,268 summed from the month's bars.
+# Counted by start day, day, week and month add up exactly (222 / 1,304 / 5,085 for 6 Oct 2026, and
+# the month's bars sum to its card). Measured on 6 Oct 2026, every figure moved by 0.5% or less.
+# It is also more accurate at the edges: a session's duration runs from its real start rather than
+# from midnight, and "How they arrived" reads its real first event rather than a mid-visit click.
+#
+# A session's start is looked for STARTED_DAY_LOOKBACK_DAYS either side of the range. Of 18,778
+# sessions on that campaign since 1 May, 18,494 ended the day they began and all but two within 11
+# days; the two that did not are session IDs left open for 110 and 126 days, and with the 14-day
+# window they count as starting inside a range they are active in - exactly as before this change.
+#
+# Rows with no SESSION_ID keep their own date: there is no session to attribute them to.
+#
+# Ten binds rather than three - see campaign_params(), which every caller uses rather than
+# building the list itself. The emailed Campaign Overview applies the same rule.
+STARTED_DAY_LOOKBACK_DAYS = 14
+
 _CAMPAIGN_SCOPE = """
-        WHERE EVENT_TS::DATE BETWEEN ? AND ?
+        WHERE EVENT_TS::DATE BETWEEN DATEADD(day, -{lookback}, ?::DATE) AND DATEADD(day, {lookback}, ?::DATE)
           AND CAMPAIGN_ID = ?
-          AND {not_test}"""
+          AND {not_test}
+          AND (SESSION_ID IN (
+                  SELECT SESSION_ID FROM {table}
+                  WHERE CAMPAIGN_ID = ?
+                    AND {not_test}
+                    AND SESSION_ID IS NOT NULL
+                    AND EVENT_TS::DATE BETWEEN DATEADD(day, -{lookback}, ?::DATE) AND DATEADD(day, {lookback}, ?::DATE)
+                  GROUP BY SESSION_ID
+                  HAVING MIN(EVENT_TS)::DATE BETWEEN ?::DATE AND ?::DATE)
+               OR (SESSION_ID IS NULL AND EVENT_TS::DATE BETWEEN ?::DATE AND ?::DATE))"""
+
+
+def _campaign_scope() -> str:
+    """The WHERE clause every campaign builder reads its rows through. The session subquery reads
+    the same table as the FROM it follows - _campaign_table() - so the internal-traffic filter
+    decides a session's start and its rows alike."""
+    return _CAMPAIGN_SCOPE.format(not_test=_NOT_TEST, table=_campaign_table(), lookback=STARTED_DAY_LOOKBACK_DAYS)
+
+
+def campaign_params(start, end, campaign_id) -> list:
+    """The binds every builder that uses _CAMPAIGN_SCOPE takes, in the order the scope reads them."""
+    return [start, end, campaign_id, campaign_id, start, end, start, end, start, end]
 
 
 def _campaign_events_cte() -> str:
@@ -1555,7 +1598,7 @@ def _campaign_events_cte() -> str:
             {_ACTION_LABEL} AS ACTION_LABEL,
             IFF({_ENGAGED_EVENT}, 1, 0) AS IS_ACTION
         FROM {_campaign_table()}
-        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+        {_campaign_scope()}
     """
 
 
@@ -1754,7 +1797,7 @@ def campaign_daily_sql() -> str:
                 -- The day the session STARTED, carried onto all of its rows.
                 MIN(EVENT_TS::DATE) OVER (PARTITION BY SESSION_ID) AS SESSION_START
             FROM {_campaign_table()}
-            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+            {_campaign_scope()}
         )
         SELECT
             EVENT_DATE,
@@ -1789,7 +1832,7 @@ def campaign_duration_bands_sql() -> str:
     """
     # Built first rather than nested inside the f-string below: the Streamlit-in-Snowflake runtime is
     # Python 3.11, which predates the nested-quote f-strings that 3.12 allows.
-    spans = _session_spans_ctes(f"{_campaign_table()} {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)} AND SESSION_ID IS NOT NULL")
+    spans = _session_spans_ctes(f"{_campaign_table()} {_campaign_scope()} AND SESSION_ID IS NOT NULL")
     return f"""
         WITH {spans}
         SELECT
@@ -1955,7 +1998,7 @@ def campaign_event_mix_sql() -> str:
             {_EVENT_BUCKET} AS BUCKET,
             COUNT(DISTINCT {_INTERACTION_KEY}) AS INTERACTIONS
         FROM {_campaign_table()}
-        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+        {_campaign_scope()}
         GROUP BY 1
     """
 
@@ -1975,7 +2018,7 @@ def campaign_funnel_sql() -> str:
                 MAX(IFF({_ENGAGED_EVENT}, 1, 0)) AS DID_ACT,
                 MAX(IFF({_LEAD_SUBMIT}, 1, 0)) AS DID_CONVERT
             FROM {_campaign_table()}
-            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+            {_campaign_scope()}
               AND SESSION_ID IS NOT NULL
             GROUP BY SESSION_ID
         )
@@ -2034,7 +2077,7 @@ def campaign_geo_sql(timezone_limit: int = 10) -> str:
         WITH base AS (
             SELECT SESSION_ID, TIMEZONE
             FROM {_campaign_table()}
-            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+            {_campaign_scope()}
               AND SESSION_ID IS NOT NULL
         ), region AS (
             SELECT 'region' AS KIND, {_REGION} AS LABEL, COUNT(DISTINCT SESSION_ID) AS SESSIONS
@@ -2113,7 +2156,7 @@ def campaign_pages_sql(limit: int = 12) -> str:
             SELECT SESSION_ID, MESSAGE_ID, EVENT_NAME, EVENT_TYPE, SEARCH_URL,
                    {_PAGE_SCHEME} AS SCHEME
             FROM {_campaign_table()}
-            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+            {_campaign_scope()}
               AND SESSION_ID IS NOT NULL
         ), all_sessions AS (
             SELECT COUNT(DISTINCT SESSION_ID) AS N FROM base
@@ -2165,7 +2208,7 @@ def campaign_assets_sql(limit: int = 12) -> str:
             ROUND(COUNT(DISTINCT {_INTERACTION_KEY}) * 1.0
                   / NULLIF(COUNT(DISTINCT SESSION_ID), 0), 1) AS INTERACTIONS_PER_SESSION
         FROM {_campaign_table()}
-        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+        {_campaign_scope()}
           AND {_ASSET} IS NOT NULL
           AND SESSION_ID IS NOT NULL
         GROUP BY {_ASSET}
@@ -2200,7 +2243,7 @@ def campaign_read_depth_sql(limit: int = 10) -> str:
                 SESSION_ID,
                 MAX(TRY_TO_NUMBER(PROPERTIES:page_visited::STRING)) AS DEEPEST
             FROM {_campaign_table()}
-            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+            {_campaign_scope()}
               AND PROPERTIES:page_visited IS NOT NULL
               AND {_ASSET} IS NOT NULL
               AND SESSION_ID IS NOT NULL
@@ -2233,7 +2276,7 @@ def campaign_companies_sql(limit: int = 12) -> str:
             COUNT(DISTINCT {_EMAIL}) AS PEOPLE,
             COUNT(DISTINCT SESSION_ID) AS SESSIONS
         FROM {_campaign_table()}
-        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+        {_campaign_scope()}
           AND {_VALID_EMAIL}
           AND {_DOMAIN} NOT IN {_FREE_MAIL}
           AND SESSION_ID IS NOT NULL
@@ -2328,7 +2371,7 @@ def campaign_sources_sql(referrer_limit: int = 8) -> str:
         WITH arrivals AS (
             SELECT REFERER_URL, SEARCH_URL
             FROM {_campaign_table()}
-            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+            {_campaign_scope()}
               AND SESSION_ID IS NOT NULL
             QUALIFY ROW_NUMBER() OVER (PARTITION BY SESSION_ID ORDER BY EVENT_TS, MESSAGE_ID) = 1
         ), grp AS (
@@ -2372,7 +2415,7 @@ def campaign_ai_sql() -> str:
             COUNT(DISTINCT SESSION_ID) AS SESSIONS,
             COUNT(DISTINCT {_INTERACTION_KEY}) AS INTERACTIONS
         FROM {_campaign_table()}
-        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+        {_campaign_scope()}
           AND {_AI_REQUEST}
           AND SESSION_ID IS NOT NULL
         GROUP BY 1

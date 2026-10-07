@@ -129,6 +129,18 @@ top_campaigns = run_query(top_campaigns_sql(CAMPAIGN_PICKER_LIMIT), params)
 ranked = top_campaigns.head(CHART_ROWS)
 
 
+# The campaign Back last closed. In Snowsight the app runs in an iframe and its query string is
+# mirrored to the outer page's URL asynchronously, so deleting ?campaign_id= does not reliably
+# land before the rerun that follows - the next run could still read the old id, adopt it as a
+# fresh link, and reopen the campaign: Back "did nothing", some of the time, and always worked
+# after a page switch (which loads a URL without the parameter). Remembering the closed id lets
+# a stale parameter be recognised and ignored. It is forgotten only when a campaign is opened
+# from the page; a link to a DIFFERENT campaign still opens at once. It is deliberately not
+# forgotten when this run's query_params lacks the id: the server side drops it in the very run
+# Back triggers, before Snowsight's late update can bring it back - which is the case it exists for.
+DISMISSED_KEY = "campaign_dismissed"
+
+
 def open_campaign(campaign_id):
     """Open one campaign, and put it in the URL so the view can be shared.
 
@@ -137,16 +149,30 @@ def open_campaign(campaign_id):
     session state. The explicit rerun below is what swaps the view.
     """
     st.session_state[SELECTED_KEY] = str(campaign_id)
+    st.session_state.pop(DISMISSED_KEY, None)
     st.query_params[QUERY_KEY] = str(campaign_id)
     st.rerun()
 
 
+def close_campaign():
+    """Back's on_click: runs before the rerun it triggers, so that run already draws the ranking.
+
+    The chart's bar selection and the picker are reset too, so neither can reopen the campaign
+    from a value left over from before it was opened.
+    """
+    st.session_state[DISMISSED_KEY] = st.session_state.pop(SELECTED_KEY, None)
+    st.session_state.pop("campaign_chart", None)
+    st.session_state.pop("campaign_picker", None)
+    if QUERY_KEY in st.query_params:
+        del st.query_params[QUERY_KEY]
+
+
 # A link carrying ?campaign_id=... opens that campaign directly. The URL is the source of
 # truth on arrival and the in-page controls own it afterwards, writing back on every change.
-# Adoption is conditional so that pressing Back - which clears both - is not immediately
-# undone by re-reading a parameter that is no longer there.
+# Adoption is conditional so that pressing Back - which clears both - is not undone by a
+# parameter that is gone, or by one Snowsight has not yet finished removing (DISMISSED_KEY).
 linked = st.query_params.get(QUERY_KEY)
-if linked and linked != st.session_state.get(SELECTED_KEY):
+if linked and linked != st.session_state.get(SELECTED_KEY) and linked != st.session_state.get(DISMISSED_KEY):
     st.session_state[SELECTED_KEY] = str(linked)
 
 # The detail view REPLACES the ranking rather than appending to it, and that includes the
@@ -157,12 +183,10 @@ if linked and linked != st.session_state.get(SELECTED_KEY):
 # the sidebar's date and filter controls can rerun the page without losing it.
 selected = st.session_state.get(SELECTED_KEY)
 if selected:
-    if st.button(":material/arrow_back: Back to all campaigns"):
-        st.session_state.pop(SELECTED_KEY, None)
-        # Clear the URL too, or the next run re-adopts the parameter and Back does nothing.
-        if QUERY_KEY in st.query_params:
-            del st.query_params[QUERY_KEY]
-        st.rerun()
+    # A callback rather than `if st.button(...)`: the state is cleared before the rerun the click
+    # triggers, so that run draws the ranking directly - no second rerun - and see DISMISSED_KEY
+    # for why a stale URL can no longer reopen the campaign.
+    st.button(":material/arrow_back: Back to all campaigns", on_click=close_campaign)
     # Collected once, here, and handed to the renderer. The page needs the report before it
     # draws anything, to decide whether a share link and download buttons make sense at all:
     # both are assertions ABOUT a campaign, and neither belongs on a page whose only honest

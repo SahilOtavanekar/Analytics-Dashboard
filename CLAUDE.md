@@ -112,3 +112,10 @@ Python runs; fix it with `GRANT OWNERSHIP … COPY CURRENT GRANTS`, not by editi
 
 No secrets are needed inside Snowflake: `st.connection("snowflake")` returns the active Snowpark
 session before it ever reads `secrets.toml`, which is local-development only.
+
+The daily email is the stored procedure `CAMPAIGN_ANALYTICS_REPORT_DAILY`, **built, not hand-written**:
+`python scripts/build_procedure.py out.sql` embeds `src/db.py`, `queries.py`, `minipdf.py` and
+`campaign_report.py` unchanged plus `scripts/procedure_overview.py` (campaigns, recipients, layout).
+`updated procedure.txt` is the copy that is live. After changing anything in `src/` the email uses,
+rebuild, and paste the output into a Snowsight worksheet to deploy it. `CALL …('TEST')` sends only to
+the test recipient.
