@@ -28,6 +28,7 @@ from src.campaign_report import (
     internal_only_message,
     partial_day_note,
     concentration,
+    STARTED_EARLIER_MSG,
     STATUS_MISSING,
     STATUS_NO_SESSIONS,
     classify_lookup,
@@ -170,6 +171,8 @@ def render(campaign_id: str, start: dt.date, end: dt.date, data: dict | None = N
     if data["status"] == STATUS_MISSING:
         if data["reason"] == "internal_only":
             st.info(internal_only_message(data["lookup"], f"{start} and {end}"))
+        elif data["reason"] == "started_earlier":
+            st.info(STARTED_EARLIER_MSG.format(window=f"{start} and {end}"))
         elif data["reason"] == "wrong_window":
             f = data["lookup"]
             named = f" (`{f['CAMPAIGN_NAME']}`)" if f["CAMPAIGN_NAME"] else ""

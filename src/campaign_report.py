@@ -47,6 +47,7 @@ from src.queries import (
     campaign_geo_sql,
     campaign_lookup_sql,
     campaign_pages_sql,
+    campaign_params,
     campaign_read_depth_sql,
     campaign_sources_sql,
 )
@@ -208,6 +209,21 @@ def internal_only_message(found, window: str) -> str:
     return _INTERNAL_IN_WINDOW_MSG.format(n=n, window=window) if n else _INTERNAL_EVER_MSG.format(window=window)
 
 
+# collect()'s "started_earlier" outcome: the range has activity, but all of it belongs to sessions
+# that began before the range - and a session counts on the day it started (see _CAMPAIGN_SCOPE in
+# queries.py). Rare, and only on short ranges: a quiet campaign's single day whose only visitor had
+# arrived the evening before. Without its own reason it read "No campaign exists", which is false.
+STARTED_EARLIER_MSG = ("This campaign had activity between {window}, but only from sessions that started before "
+                       "that date. Each session is counted once, on the day it started, so none falls in this range.")
+
+
+def _day(value):
+    """A date from a DATE cell. Snowflake returns date objects, Timestamps or strings depending on
+    the path; a Timestamp is a datetime, and comparing one with a date raises."""
+    d = _as_date(value)
+    return d.date() if isinstance(d, dt.datetime) else d
+
+
 def collect(run, campaign_id: str, start: dt.date, end: dt.date) -> dict:
     """Every section of one campaign's report, gated, from a single entry point.
 
@@ -216,7 +232,7 @@ def collect(run, campaign_id: str, start: dt.date, end: dt.date) -> dict:
     matters. Ordering of the queries is the same order the page renders them, so a reader
     following a slow load sees them appear top to bottom.
     """
-    params = [start, end, campaign_id]
+    params = campaign_params(start, end, campaign_id)
     kpis = run(campaign_detail_kpis_sql(), params).iloc[0]
     out: dict = {
         "campaign_id": campaign_id,
@@ -231,9 +247,14 @@ def collect(run, campaign_id: str, start: dt.date, end: dt.date) -> dict:
     # real campaign that ran on other dates, so the reason is resolved here - once - and
     # every consumer gets the same explanation rather than inventing its own.
     if int(kpis["EVENTS"]) == 0:
-        found = run(campaign_lookup_sql(), params).iloc[0]
+        # The lookup counts events by their own date and takes the plain three binds. If it finds
+        # activity in the window ("open"), every session behind it started earlier - see
+        # STARTED_EARLIER_MSG - so that outcome is renamed rather than reported as no campaign.
+        found = run(campaign_lookup_sql(), [start, end, campaign_id]).iloc[0]
         out["status"] = STATUS_MISSING
         out["reason"] = classify_lookup(found)
+        if out["reason"] == "open":
+            out["reason"] = "started_earlier"
         out["lookup"] = found
         return out
 
@@ -244,8 +265,18 @@ def collect(run, campaign_id: str, start: dt.date, end: dt.date) -> dict:
         return out
 
     out["status"] = STATUS_OK
-    out["daily"] = run(campaign_daily_sql(), params)
+    # A session started on the range's last day brings its later events with it (see
+    # _CAMPAIGN_SCOPE), so the daily rows can run past `end`. The bars stay inside the range.
+    daily = run(campaign_daily_sql(), params)
+    out["daily"] = daily[[d is None or d <= end for d in (_day(v) for v in daily["EVENT_DATE"])]].reset_index(drop=True)
     out["partial_day"] = partial_day(out["daily"], dt.datetime.now(dt.timezone.utc).date())
+    # FIRST_SEEN / LAST_SEEN / ACTIVE_DAYS describe the range, so they come from those bars: counted
+    # over the KPI query's rows they took in that same tail, and read "active on 31 of 30 days".
+    days = [d for d in (_day(v) for v in out["daily"]["EVENT_DATE"]) if d is not None]
+    if days:
+        kpis = kpis.copy()
+        kpis["FIRST_SEEN"], kpis["LAST_SEEN"], kpis["ACTIVE_DAYS"] = min(days), max(days), len(set(days))
+        out["kpis"] = kpis
     out["duration"] = run(campaign_duration_bands_sql(), params)
     out["event_mix"] = run(campaign_event_mix_sql(), params)
     # No "actions" key any more: the action-reach breakdown was removed from the page, the PDF
@@ -1156,6 +1187,8 @@ def to_pdf(data: dict) -> bytes:
     if data["status"] == STATUS_MISSING:
         if data.get("reason") == "internal_only":
             msg = internal_only_message(data["lookup"], window)
+        elif data.get("reason") == "started_earlier":
+            msg = STARTED_EARLIER_MSG.format(window=window)
         elif data.get("reason") == "wrong_window":
             f = data["lookup"]
             msg = (f"This campaign recorded nothing between {window}. It ran "
@@ -1437,6 +1470,8 @@ def to_html(data: dict, link: str = "") -> str:
     if data["status"] == STATUS_MISSING:
         if data.get("reason") == "internal_only":
             msg = _esc(internal_only_message(data["lookup"], f"{data['start']} and {data['end']}"))
+        elif data.get("reason") == "started_earlier":
+            msg = _esc(STARTED_EARLIER_MSG.format(window=_fmt_range(data["start"], data["end"])))
         elif data.get("reason") == "wrong_window":
             f = data["lookup"]
             msg = (f"Campaign <code>{cid}</code> has no activity between {window}. "
