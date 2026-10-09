@@ -1,20 +1,13 @@
 -- =====================================================================================
--- CAMPAIGN_ANALYTICS_REPORT_DAILY - v18, generated from the project source on 2026-10-07.
+-- CAMPAIGN_ANALYTICS_REPORT_DAILY - v20, built from the project source on 2026-10-09
+-- by scripts/build_procedure.py.
 --
--- The daily Campaign Overview email. Replaces v17 in place: same name, same arguments, same
--- packages, integration and secret, so the daily task calls it unchanged.
+-- The daily Campaign Overview email: one email with a short summary (sessions per day, per week and
+-- per month for each campaign) and one PDF per campaign attached. The campaigns and recipients are
+-- set in scripts/procedure_overview.py. Same name, arguments, packages, integration and secret as
+-- before, so CREATE OR REPLACE replaces it in place and the daily task calls it unchanged.
 --
--- What it sends: one email with a short summary (sessions per day, per week and per month for each
--- campaign) and one PDF per campaign attached:
---     demand_ai_internal_website_track
---     demand_ai_internal_website_demo_request
---     demand_ai_internal_website_research
--- Each PDF: Day and Week on a tinted page each, then the Month in the report's original layout,
--- Pages viewed above Session duration. No Accounts reached. Periods end yesterday (UTC). Each session
--- is counted once, on the day it started. Internal traffic excluded, as in v17.
---
--- Arguments (unchanged from v17):
---     CALL CIT_DATA_CORE.TRACKING.CAMPAIGN_ANALYTICS_REPORT_DAILY('TEST');  -- test: your inbox only, [TEST] subject
+--     CALL CIT_DATA_CORE.TRACKING.CAMPAIGN_ANALYTICS_REPORT_DAILY('TEST');  -- test: test recipient only, [TEST] subject
 --     anything else, including the task's call                               -- all recipients
 --   WINDOW_DAYS and EXCLUDE_INTERNAL are accepted and ignored.
 --
@@ -34,12 +27,13 @@ AS $$
 from __future__ import annotations
 
 # ============================================================================
-# CAMPAIGN_ANALYTICS_REPORT_DAILY v18 - the daily Campaign Overview email.
-# Generated from the project source; sections 1-4 are the project's own files,
+# CAMPAIGN_ANALYTICS_REPORT_DAILY - the daily Campaign Overview email.
+# Built by scripts/build_procedure.py; sections 1-4 are the project's own files,
 # embedded unchanged apart from their import lines.
 # ============================================================================
 import datetime as dt
 import html
+import json
 import math
 import re
 import zlib
@@ -55,8 +49,8 @@ import _snowflake
 
 class _StreamlitShim:
     """Stands in for the three things src/db.py takes from Streamlit, which a stored procedure does not
-    have. Internal traffic is always excluded (as in v17); results are never cached; and there is no
-    Streamlit connection - run_report() passes Snowpark's session to every query instead."""
+    have. Internal traffic is always excluded; results are never cached; and there is no Streamlit
+    connection - run_report() passes Snowpark's session to every query instead."""
     session_state = {"exclude_internal": True}
 
     @staticmethod
@@ -1777,10 +1771,53 @@ def tenant_movement_sql(limit: int = 12) -> str:
 # claimed ml_request events carry no campaign ID; that was wrong - 1,265,377 of 1,265,649
 # of them do. AI is simply concentrated in 138 of 1,023 campaigns, none of which are the
 # largest by sessions.
+#
+# A campaign's date range holds the sessions that STARTED in it, each with every event it had -
+# including events after the range's last midnight. It used to hold every event dated inside the
+# range, and a session crossing midnight then belonged to two ranges at once: on
+# demand_ai_internal_website_track a one-day range read 231 sessions while the same day's bar in a
+# week-long chart read 229, and the week read 1,271 against 1,268 summed from the month's bars.
+# Counted by start day, day, week and month add up exactly (222 / 1,304 / 5,085 for 6 Oct 2026, and
+# the month's bars sum to its card). Measured on 6 Oct 2026, every figure moved by 0.5% or less.
+# It is also more accurate at the edges: a session's duration runs from its real start rather than
+# from midnight, and "How they arrived" reads its real first event rather than a mid-visit click.
+#
+# A session's start is looked for STARTED_DAY_LOOKBACK_DAYS either side of the range. Of 18,778
+# sessions on that campaign since 1 May, 18,494 ended the day they began and all but two within 11
+# days; the two that did not are session IDs left open for 110 and 126 days, and with the 14-day
+# window they count as starting inside a range they are active in - exactly as before this change.
+#
+# Rows with no SESSION_ID keep their own date: there is no session to attribute them to.
+#
+# Ten binds rather than three - see campaign_params(), which every caller uses rather than
+# building the list itself. The emailed Campaign Overview applies the same rule.
+STARTED_DAY_LOOKBACK_DAYS = 14
+
 _CAMPAIGN_SCOPE = """
-        WHERE EVENT_TS::DATE BETWEEN ? AND ?
+        WHERE EVENT_TS::DATE BETWEEN DATEADD(day, -{lookback}, ?::DATE) AND DATEADD(day, {lookback}, ?::DATE)
           AND CAMPAIGN_ID = ?
-          AND {not_test}"""
+          AND {not_test}
+          AND (SESSION_ID IN (
+                  SELECT SESSION_ID FROM {table}
+                  WHERE CAMPAIGN_ID = ?
+                    AND {not_test}
+                    AND SESSION_ID IS NOT NULL
+                    AND EVENT_TS::DATE BETWEEN DATEADD(day, -{lookback}, ?::DATE) AND DATEADD(day, {lookback}, ?::DATE)
+                  GROUP BY SESSION_ID
+                  HAVING MIN(EVENT_TS)::DATE BETWEEN ?::DATE AND ?::DATE)
+               OR (SESSION_ID IS NULL AND EVENT_TS::DATE BETWEEN ?::DATE AND ?::DATE))"""
+
+
+def _campaign_scope() -> str:
+    """The WHERE clause every campaign builder reads its rows through. The session subquery reads
+    the same table as the FROM it follows - _campaign_table() - so the internal-traffic filter
+    decides a session's start and its rows alike."""
+    return _CAMPAIGN_SCOPE.format(not_test=_NOT_TEST, table=_campaign_table(), lookback=STARTED_DAY_LOOKBACK_DAYS)
+
+
+def campaign_params(start, end, campaign_id) -> list:
+    """The binds every builder that uses _CAMPAIGN_SCOPE takes, in the order the scope reads them."""
+    return [start, end, campaign_id, campaign_id, start, end, start, end, start, end]
 
 
 def _campaign_events_cte() -> str:
@@ -1807,7 +1844,7 @@ def _campaign_events_cte() -> str:
             {_ACTION_LABEL} AS ACTION_LABEL,
             IFF({_ENGAGED_EVENT}, 1, 0) AS IS_ACTION
         FROM {_campaign_table()}
-        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+        {_campaign_scope()}
     """
 
 
@@ -2006,7 +2043,7 @@ def campaign_daily_sql() -> str:
                 -- The day the session STARTED, carried onto all of its rows.
                 MIN(EVENT_TS::DATE) OVER (PARTITION BY SESSION_ID) AS SESSION_START
             FROM {_campaign_table()}
-            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+            {_campaign_scope()}
         )
         SELECT
             EVENT_DATE,
@@ -2041,7 +2078,7 @@ def campaign_duration_bands_sql() -> str:
     """
     # Built first rather than nested inside the f-string below: the Streamlit-in-Snowflake runtime is
     # Python 3.11, which predates the nested-quote f-strings that 3.12 allows.
-    spans = _session_spans_ctes(f"{_campaign_table()} {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)} AND SESSION_ID IS NOT NULL")
+    spans = _session_spans_ctes(f"{_campaign_table()} {_campaign_scope()} AND SESSION_ID IS NOT NULL")
     return f"""
         WITH {spans}
         SELECT
@@ -2207,7 +2244,7 @@ def campaign_event_mix_sql() -> str:
             {_EVENT_BUCKET} AS BUCKET,
             COUNT(DISTINCT {_INTERACTION_KEY}) AS INTERACTIONS
         FROM {_campaign_table()}
-        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+        {_campaign_scope()}
         GROUP BY 1
     """
 
@@ -2227,7 +2264,7 @@ def campaign_funnel_sql() -> str:
                 MAX(IFF({_ENGAGED_EVENT}, 1, 0)) AS DID_ACT,
                 MAX(IFF({_LEAD_SUBMIT}, 1, 0)) AS DID_CONVERT
             FROM {_campaign_table()}
-            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+            {_campaign_scope()}
               AND SESSION_ID IS NOT NULL
             GROUP BY SESSION_ID
         )
@@ -2286,7 +2323,7 @@ def campaign_geo_sql(timezone_limit: int = 10) -> str:
         WITH base AS (
             SELECT SESSION_ID, TIMEZONE
             FROM {_campaign_table()}
-            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+            {_campaign_scope()}
               AND SESSION_ID IS NOT NULL
         ), region AS (
             SELECT 'region' AS KIND, {_REGION} AS LABEL, COUNT(DISTINCT SESSION_ID) AS SESSIONS
@@ -2365,7 +2402,7 @@ def campaign_pages_sql(limit: int = 12) -> str:
             SELECT SESSION_ID, MESSAGE_ID, EVENT_NAME, EVENT_TYPE, SEARCH_URL,
                    {_PAGE_SCHEME} AS SCHEME
             FROM {_campaign_table()}
-            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+            {_campaign_scope()}
               AND SESSION_ID IS NOT NULL
         ), all_sessions AS (
             SELECT COUNT(DISTINCT SESSION_ID) AS N FROM base
@@ -2417,7 +2454,7 @@ def campaign_assets_sql(limit: int = 12) -> str:
             ROUND(COUNT(DISTINCT {_INTERACTION_KEY}) * 1.0
                   / NULLIF(COUNT(DISTINCT SESSION_ID), 0), 1) AS INTERACTIONS_PER_SESSION
         FROM {_campaign_table()}
-        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+        {_campaign_scope()}
           AND {_ASSET} IS NOT NULL
           AND SESSION_ID IS NOT NULL
         GROUP BY {_ASSET}
@@ -2452,7 +2489,7 @@ def campaign_read_depth_sql(limit: int = 10) -> str:
                 SESSION_ID,
                 MAX(TRY_TO_NUMBER(PROPERTIES:page_visited::STRING)) AS DEEPEST
             FROM {_campaign_table()}
-            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+            {_campaign_scope()}
               AND PROPERTIES:page_visited IS NOT NULL
               AND {_ASSET} IS NOT NULL
               AND SESSION_ID IS NOT NULL
@@ -2485,7 +2522,7 @@ def campaign_companies_sql(limit: int = 12) -> str:
             COUNT(DISTINCT {_EMAIL}) AS PEOPLE,
             COUNT(DISTINCT SESSION_ID) AS SESSIONS
         FROM {_campaign_table()}
-        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+        {_campaign_scope()}
           AND {_VALID_EMAIL}
           AND {_DOMAIN} NOT IN {_FREE_MAIL}
           AND SESSION_ID IS NOT NULL
@@ -2580,7 +2617,7 @@ def campaign_sources_sql(referrer_limit: int = 8) -> str:
         WITH arrivals AS (
             SELECT REFERER_URL, SEARCH_URL
             FROM {_campaign_table()}
-            {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+            {_campaign_scope()}
               AND SESSION_ID IS NOT NULL
             QUALIFY ROW_NUMBER() OVER (PARTITION BY SESSION_ID ORDER BY EVENT_TS, MESSAGE_ID) = 1
         ), grp AS (
@@ -2624,7 +2661,7 @@ def campaign_ai_sql() -> str:
             COUNT(DISTINCT SESSION_ID) AS SESSIONS,
             COUNT(DISTINCT {_INTERACTION_KEY}) AS INTERACTIONS
         FROM {_campaign_table()}
-        {_CAMPAIGN_SCOPE.format(not_test=_NOT_TEST)}
+        {_campaign_scope()}
           AND {_AI_REQUEST}
           AND SESSION_ID IS NOT NULL
         GROUP BY 1
@@ -3261,6 +3298,21 @@ def internal_only_message(found, window: str) -> str:
     return _INTERNAL_IN_WINDOW_MSG.format(n=n, window=window) if n else _INTERNAL_EVER_MSG.format(window=window)
 
 
+# collect()'s "started_earlier" outcome: the range has activity, but all of it belongs to sessions
+# that began before the range - and a session counts on the day it started (see _CAMPAIGN_SCOPE in
+# queries.py). Rare, and only on short ranges: a quiet campaign's single day whose only visitor had
+# arrived the evening before. Without its own reason it read "No campaign exists", which is false.
+STARTED_EARLIER_MSG = ("This campaign had activity between {window}, but only from sessions that started before "
+                       "that date. Each session is counted once, on the day it started, so none falls in this range.")
+
+
+def _day(value):
+    """A date from a DATE cell. Snowflake returns date objects, Timestamps or strings depending on
+    the path; a Timestamp is a datetime, and comparing one with a date raises."""
+    d = _as_date(value)
+    return d.date() if isinstance(d, dt.datetime) else d
+
+
 def collect(run, campaign_id: str, start: dt.date, end: dt.date) -> dict:
     """Every section of one campaign's report, gated, from a single entry point.
 
@@ -3269,7 +3321,7 @@ def collect(run, campaign_id: str, start: dt.date, end: dt.date) -> dict:
     matters. Ordering of the queries is the same order the page renders them, so a reader
     following a slow load sees them appear top to bottom.
     """
-    params = [start, end, campaign_id]
+    params = campaign_params(start, end, campaign_id)
     kpis = run(campaign_detail_kpis_sql(), params).iloc[0]
     out: dict = {
         "campaign_id": campaign_id,
@@ -3284,9 +3336,14 @@ def collect(run, campaign_id: str, start: dt.date, end: dt.date) -> dict:
     # real campaign that ran on other dates, so the reason is resolved here - once - and
     # every consumer gets the same explanation rather than inventing its own.
     if int(kpis["EVENTS"]) == 0:
-        found = run(campaign_lookup_sql(), params).iloc[0]
+        # The lookup counts events by their own date and takes the plain three binds. If it finds
+        # activity in the window ("open"), every session behind it started earlier - see
+        # STARTED_EARLIER_MSG - so that outcome is renamed rather than reported as no campaign.
+        found = run(campaign_lookup_sql(), [start, end, campaign_id]).iloc[0]
         out["status"] = STATUS_MISSING
         out["reason"] = classify_lookup(found)
+        if out["reason"] == "open":
+            out["reason"] = "started_earlier"
         out["lookup"] = found
         return out
 
@@ -3297,8 +3354,18 @@ def collect(run, campaign_id: str, start: dt.date, end: dt.date) -> dict:
         return out
 
     out["status"] = STATUS_OK
-    out["daily"] = run(campaign_daily_sql(), params)
+    # A session started on the range's last day brings its later events with it (see
+    # _CAMPAIGN_SCOPE), so the daily rows can run past `end`. The bars stay inside the range.
+    daily = run(campaign_daily_sql(), params)
+    out["daily"] = daily[[d is None or d <= end for d in (_day(v) for v in daily["EVENT_DATE"])]].reset_index(drop=True)
     out["partial_day"] = partial_day(out["daily"], dt.datetime.now(dt.timezone.utc).date())
+    # FIRST_SEEN / LAST_SEEN / ACTIVE_DAYS describe the range, so they come from those bars: counted
+    # over the KPI query's rows they took in that same tail, and read "active on 31 of 30 days".
+    days = [d for d in (_day(v) for v in out["daily"]["EVENT_DATE"]) if d is not None]
+    if days:
+        kpis = kpis.copy()
+        kpis["FIRST_SEEN"], kpis["LAST_SEEN"], kpis["ACTIVE_DAYS"] = min(days), max(days), len(set(days))
+        out["kpis"] = kpis
     out["duration"] = run(campaign_duration_bands_sql(), params)
     out["event_mix"] = run(campaign_event_mix_sql(), params)
     # No "actions" key any more: the action-reach breakdown was removed from the page, the PDF
@@ -4208,6 +4275,8 @@ def to_pdf(data: dict) -> bytes:
     if data["status"] == STATUS_MISSING:
         if data.get("reason") == "internal_only":
             msg = internal_only_message(data["lookup"], window)
+        elif data.get("reason") == "started_earlier":
+            msg = STARTED_EARLIER_MSG.format(window=window)
         elif data.get("reason") == "wrong_window":
             f = data["lookup"]
             msg = (f"This campaign recorded nothing between {window}. It ran "
@@ -4489,6 +4558,8 @@ def to_html(data: dict, link: str = "") -> str:
     if data["status"] == STATUS_MISSING:
         if data.get("reason") == "internal_only":
             msg = _esc(internal_only_message(data["lookup"], f"{data['start']} and {data['end']}"))
+        elif data.get("reason") == "started_earlier":
+            msg = _esc(STARTED_EARLIER_MSG.format(window=_fmt_range(data["start"], data["end"])))
         elif data.get("reason") == "wrong_window":
             f = data["lookup"]
             msg = (f"Campaign <code>{cid}</code> has no activity between {window}. "
@@ -4586,8 +4657,13 @@ def _document(title, body, window, link) -> str:
 
 
 
+# NOT A MODULE. scripts/build_procedure.py appends this file to the stored procedure's body, after
+# src/db.py, src/queries.py, src/minipdf.py and src/campaign_report.py - so it reads their names
+# (collect, _pdf_table, Canvas, ...) directly, and rebinds a few of them on purpose (_pdf_table,
+# _pdf_series_chart, _PAGE_W, _PDF_BAND, IDENTITY_FLOOR). Import it on its own and it fails.
+#
 # ============================================================================
-# 5. Campaign Overview (v18) - Day / Week / Month in one PDF per campaign, and
+# 5. Campaign Overview - Day / Week / Month in one PDF per campaign, and
 #    the email that carries them. Everything above this section is the project
 #    source, embedded unchanged; this section only arranges what it produces.
 #
@@ -4600,7 +4676,8 @@ def _document(title, body, window, link) -> str:
 #      * Month: the report's original layout, every section full width, each with
 #        its note, Pages viewed moved above Session duration;
 #      * no Accounts reached anywhere - the company query is never run;
-#      * each session counted once, on the day it started, with all its events.
+#      * each session counted once, on the day it started, with all its events -
+#        collect() applies that (src/queries.py, _CAMPAIGN_SCOPE), so nothing here does.
 # ============================================================================
 
 OVERVIEW_TITLE = "Campaign Overview"
@@ -4610,62 +4687,20 @@ OVERVIEW_CAMPAIGNS = [
     "demand_ai_internal_website_demo_request",
     "demand_ai_internal_website_research",
 ]
-OVERVIEW_LOOKBACK_DAYS = 14   # how far back a session's true start is looked for; covered every
-                              # session since May except two IDs left open for months
 
 # Accounts reached is not part of the overview. Raising the floor means collect() never fetches it,
 # so no company figure can reach the PDF or the email however either is written.
 IDENTITY_FLOOR = 10 ** 9
 
 
-# ---------------------------------------------------------------- the started-day rule
-# A period holds the sessions whose FIRST event falls inside it, with every event they had - including
-# ones after the period's last midnight. Applied by swapping the campaign table for a subquery that keeps
-# only those sessions, and widening the date binds so whole sessions pass the builders' own date filter.
-_OVERVIEW_BASE_TABLE = _campaign_table
-
-
-def _overview_started_table():
-    base = _OVERVIEW_BASE_TABLE()
-    return (f"(SELECT t.* FROM {base} t "
-            f"WHERE t.SESSION_ID IN (SELECT SESSION_ID FROM {base} "
-            f"WHERE CAMPAIGN_ID = '__CID__' AND {_NOT_TEST} AND SESSION_ID IS NOT NULL "
-            f"AND EVENT_TS::DATE BETWEEN '__LO__' AND '__HI__' "
-            f"GROUP BY SESSION_ID HAVING MIN(EVENT_TS)::DATE BETWEEN '__START__' AND '__END__') "
-            f"OR (t.SESSION_ID IS NULL AND t.EVENT_TS::DATE BETWEEN '__START__' AND '__END__'))")
-
-
-def _overview_collect_period(run, campaign_id, start, end):
-    def run_started(sql, params):
-        p_start, p_end, cid = params[0], params[1], params[2]
-        lo = p_start - dt.timedelta(days=OVERVIEW_LOOKBACK_DAYS)
-        hi = p_end + dt.timedelta(days=OVERVIEW_LOOKBACK_DAYS)
-        for token, value in (("__CID__", str(cid).replace("'", "''")), ("__LO__", lo.isoformat()), ("__HI__", hi.isoformat()),
-                             ("__START__", p_start.isoformat()), ("__END__", p_end.isoformat())):
-            sql = sql.replace(token, value)
-        return run(sql, [lo, hi] + list(params[2:]))
-
-    global _campaign_table
-    _campaign_table = _overview_started_table
-    try:
-        data = collect(run_started, campaign_id, start, end)
-    finally:
-        _campaign_table = _OVERVIEW_BASE_TABLE
-    # Whole sessions bring rows dated after `end` (the overnight tail); the bars stay inside the period.
-    if data.get("daily") is not None:
-        d = data["daily"]
-        data["daily"] = d[pd.to_datetime(d["EVENT_DATE"]).dt.date <= end].reset_index(drop=True)
-        data["partial_day"] = partial_day(data["daily"], dt.datetime.now(dt.timezone.utc).date())
-    return data
-
-
+# ---------------------------------------------------------------- the three periods
 def _overview_collect(run, campaign_id, end):
     """[(tag, heading, data)] for Day, Week and Month ending on `end`."""
     week_start, month_start = end - dt.timedelta(days=6), end - dt.timedelta(days=29)
     periods = [("DAY", f"{end.strftime('%A')} {_fmt_date(end, year=True)}", end, end),
                ("WEEK", _fmt_range(week_start, end), week_start, end),
                ("MONTH", _fmt_range(month_start, end), month_start, end)]
-    return [(tag, heading, _overview_collect_period(run, campaign_id, start, stop)) for tag, heading, start, stop in periods]
+    return [(tag, heading, collect(run, campaign_id, start, stop)) for tag, heading, start, stop in periods]
 
 
 # ---------------------------------------------------------------- shared drawing helpers
@@ -4950,19 +4985,12 @@ def _ov_month_body(pdf, data):
 # ---------------------------------------------------------------- one campaign's PDF
 def _overview_pdf(collected, campaign_id, end) -> bytes:
     _OV_SECTIONS.clear()
-    month = dict(collected[-1][2])
+    month = collected[-1][2]
     label = month["label"]
     pdf = Canvas(footer=_ov_footer, title=_safe(f"Demand AI - {OVERVIEW_TITLE} - {label} - to {end}"))
     pdf.set_auto_page_break(auto=True, margin=18)
     pdf.set_margins(15, 14, 15)
     pdf.add_page()
-    # The title block describes the reporting range. The started-day rule brings in the overnight tail
-    # of sessions begun on the last day, so first / last / active days come from the month's own bars.
-    if month.get("daily") is not None and len(month["daily"]):
-        days = sorted(pd.to_datetime(month["daily"]["EVENT_DATE"]).dt.date)
-        kp = month["kpis"].copy()
-        kp["FIRST_SEEN"], kp["LAST_SEEN"], kp["ACTIVE_DAYS"] = days[0], days[-1], len(days)
-        month["kpis"] = kp
     _pdf_title_block(pdf, month)
     pdf.ln(2)
     for tag, title, data in collected:
@@ -4991,8 +5019,9 @@ def _ov_mail_range(a, b):
     return f"{a.day} {a.strftime('%b')} - {b.day} {b.strftime('%b %Y')}"
 
 
-def _overview_email_html(reports, end) -> str:
+def _overview_email_html(reports, end, note=None) -> str:
     """A short summary - sessions per day, week and month for each campaign - with the PDFs attached.
+    `note`, when given, is one more line under the table (the form report's, from _form_report_note).
     Tables and inline styles throughout: Outlook ignores most CSS and some clients drop <style>."""
     T, INK, MUTED, RULE, TINT = _OV_MAIL_TEAL, _OV_MAIL_INK, _OV_MAIL_MUTED, _OV_MAIL_RULE, _OV_MAIL_TINT
     rows = []
@@ -5014,6 +5043,7 @@ def _overview_email_html(reports, end) -> str:
                    f"letter-spacing:.04em;color:{MUTED};font-weight:600;text-align:right;line-height:1.35'>{label}<br>"
                    f"<span style='font-weight:400;letter-spacing:0'>{dates}</span></th>"
                    for t, label, dates in heads)
+    extra = f"<p style='margin:10px 0 0;color:{MUTED};font-size:13px'>{note}</p>" if note else ""
     font = '-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif'  # double quotes: it sits in style='...'
     return (f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
             f"<meta name='viewport' content='width=device-width,initial-scale=1'><title>{OVERVIEW_TITLE}</title></head>"
@@ -5030,9 +5060,252 @@ def _overview_email_html(reports, end) -> str:
             f"text-align:left;background:#f2f7f7'>CAMPAIGN</th>{head}</tr></thead>"
             f"<tbody>{''.join(rows)}</tbody></table>"
             f"<p style='margin:16px 0 0;color:{MUTED};font-size:13px'>Each session is counted once, on the day it started.</p>"
+            f"{extra}"
             f"<p style='margin:28px 0 0;padding-top:12px;border-top:1px solid {RULE};font-size:13px;color:{MUTED}'>"
             f"<b style='color:{T}'>Demand AI</b> &middot; {OVERVIEW_TITLE}</p>"
             f"</div></body></html>")
+
+
+# ============================================================================
+# 5b. Form submissions - every submission the Day's "Form submit" figure counts, with each form's
+#     fields, as a landscape table per form campaign. Added 2026-10-09 from the agreed test report.
+#
+#     The rows are selected through the email's own scope (_campaign_table + _campaign_scope +
+#     campaign_params, _EVENT_BUCKET = 'Form submit', one per MESSAGE_ID), so their count IS the Form
+#     submit figure in that campaign's Day section. It is still checked: on a mismatch the PDF is left
+#     out and the email says so, rather than sending a number nobody can reconcile.
+# ============================================================================
+
+# The report carries personal data (names, emails, phone numbers, messages). While this is False it is
+# attached only to CALL ...('TEST') emails. Switched on 2026-10-09 after the TEST email was confirmed:
+# the daily email now carries it to ALL_RECIPIENTS every day, "No records registered" days included.
+FORM_REPORT_IN_DAILY_EMAIL = True
+
+# (label, form_data key or special, width in mm; None takes the rest). Sized from measured text on a
+# landscape A4: the longest report title is 58.4 mm at 7.5pt, email addresses measured up to 35 mm.
+FORM_REPORT_CAMPAIGNS = [
+    ("DEMO REQUEST", "demand_ai_internal_website_demo_request", [
+        ("#", "#", 7), ("Date & time (UTC)", "time", 25), ("First name", "firstName", 22),
+        ("Last name", "lastName", 22), ("Email", "email", 46), ("Phone", "phone", 28), ("Company", "company", 30),
+        ("Message", "message", None)]),
+    ("RESEARCH", "demand_ai_internal_website_research", [
+        ("#", "#", 7), ("Date & time (UTC)", "time", 25), ("First name", "firstName", 18),
+        ("Last name", "lastName", 18), ("Email", "email", 40), ("Company", "company", 24), ("Job title", "jobTitle", 24),
+        ("Country", "country", 16), ("Report", "report", None), ("Edition", "edition", 18), ("Opt-in", "researchOptIn", 11)]),
+]
+_FR_SPAM_FILL, _FR_SPAM_INK = (253, 236, 234), (160, 40, 30)
+_FR_LINE, _FR_PAD = 3.5, 1.6
+_FR_LANDSCAPE = (841.89, 595.28)
+
+
+def _form_rows_sql() -> str:
+    return (f"SELECT MESSAGE_ID, MIN(EVENT_TS) AS EVENT_TS, ANY_VALUE(PROPERTIES:form_data) AS FORM_DATA "
+            f"FROM {_campaign_table()} {_campaign_scope()} AND ({_EVENT_BUCKET}) = 'Form submit' "
+            f"GROUP BY MESSAGE_ID ORDER BY EVENT_TS DESC")
+
+
+def _form_rows(run, campaign_id, day) -> list:
+    rows = run(_form_rows_sql(), campaign_params(day, day, campaign_id)).to_dict("records")
+    for r in rows:
+        fd = r.get("FORM_DATA")
+        r["FORM_DATA"] = json.loads(fd) if isinstance(fd, str) else (fd if isinstance(fd, dict) else {})
+    return rows
+
+
+def _form_internal_count(run, campaign_id, day, kept) -> int:
+    """Form submissions the internal-traffic filter removed for this day - a count only."""
+    st.session_state["exclude_internal"] = False
+    try:
+        everything = len(run(_form_rows_sql(), campaign_params(day, day, campaign_id)))
+    finally:
+        st.session_state["exclude_internal"] = True
+    return everything - kept
+
+
+def _form_email_count(run, campaign_id, day, day_data=None) -> int:
+    """The email's own Form submit figure for the Day: the overview's event mix when it was collected,
+    else the same query collect() runs."""
+    if day_data is not None:
+        mix = day_data.get("event_mix") if day_data.get("status") == STATUS_OK else None
+    else:
+        mix = run(campaign_event_mix_sql(), campaign_params(day, day, campaign_id))
+    if mix is None or not len(mix):
+        return 0
+    return {str(r.BUCKET): int(r.INTERACTIONS or 0) for r in mix.itertuples()}.get("Form submit", 0)
+
+
+def _form_is_spam(rec) -> bool:
+    return str(rec["FORM_DATA"].get("_dai_hp") or "").strip() != ""
+
+
+def _form_cell(rec, key, n) -> str:
+    fd = rec["FORM_DATA"]
+    if key == "#":
+        return str(n)
+    if key == "time":
+        # Date and time, always - "22 Sep 23:04". A session counts on the day it started, so a submission
+        # just past midnight can sit under the previous day; the date makes that plain.
+        ts = rec["EVENT_TS"]
+        if not hasattr(ts, "astimezone"):
+            return str(ts)
+        # EVENT_TS is UTC. A naive value must not go through astimezone(), which would read it as local time.
+        utc = ts.replace(tzinfo=dt.timezone.utc) if ts.tzinfo is None else ts.astimezone(dt.timezone.utc)
+        return f"{utc.day} {utc.strftime('%b %H:%M')}"
+    if key == "phone":
+        return " ".join(p for p in (str(fd.get("phoneCountryCode") or "").strip(), str(fd.get("phone") or "").strip()) if p)
+    v = fd.get(key)
+    return "" if v is None else str(v)
+
+
+def _form_pdf(day, sections) -> bytes:
+    """sections: [(label, campaign_id, cols, rows, email_figure, internal_excluded)]."""
+    day_txt = f"{day.strftime('%A')} {_fmt_date(day, year=True)}"
+    pdf = Canvas(footer=None, title=_safe(f"Demand AI - Form submissions - {day}"), page_pt=_FR_LANDSCAPE)
+    pdf.set_auto_page_break(auto=True, margin=14)
+    pdf.set_margins(15, 12, 15)
+    width = pdf.w - 30
+
+    def footer(p):
+        p.set_y(-9)
+        p.set_draw_color(*_PDF_RULE)
+        p.line(p.l_margin, p.get_y() - 1.2, p.l_margin + width, p.get_y() - 1.2)
+        p.set_font("Helvetica", "B", 6.5)
+        p.set_text_color(*_PDF_TEAL)
+        p.cell(13, 4, "Demand AI")
+        p.set_font("Helvetica", "", 6.5)
+        p.set_text_color(*_PDF_MUTED)
+        p.cell(width * 0.8 - 13, 4, _safe(f"-   Form submissions on {day_txt} (UTC)   -   Contains personal data: internal use only"))
+        p.cell(width * 0.2, 4, f"Page {p.page_no()} of {p.total_pages}", align="R")
+
+    pdf._footer = footer
+    pdf.add_page()
+
+    def header_row(cols, ws, continued_label=None):
+        if continued_label:
+            pdf.set_font("Helvetica", "", 7)
+            pdf.set_text_color(*_PDF_MUTED)
+            pdf.cell(width, 4, _safe(f"{continued_label} (continued)"), new_x="LMARGIN", new_y="NEXT")
+        y = pdf.get_y()
+        pdf.set_fill_color(*_PDF_TEAL)
+        pdf.rect(pdf.l_margin, y, width, 6, style="F")
+        x = pdf.l_margin
+        pdf.set_font("Helvetica", "B", 7)
+        pdf.set_text_color(255, 255, 255)
+        for (name, _, _), w in zip(cols, ws):
+            pdf.set_xy(x + _FR_PAD, y + 1)
+            pdf.cell(w - 2 * _FR_PAD, 4, name)
+            x += w
+        pdf.set_xy(pdf.l_margin, y + 6)
+
+    def table(label, cols, rows):
+        fixed = sum(w for _, _, w in cols if w)
+        ws = [w if w else width - fixed for _, _, w in cols]
+        header_row(cols, ws)
+        for n, rec in enumerate(rows, start=1):
+            pdf.set_font("Helvetica", "", 7.5)
+            cells = [pdf._wrap(_safe(_form_cell(rec, key, n)) or "-", w - 2 * _FR_PAD) for (_, key, _), w in zip(cols, ws)]
+            row_h = max(len(c) for c in cells) * _FR_LINE + 2 * _FR_PAD
+            if pdf.get_y() + row_h > pdf.h - pdf.b_margin:
+                pdf.add_page()
+                header_row(cols, ws, continued_label=label)
+            pdf.set_font("Helvetica", "", 7.5)
+            y = pdf.get_y()
+            # Every row is counted in the email. Spam-trap hits are marked in red - still counted, but
+            # worth knowing before anyone follows one up.
+            spam = _form_is_spam(rec)
+            fill = _FR_SPAM_FILL if spam else ((250, 252, 252) if n % 2 == 0 else None)
+            if fill:
+                pdf.set_fill_color(*fill)
+                pdf.rect(pdf.l_margin, y, width, row_h, style="F")
+            pdf.set_text_color(*(_FR_SPAM_INK if spam else _PDF_INK))
+            x = pdf.l_margin
+            for lines, w in zip(cells, ws):
+                for i, line in enumerate(lines):
+                    pdf.set_xy(x + _FR_PAD, y + _FR_PAD + i * _FR_LINE)
+                    pdf.cell(w - 2 * _FR_PAD, _FR_LINE, line)
+                x += w
+            pdf.set_draw_color(*_PDF_RULE)
+            pdf.line(pdf.l_margin, y + row_h, pdf.l_margin + width, y + row_h)
+            pdf.set_xy(pdf.l_margin, y + row_h)
+
+    y = pdf.get_y()
+    pdf.set_fill_color(*_PDF_TEAL)
+    pdf.rect(pdf.l_margin, y + 0.8, 1.6, 8.4, style="F")
+    pdf.set_xy(pdf.l_margin + 4.2, y)
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_text_color(*_PDF_INK)
+    pdf.cell(width - 4.2, 7.4, _safe(f"Form submissions - {day_txt}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.set_x(pdf.l_margin + 4.2)
+    pdf.set_font("Helvetica", "", 7.5)
+    pdf.set_text_color(*_PDF_MUTED)
+    pdf.cell(width - 4.2, 4, "Every form submission the Campaign Overview email counts: internal traffic excluded, each session on the day it started (UTC)   -   Newest first   -   Contains personal data: internal use only", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+
+    for label, cid, cols, rows, email, gone in sections:
+        if pdf.get_y() + 40 > pdf.h - pdf.b_margin:
+            pdf.add_page()
+        y = pdf.get_y()
+        pdf.set_fill_color(212, 230, 246)
+        pdf.rect(pdf.l_margin, y, width, 10, style="F")
+        pdf.set_fill_color(*_PDF_TEAL)
+        pdf.rect(pdf.l_margin, y, 38, 10, style="F")
+        pdf.set_xy(pdf.l_margin, y + 2.2)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(38, 6, label, align="C")
+        pdf.set_xy(pdf.l_margin + 43, y + 2.2)
+        pdf.set_text_color(*_PDF_INK)
+        pdf.cell(width - 48, 6, _safe(cid))
+        pdf.set_xy(pdf.l_margin, y + 12)
+        gone_txt = f"{gone} internal submission{'s' if gone != 1 else ''} also excluded, as in the campaign report" if gone else ""
+        if not rows:
+            pdf.set_font("Helvetica", "B", 9.5)
+            pdf.set_text_color(*_PDF_INK)
+            pdf.cell(width, 7, _safe(f"No records registered for {day_txt}."), new_x="LMARGIN", new_y="NEXT")
+            if gone_txt:
+                pdf.set_font("Helvetica", "", 8)
+                pdf.set_text_color(*_PDF_MUTED)
+                pdf.multi_cell(width, 4.2, _safe(gone_txt[0].upper() + gone_txt[1:] + "."), new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(6)
+            continue
+        parts = [f"{len(rows)} form submission{'s' if len(rows) != 1 else ''} - the same as the Form submit figure in the Campaign Overview email for this day ({email})"]
+        if gone_txt:
+            parts.append(gone_txt)
+        spam = sum(_form_is_spam(r) for r in rows)
+        if spam:
+            parts.append(f"{spam} caught by the spam trap, in red")
+        pdf.set_font("Helvetica", "", 8)
+        pdf.set_text_color(*_PDF_MUTED)
+        pdf.multi_cell(width, 4.2, _safe(" - ".join(parts) + "."), new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(1.5)
+        table(label, cols, rows)
+        pdf.ln(8)
+    return bytes(pdf.output())
+
+
+def _form_report(run, day, overview):
+    """(pdf bytes or None, {campaign_id: count}, problem or None). `overview` maps a campaign id to its
+    collected periods, so the Day's Form submit figure is read from what the email already fetched."""
+    sections, counts = [], {}
+    for label, cid, cols in FORM_REPORT_CAMPAIGNS:
+        rows = _form_rows(run, cid, day)
+        day_data = overview[cid][0][2] if cid in overview else None
+        email = _form_email_count(run, cid, day, day_data)
+        if len(rows) != email:
+            return None, {}, f"{cid} lists {len(rows)} submissions but its Form submit figure is {email}"
+        sections.append((label, cid, cols, rows, email, _form_internal_count(run, cid, day, len(rows))))
+        counts[cid] = len(rows)
+    return _form_pdf(day, sections), counts, None
+
+
+def _form_report_note(day, counts, problem) -> str:
+    """The email body's line about the form report: what is attached, or why it is not."""
+    if problem:
+        return f"The form submissions report was not attached: {html.escape(problem)}."
+    labels = {cid: label.title() for label, cid, _ in FORM_REPORT_CAMPAIGNS}
+    listed = ", ".join(f"{labels[cid]} {n}" for cid, n in counts.items())
+    return (f"Form submissions on {day.day} {day.strftime('%b')}: {listed}. Every one is listed in the attached "
+            f"form report, which contains personal data.")
 
 
 # ============================================================================
@@ -5053,6 +5326,8 @@ def run_report(session: Session, campaign_id: str, window_days: int, exclude_int
                     including the task's 'demand_ai_internal_website_track' - sends to ALL_RECIPIENTS.
       window_days   unused: the periods are always the last 1, 7 and 30 complete days.
       exclude_internal_flag  unused: internal traffic is always excluded, as in v17.
+    A 'TEST' call also attaches the form submissions report for the Day (section 5b); other calls do
+    only once FORM_REPORT_IN_DAILY_EMAIL is True.
     """
     test = str(campaign_id or "").strip().upper() == "TEST"
     recipients = TEST_RECIPIENTS if test else ALL_RECIPIENTS
@@ -5069,6 +5344,17 @@ def run_report(session: Session, campaign_id: str, window_days: int, exclude_int
         reports.append((cid, collected))
         attachments.append((_overview_filename(cid, end), _overview_pdf(collected, cid, end)))
 
+    # The form report holds personal data, so it goes only to TEST until FORM_REPORT_IN_DAILY_EMAIL is set.
+    note, forms = None, ""
+    if test or FORM_REPORT_IN_DAILY_EMAIL:
+        form_pdf, counts, problem = _form_report(run, end, dict(reports))
+        note = _form_report_note(end, counts, problem)
+        if form_pdf is not None:
+            attachments.append((f"form_submissions_{end}.pdf", form_pdf))
+            forms = " | form submissions: " + ", ".join(f"{cid}={n}" for cid, n in counts.items())
+        else:
+            forms = " | form report NOT attached: " + problem
+
     subject = f"{OVERVIEW_TITLE}: {len(OVERVIEW_CAMPAIGNS)} campaigns - to {end.day} {end.strftime('%b %Y')}"
     if test:
         subject = "[TEST] " + subject
@@ -5079,12 +5365,12 @@ def run_report(session: Session, campaign_id: str, window_days: int, exclude_int
     if not access_key or not secret_key:
         raise RuntimeError("AWS creds not found; ensure SECRETS=('aws_cred'=DEV_MDLH.TARGET.SES_SECRET_MDLH_DAILY_REPORT).")
 
-    # multipart/mixed: the HTML summary, then one application/pdf part per campaign.
+    # multipart/mixed: the HTML summary, then one application/pdf part per campaign (+ the form report).
     msg = MIMEMultipart("mixed")
     msg["Subject"] = subject
     msg["From"] = sender
     msg["To"] = ", ".join(recipients)
-    msg.attach(MIMEText(_overview_email_html(reports, end), "html", "utf-8"))
+    msg.attach(MIMEText(_overview_email_html(reports, end, note), "html", "utf-8"))
     for name, pdf_bytes in attachments:
         part = MIMEApplication(pdf_bytes, _subtype="pdf")
         part.add_header("Content-Disposition", "attachment", filename=name)
@@ -5100,6 +5386,6 @@ def run_report(session: Session, campaign_id: str, window_days: int, exclude_int
     sessions = "; ".join(f"{cid}=" + "/".join(f"{int(d['kpis']['SESSIONS'] or 0):,}" for _, _, d in collected)
                          for cid, collected in reports)
     return (f"SES email sent to: {', '.join(recipients)} | {OVERVIEW_TITLE} to {end} | "
-            f"sessions day/week/month: {sessions}")
+            f"sessions day/week/month: {sessions}{forms}")
 
 $$;

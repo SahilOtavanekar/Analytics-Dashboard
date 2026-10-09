@@ -73,6 +73,7 @@ PRELUDE = '''from __future__ import annotations
 # ============================================================================
 import datetime as dt
 import html
+import json
 import math
 import re
 import zlib
