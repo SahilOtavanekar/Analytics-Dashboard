@@ -440,8 +440,12 @@ _FR_LANDSCAPE = (841.89, 595.28)
 
 
 def _form_rows_sql() -> str:
+    # Only the submits that count (src/queries.py, _WEBSITE_FORM_INCOMPLETE): an email and a first or
+    # last name. The same rule takes them out of the Form submit figure, so the row count still
+    # equals it and the check in _form_report holds.
     return (f"SELECT MESSAGE_ID, MIN(EVENT_TS) AS EVENT_TS, ANY_VALUE(PROPERTIES:form_data) AS FORM_DATA "
             f"FROM {_campaign_table()} {_campaign_scope()} AND ({_EVENT_BUCKET}) = 'Form submit' "
+            f"AND NOT {_WEBSITE_FORM_INCOMPLETE} "
             f"GROUP BY MESSAGE_ID ORDER BY EVENT_TS DESC")
 
 
