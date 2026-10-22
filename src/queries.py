@@ -1596,7 +1596,10 @@ def _campaign_events_cte() -> str:
             -- Projected here so the action chart can group on meaning rather than on EVENT_NAME;
             -- the label needs PROPERTIES, which does not survive this CTE's column list.
             {_ACTION_LABEL} AS ACTION_LABEL,
-            IFF({_ENGAGED_EVENT}, 1, 0) AS IS_ACTION
+            IFF({_ENGAGED_EVENT}, 1, 0) AS IS_ACTION,
+            -- The interaction key, computed here because it reads CAMPAIGN_ID and form_data, which
+            -- this CTE does not otherwise carry - see _INTERACTION_KEY and _WEBSITE_FORM_INCOMPLETE.
+            {_INTERACTION_KEY} AS IK
         FROM {_campaign_table()}
         {_campaign_scope()}
     """
@@ -1625,7 +1628,7 @@ def campaign_detail_kpis_sql() -> str:
     Python rather than needing a COALESCE on every ratio here.
     """
     # Built first, not nested in the f-string: the Streamlit-in-Snowflake runtime is Python 3.11.
-    spans = _session_spans_ctes("ev WHERE SESSION_ID IS NOT NULL")
+    spans = _session_spans_ctes("ev WHERE SESSION_ID IS NOT NULL", key="IK")
     return f"""
         WITH ev AS ({_campaign_events_cte()}
         ), sess AS (
@@ -1653,7 +1656,7 @@ def campaign_detail_kpis_sql() -> str:
                 -- The donut's total and the Interactions / Session numerator - see _INTERACTION_KEY.
                 -- EVENTS above stays the raw count: it gates the report and feeds the captions
                 -- that are about raw events.
-                COUNT(DISTINCT {_INTERACTION_KEY}) AS INTERACTIONS,
+                COUNT(DISTINCT IK) AS INTERACTIONS,
                 MIN(EVENT_TS)::DATE AS FIRST_SEEN,
                 MAX(EVENT_TS)::DATE AS LAST_SEEN,
                 COUNT(DISTINCT EVENT_TS::DATE) AS ACTIVE_DAYS,
@@ -1680,7 +1683,7 @@ def campaign_detail_kpis_sql() -> str:
                 -- traffic is excluded. With it included they differ by the page visits on localhost
                 -- and hostless pages (285 on that campaign): the donut counts them then, and the Pages
                 -- section never does - _REAL_PAGE applies whatever the toggle says.
-                COUNT(DISTINCT IFF({_PAGE_VIEW} AND {_REAL_PAGE}, {_INTERACTION_KEY}, NULL)) AS PAGE_VISITS,
+                COUNT(DISTINCT IFF({_PAGE_VIEW} AND {_REAL_PAGE}, IK, NULL)) AS PAGE_VISITS,
                 COUNT(DISTINCT TIMEZONE) AS TIMEZONES
             FROM ev
         ), sess_agg AS (
@@ -1899,6 +1902,35 @@ _EVENT_BUCKET = f"""
         END"""
 
 
+# Which form submits count on the Demand AI website campaigns (decided 2026-10-22): one with a
+# non-blank email and a non-blank first or last name. This predicate is TRUE for the ones that do
+# NOT count - a blank form, a research gate sent with only a first name - and it is only meaningful
+# on a Form submit row, so it is always paired with that bucket. Such a submit drops out of the Form
+# submit slice, the Interactions figures and the emailed form report alike, so the dashboard and
+# the email agree. "Non-blank" is all the email test asks: the address is not checked for shape.
+#
+# Measured over 22 Sep-21 Oct (internal traffic excluded): 4 of 53 website form submits fail it -
+# one blank demo form (the same visitor sent a complete one in that session) and three research
+# gates from one session within 6 seconds, each with only a first name. All time: demo 2 of 13,
+# research 3 of 37, track 18 of 155 (blank contact and careers forms, gates with no email, blog
+# comments, which never carry a name).
+#
+# Scoped to the website campaigns because the rule fits only their forms. On InSyte campaigns all
+# 5,892 form submits in the same 30 days would have failed it: 5,151 are cookie-consent forms, and
+# their lead forms name the fields fname/lname. Spam-trap (_dai_hp) hits are untouched - all ten so
+# far carry an email and names, and they still count.
+#
+# form_data arrived as an OBJECT on every website form submit measured (222 of 222), so the path
+# reads it directly. Each test is NULLIF(TRIM(...)) so a missing key, a NULL and spaces all read as
+# blank, and the whole predicate is never NULL - which keeps NOT over it safe.
+_WEBSITE_FORM_INCOMPLETE = (
+    "(STARTSWITH(COALESCE(CAMPAIGN_ID, ''), 'demand_ai_internal_website')"
+    " AND (NULLIF(TRIM(PROPERTIES:form_data:email::STRING), '') IS NULL"
+    " OR (NULLIF(TRIM(PROPERTIES:form_data:firstName::STRING), '') IS NULL"
+    " AND NULLIF(TRIM(PROPERTIES:form_data:lastName::STRING), '') IS NULL)))"
+)
+
+
 # What the donut and the Interactions / Session card count: a page visit once per page per
 # session, and every other event - each click, each form submit - on its own.
 #
@@ -1926,14 +1958,23 @@ _EVENT_BUCKET = f"""
 # The bucket is tested through _EVENT_BUCKET rather than _PAGE_VIEW on purpose: a form submit can
 # also carry EVENT_TYPE 'page', and the donut files it under Form submit, so it must not be
 # collapsed as if it were a page visit.
+#
+# A website form submit that does not count (_WEBSITE_FORM_INCOMPLETE) gets no key at all - NULL -
+# and COUNT(DISTINCT) skips a NULL, so one change here takes it out of every interaction figure.
+# _session_spans_ctes drops NULL keys explicitly, since its GROUP BY would otherwise keep them.
 _INTERACTION_KEY = f"""IFF(({_EVENT_BUCKET}) = 'Page visit' AND SESSION_ID IS NOT NULL,
             'p|' || SESSION_ID::STRING || '|' || {_PAGE_URL},
-            'e|' || MESSAGE_ID)"""
+            IFF(({_EVENT_BUCKET}) = 'Form submit' AND {_WEBSITE_FORM_INCOMPLETE}, NULL,
+            'e|' || MESSAGE_ID))"""
 
 
-def _session_spans_ctes(source: str) -> str:
+def _session_spans_ctes(source: str, key: str | None = None) -> str:
     """Two CTEs, `firsts` and `spans`: each session's duration and interaction count under the
     interactions rule. `source` is a FROM clause with its WHERE, and must exclude NULL SESSION_IDs.
+    `key` is the interaction key to group on - _INTERACTION_KEY by default, or a column the source
+    already carries it in (campaign_detail_kpis_sql's events CTE projects it as IK). A NULL key - a
+    website form submit that does not count - is dropped, so it neither adds an interaction nor
+    stretches a session's duration.
 
     A session's duration runs from its first event to the FIRST time its last new interaction
     happened - the latest moment it did something it had not done before. A page an open tab keeps
@@ -1951,10 +1992,12 @@ def _session_spans_ctes(source: str) -> str:
     Written once and used by campaign_duration_bands_sql and campaign_detail_kpis_sql, so the
     chart's bands and the caption's median can never be measured two different ways.
     """
+    key = key or _INTERACTION_KEY
     return f"""firsts AS (
-            SELECT SESSION_ID, {_INTERACTION_KEY} AS K, MIN(EVENT_TS) AS T
+            SELECT SESSION_ID, {key} AS K, MIN(EVENT_TS) AS T
             FROM {source}
             GROUP BY 1, 2
+            HAVING K IS NOT NULL
         ), spans AS (
             SELECT SESSION_ID, DATEDIFF('second', MIN(T), MAX(T)) AS SECS, COUNT(*) AS INTERACTIONS
             FROM firsts
