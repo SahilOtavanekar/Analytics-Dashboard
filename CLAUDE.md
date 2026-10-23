@@ -18,7 +18,7 @@ streamlit run streamlit_app.py           # opens :8501, SSO browser tab on first
 ```
 
 **There is no test suite and no lint config.** `scripts/test_snowflake_connection.py` is a
-standalone connectivity probe, not a test. Verification in this repo is done three ways:
+standalone connectivity probe, not a test. Verification in this repo is done these ways:
 
 ```bash
 # 1. Expand a query builder to see the SQL the app actually sends. Reading the f-strings is
@@ -33,6 +33,15 @@ python -c "import sys,inspect; sys.path.insert(0,'.'); import src.queries as Q; 
 
 # 3. Drive a page headlessly with streamlit.testing.v1.AppTest, patching src.db.run_query with
 #    synthetic DataFrames. This is the only way to exercise render code without Snowflake.
+
+# 4. Prove a rule change reaches only what it should: load the previous commit's queries as a
+#    module (exec of `git show <base>:src/queries.py`) and compare both against live data. Sort
+#    before comparing - several builders have no ORDER BY, so DataFrame.equals flags row order.
+
+# 5. Dry-run the email: --body writes the procedure's Python alone. Exec it with boto3 and
+#    _snowflake stubbed and a session whose sql() runs through snowflake.connector (qmark), then
+#    call run_report(session, 'TEST', 30, True). Queries are live; nothing is sent.
+python scripts/build_procedure.py out.sql --body body.py --version vNN
 ```
 
 Rendering can only be confirmed visually. AppTest, Vega specs and contrast maths all pass while
@@ -42,9 +51,18 @@ a chart still looks wrong — ask the user for a screenshot rather than iteratin
 
 **All SQL lives in `src/queries.py`** — ~50 builders, one function per query, each returning a
 string with `?` binds. Shared predicates are module constants (`_LEAD_SUBMIT`, `_PAGE_VIEW`,
-`_ENGAGED_EVENT`, `_NOT_TEST`, `_ASSET`, `_ACTION_LABEL`). Change the constant, not the call
-sites. Comments record the measurement behind each definition — they are the reasoning, not
-decoration; read them before changing a rule.
+`_ENGAGED_EVENT`, `_NOT_TEST`, `_ASSET`, `_ACTION_LABEL`, `_EVENT_BUCKET`, `_INTERACTION_KEY`,
+`_WEBSITE_FORM_INCOMPLETE`). Change the constant, not the call sites. Comments record the
+measurement behind each definition — they are the reasoning, not decoration; read them before
+changing a rule.
+
+**Campaign figures count interactions, not events.** `_INTERACTION_KEY` counts a page visit once
+per page per session and every other event each time; the donut, Interactions / session, Content
+and AI usage all count it. On the `demand_ai_internal_website*` campaigns a form submit with a blank
+email, or with both names blank (`_WEBSITE_FORM_INCOMPLETE`), gets a NULL key and so drops out of
+all of them. The emailed form report filters on the same predicate, and `_form_report` withholds
+the PDF if its rows stop matching the Form submit figure. A counting change therefore goes through
+these constants, never into one consumer. The Conversion page's `_LEAD_SUBMIT` is a separate rule.
 
 **`src/db.py` is the single filter point.** `table_fqn()` returns either the table name or a
 `(SELECT * FROM … WHERE …)` subquery when the reader has internal traffic excluded. All ~49 table
@@ -93,6 +111,15 @@ nullable column has silently deleted whole buckets here.
 **Guard `SESSION_ID IS NOT NULL` in any GROUP BY.** ~3.47M rows have no session id (it was not
 captured before Nov 2025), and SQL collapses them into one pseudo-session spanning the range.
 
+**A NULL interaction key is an exclusion.** `COUNT(DISTINCT …)` skips it, but a `GROUP BY` keeps it
+as a group of its own — anything grouping on the key must drop it, as `_session_spans_ctes` does
+with `HAVING K IS NOT NULL`.
+
+**Yesterday is not final at 08:00 IST.** Rows load hourly by arrival time and events can arrive
+after the day they are stamped: the 21 Oct email showed 161 track sessions for 20 Oct, and the
+same code read 166 a day later. Time Travel keeps only 1 day. When an emailed figure disagrees
+with a fresh run, run the old and new code on the same data before suspecting either.
+
 **Individual identities are never shown.** Company reach aggregates to the email domain and is not
 even *queried* below `IDENTITY_FLOOR` (5) identified people. Strip query strings from URLs before
 grouping or displaying — `QUERY_PARAMETERS:email` rides in them on personalised links, so a raw
@@ -113,9 +140,21 @@ Python runs; fix it with `GRANT OWNERSHIP … COPY CURRENT GRANTS`, not by editi
 No secrets are needed inside Snowflake: `st.connection("snowflake")` returns the active Snowpark
 session before it ever reads `secrets.toml`, which is local-development only.
 
+**Replacing a file in the Workspace changes nothing live until Deploy runs.** To see what the app
+actually serves: `DESCRIBE STREAMLIT CIT_DATA_CORE.TRACKING.ANALYTICS_DASHBOARD_DEPLOY` gives
+`last_version_location_uri`; `GET` a file from that `snow://streamlit/…` path and diff it against
+the repo. Compare content, not `LIST` sizes, which are off by a few bytes.
+
 The daily email is the stored procedure `CAMPAIGN_ANALYTICS_REPORT_DAILY`, **built, not hand-written**:
-`python scripts/build_procedure.py out.sql` embeds `src/db.py`, `queries.py`, `minipdf.py` and
-`campaign_report.py` unchanged plus `scripts/procedure_overview.py` (campaigns, recipients, layout).
-`updated procedure.txt` is the copy that is live. After changing anything in `src/` the email uses,
-rebuild, and paste the output into a Snowsight worksheet to deploy it. `CALL …('TEST')` sends only to
-the test recipient.
+`python scripts/build_procedure.py out.sql --version vNN` embeds `src/db.py`, `queries.py`,
+`minipdf.py` and `campaign_report.py` unchanged plus `scripts/procedure_overview.py` (campaigns,
+recipients, layout). `updated procedure.txt` is the copy that is live. After changing anything in
+`src/` the email uses, rebuild, and paste the output into a Snowsight worksheet to deploy it.
+`CALL …('TEST')` sends only to the test recipient. Task `TASK_CAMPAIGN_ANALYTICS_REPORT_DAILY` calls
+it at 08:00 Asia/Kolkata for yesterday (UTC); its arguments are ignored except `'TEST'`. To confirm
+a deploy, `DESCRIBE PROCEDURE …CAMPAIGN_ANALYTICS_REPORT_DAILY(VARCHAR, NUMBER, BOOLEAN)` returns the
+live body unescaped, to diff against the build.
+
+**Run read-only queries only.** Anything that changes the account — `CREATE`, `ALTER`, `GRANT`, task
+changes — is handed over as SQL for a person to run. A task altered from here once failed to resume
+and stopped the daily email.
