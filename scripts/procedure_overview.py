@@ -413,8 +413,9 @@ def _overview_email_html(reports, end, note=None) -> str:
 #
 #     The rows are selected through the email's own scope (_campaign_table + _campaign_scope +
 #     campaign_params, _EVENT_BUCKET = 'Form submit', one per MESSAGE_ID), so their count IS the Form
-#     submit figure in that campaign's Day section. It is still checked: on a mismatch the PDF is left
-#     out and the email says so, rather than sending a number nobody can reconcile.
+#     submit figure for that campaign's Day - shown in the email for the OVERVIEW_CAMPAIGNS, and on the
+#     dashboard for the rest. It is still checked: on a mismatch the PDF is left out and the email says
+#     so, rather than sending a number nobody can reconcile.
 # ============================================================================
 
 # The report carries personal data (names, emails, phone numbers, messages). While this is False it is
@@ -433,7 +434,14 @@ FORM_REPORT_CAMPAIGNS = [
         ("#", "#", 7), ("Date & time (UTC)", "time", 25), ("First name", "firstName", 18),
         ("Last name", "lastName", 18), ("Email", "email", 40), ("Company", "company", 24), ("Job title", "jobTitle", 24),
         ("Country", "country", 16), ("Report", "report", None), ("Edition", "edition", 18), ("Opt-in", "researchOptIn", 11)]),
+    # Added 2026-10-27. The newsletter form has no lastName: firstName carries the whole name, and email
+    # is the form's work email. A row needs both (_WEBSITE_FORM_INCOMPLETE), which the form also requires.
+    ("NEWSLETTER SIGNUP", "demand_ai_internal_website_newsletter_signup", [
+        ("#", "#", 7), ("Date & time (UTC)", "time", 25), ("Name", "firstName", 55), ("Work email", "email", 70),
+        ("Company", "company", None)]),
 ]
+# The count line under a section, for a campaign that also has a Day figure in the email itself.
+_FR_SAME_AS_EMAIL = " - the same as the Form submit figure in the Campaign Overview email for this day ({email})"
 _FR_SPAM_FILL, _FR_SPAM_INK = (253, 236, 234), (160, 40, 30)
 _FR_LINE, _FR_PAD = 3.5, 1.6
 _FR_LANDSCAPE = (841.89, 595.28)
@@ -583,8 +591,12 @@ def _form_pdf(day, sections) -> bytes:
     pdf.set_x(pdf.l_margin + 4.2)
     pdf.set_font("Helvetica", "", 7.5)
     pdf.set_text_color(*_PDF_MUTED)
-    pdf.cell(width - 4.2, 4, "Every form submission the Campaign Overview email counts: internal traffic excluded, each session on the day it started (UTC)   -   Newest first   -   Contains personal data: internal use only", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(width - 4.2, 4, "Every counted form submission: internal traffic excluded, each session on the day it started (UTC)   -   Newest first   -   Contains personal data: internal use only", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(4)
+
+    # One tag width for every section, from the widest label: NEWSLETTER SIGNUP is 38.8 mm at 10pt bold.
+    pdf.set_font("Helvetica", "B", 10)
+    tag_w = max([38.0] + [pdf.get_string_width(s[0]) + 8 for s in sections])
 
     for label, cid, cols, rows, email, gone in sections:
         if pdf.get_y() + 40 > pdf.h - pdf.b_margin:
@@ -593,14 +605,14 @@ def _form_pdf(day, sections) -> bytes:
         pdf.set_fill_color(212, 230, 246)
         pdf.rect(pdf.l_margin, y, width, 10, style="F")
         pdf.set_fill_color(*_PDF_TEAL)
-        pdf.rect(pdf.l_margin, y, 38, 10, style="F")
+        pdf.rect(pdf.l_margin, y, tag_w, 10, style="F")
         pdf.set_xy(pdf.l_margin, y + 2.2)
         pdf.set_font("Helvetica", "B", 10)
         pdf.set_text_color(255, 255, 255)
-        pdf.cell(38, 6, label, align="C")
-        pdf.set_xy(pdf.l_margin + 43, y + 2.2)
+        pdf.cell(tag_w, 6, label, align="C")
+        pdf.set_xy(pdf.l_margin + tag_w + 5, y + 2.2)
         pdf.set_text_color(*_PDF_INK)
-        pdf.cell(width - 48, 6, _safe(cid))
+        pdf.cell(width - tag_w - 10, 6, _safe(cid))
         pdf.set_xy(pdf.l_margin, y + 12)
         gone_txt = f"{gone} internal submission{'s' if gone != 1 else ''} also excluded, as in the campaign report" if gone else ""
         if not rows:
@@ -613,7 +625,8 @@ def _form_pdf(day, sections) -> bytes:
                 pdf.multi_cell(width, 4.2, _safe(gone_txt[0].upper() + gone_txt[1:] + "."), new_x="LMARGIN", new_y="NEXT")
             pdf.ln(6)
             continue
-        parts = [f"{len(rows)} form submission{'s' if len(rows) != 1 else ''} - the same as the Form submit figure in the Campaign Overview email for this day ({email})"]
+        same_as = _FR_SAME_AS_EMAIL.format(email=email) if cid in OVERVIEW_CAMPAIGNS else ""
+        parts = [f"{len(rows)} form submission{'s' if len(rows) != 1 else ''}{same_as}"]
         if gone_txt:
             parts.append(gone_txt)
         spam = sum(_form_is_spam(r) for r in rows)
